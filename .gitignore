@@ -1,0 +1,38 @@
+docs/
+CLAUDE.md
+
+# --- Node / extension / backend ---
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+extension/dist/
+backend/dist/
+
+# --- Python sidecar ---
+__pycache__/
+*.pyc
+venv/
+.venv/
+.env
+
+# --- Environment / secrets ---
+.env.local
+.env.*.local
+!*.example
+secrets/
+*.key
+*.pem
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# --- Test / coverage ---
+coverage/
+.tmp/
