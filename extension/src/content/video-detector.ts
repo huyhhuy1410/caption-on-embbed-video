@@ -17,8 +17,7 @@ if (videos.length > 0) {
     cursor: 'pointer',
   });
   button.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'start-captioning' });
-    button.textContent = 'Caption AI enabled';
+    button.textContent = 'Click Caption AI in toolbar';
   });
   document.documentElement.append(button);
 }
