@@ -7,6 +7,7 @@ await build({
     'content/video-detector': 'src/content/video-detector.ts',
     'background/service-worker': 'src/background/service-worker.ts',
     'offscreen/capture': 'src/offscreen/capture.ts',
+        'recorder-worklet': 'src/offscreen/recorder-worklet.ts',
   },
   bundle: true,
   format: 'iife',

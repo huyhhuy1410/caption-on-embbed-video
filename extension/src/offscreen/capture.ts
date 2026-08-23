@@ -12,9 +12,32 @@ async function captureTabAudio(streamId: string) {
     } as MediaTrackConstraints,
     video: false,
   });
-  const audioContext = new AudioContext();
-  const source = audioContext.createMediaStreamSource(stream);
+  const audioContext = new AudioContext({                  
+    sampleRate: 16000,
+  });
+  console.info("Sample rate:", audioContext.sampleRate);
+  await audioContext.audioWorklet.addModule(
+    chrome.runtime.getURL("dist/recorder-worklet.js"),
+  );
+  const worklet = new AudioWorkletNode(audioContext, "recorder-processor");
+  let frameCount = 0;
+  worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
+    const float32 = event.data;
+    const pcm16 = new Int16Array(float32.length);
 
+    for (let i = 0; i < float32.length; i++) {
+      const sample = Math.max(-1, Math.min(1, float32[i]));
+      pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+
+    frameCount++;
+
+    if (frameCount % 50 === 0) {
+      console.info('PCM16 frame:', frameCount, 'samples:', pcm16.length);
+    }
+  };
+  const source = audioContext.createMediaStreamSource(stream);
+  source.connect(worklet);
   source.connect(audioContext.destination);
 
   const analyser = audioContext.createAnalyser();
