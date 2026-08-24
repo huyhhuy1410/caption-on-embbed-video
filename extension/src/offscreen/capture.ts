@@ -12,28 +12,49 @@ async function captureTabAudio(streamId: string) {
     } as MediaTrackConstraints,
     video: false,
   });
-  const audioContext = new AudioContext({                  
+  const audioContext = new AudioContext({
     sampleRate: 16000,
   });
   console.info("Sample rate:", audioContext.sampleRate);
+  const socket = new WebSocket("ws://127.0.0.1:8000");
+
+  socket.addEventListener("open", () => {
+    console.info("Connected to backend WebSocket");
+  });
   await audioContext.audioWorklet.addModule(
     chrome.runtime.getURL("dist/recorder-worklet.js"),
   );
+
   const worklet = new AudioWorkletNode(audioContext, "recorder-processor");
-  let frameCount = 0;
+  let pendingSamples: number[] = [];
+  let chunkCount = 0;
+  let sequence = 0;
   worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
-    const float32 = event.data;
-    const pcm16 = new Int16Array(float32.length);
-
-    for (let i = 0; i < float32.length; i++) {
-      const sample = Math.max(-1, Math.min(1, float32[i]));
-      pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    for (const sample of event.data) {
+      const clamped = Math.max(-1, Math.min(1, sample));
+      pendingSamples.push(clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff);
     }
+    while (pendingSamples.length >= 16000) {
+      const chunk = new Int16Array(pendingSamples.splice(0, 16000));
+      chunkCount++;
+      if (socket.readyState === WebSocket.OPEN) {
+        sequence++;
+        socket.send(
+          JSON.stringify({
+            type: "audio",
+            seq: sequence,
+            captureTime: performance.now() / 1000,
+            sampleRate: audioContext.sampleRate,
+            frames: chunk.length,
+          }),
+        );
+      }
+      console.info("PCM chunk:", chunkCount, "samples:", chunk.length);
 
-    frameCount++;
-
-    if (frameCount % 50 === 0) {
-      console.info('PCM16 frame:', frameCount, 'samples:', pcm16.length);
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(chunk.buffer);
+        console.info("Sent PCM chunk:", chunkCount);
+      }
     }
   };
   const source = audioContext.createMediaStreamSource(stream);
