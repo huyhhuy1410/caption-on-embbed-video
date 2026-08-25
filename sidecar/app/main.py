@@ -9,7 +9,7 @@ from faster_whisper import WhisperModel
 SAMPLE_RATE = 16000
 WINDOW_SIZE = 6 * SAMPLE_RATE       # 96,000 samples (6 giây)
 OVERLAP_SIZE = int(1.5 * SAMPLE_RATE) # 24,000 samples (1.5 giây)
-
+MAX_BUFFER_SIZE = 12 * SAMPLE_RATE # max buffer size = 12 giây để tránh load quá nhiều audio vào memory
 model: WhisperModel | None = None
 
 
@@ -55,6 +55,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             chunk_audio = bytes_to_float32(audio_bytes)
             audio_buffer = np.concatenate((audio_buffer, chunk_audio))
             
+            # Nếu buffer vượt quá max buffer size thì cắt bớt dữ liệu cũ để tránh memory overflow
+            if len(audio_buffer) > MAX_BUFFER_SIZE:
+                audio_buffer = audio_buffer[-OVERLAP_SIZE:]
+                print("Watchdog: dropped stale audio", flush=True)
+
             # 2. Kiểm tra nếu bộ đệm đủ 6 giây (96,000 samples):
             if len(audio_buffer) >= WINDOW_SIZE:
                 # Lấy đúng 6s đầu tiên để đưa vào Whisper
