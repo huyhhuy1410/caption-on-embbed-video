@@ -21,6 +21,9 @@ async function captureTabAudio(streamId: string) {
   socket.addEventListener("open", () => {
     console.info("Connected to backend WebSocket");
   });
+  socket.addEventListener("message", (event) => {
+    console.info("Words from backend:", event.data);
+  });
   await audioContext.audioWorklet.addModule(
     chrome.runtime.getURL("dist/recorder-worklet.js"),
   );
@@ -51,10 +54,8 @@ async function captureTabAudio(streamId: string) {
       }
       console.info("PCM chunk:", chunkCount, "samples:", chunk.length);
 
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(chunk.buffer);
-        console.info("Sent PCM chunk:", chunkCount);
-      }
+      socket.send(chunk.buffer);
+      console.info("Sent PCM chunk:", chunkCount);
     }
   };
   const source = audioContext.createMediaStreamSource(stream);

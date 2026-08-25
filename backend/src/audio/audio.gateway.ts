@@ -8,10 +8,21 @@ import { SidecarService } from './sidecar/sidecar.service';
 
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
-  constructor(private readonly sidecarService: SidecarService) {}
+  private extensionClient?: WebSocket;
+  constructor(private readonly sidecarService: SidecarService) {
+    this.sidecarService.setMessageHandler((data) => {
+      console.info('Message from sidecar:', data);
+      if (
+        this.extensionClient &&
+        this.extensionClient.readyState === WebSocket.OPEN
+      ) {
+        this.extensionClient.send(data);
+      }
+    });
+  }
   handleConnection(client: WebSocket) {
     console.info('Extension connected to audio WebSocket');
-
+    this.extensionClient = client;
     client.on('message', (data: RawData, isBinary: boolean) => {
       if (isBinary) {
         console.info('Received PCM bytes:', rawDataLength(data));
@@ -32,6 +43,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   handleDisconnect() {
     console.info('Extension disconnected from audio WebSocket');
+    this.extensionClient = undefined;
   }
 }
 function toBuffer(data: RawData): Buffer {
