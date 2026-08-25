@@ -6,6 +6,9 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 
+SAMPLE_RATE = 16000
+WINDOW_SIZE = 6 * SAMPLE_RATE       # 96,000 samples (6 giây)
+OVERLAP_SIZE = int(1.5 * SAMPLE_RATE) # 24,000 samples (1.5 giây)
 
 model: WhisperModel | None = None
 
@@ -28,6 +31,7 @@ def health() -> dict[str, str]:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
+    audio_buffer = np.array([], dtype=np.float32)
     await websocket.accept()
     await websocket.send_json({"type": "status", "state": "listening"})
     pending_metadata: dict[str, Any] | None = None
@@ -47,11 +51,27 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "error", "message": "Model is not loaded"})
                 continue
 
-            await transcribe_chunk(websocket, audio_bytes, pending_metadata)
+            # 1. Khi nhận được audio_bytes:
+            chunk_audio = bytes_to_float32(audio_bytes)
+            audio_buffer = np.concatenate((audio_buffer, chunk_audio))
+            
+            # 2. Kiểm tra nếu bộ đệm đủ 6 giây (96,000 samples):
+            if len(audio_buffer) >= WINDOW_SIZE:
+                # Lấy đúng 6s đầu tiên để đưa vào Whisper
+                window_audio = audio_buffer[:WINDOW_SIZE]
+                await transcribe_chunk(websocket, window_audio, pending_metadata)
+    
+                # 3. Giữ lại 1.5s cuối (24,000 samples) làm ngữ cảnh cho window tiếp theo!
+                audio_buffer = audio_buffer[-OVERLAP_SIZE:]
+
             pending_metadata = None
     except WebSocketDisconnect:
         return
 
+def bytes_to_float32(audio_bytes: bytes) -> np.ndarray:
+    samples = array("h")
+    samples.frombytes(audio_bytes)
+    return np.asarray(samples, dtype=np.float32) / 32768.0
 
 def parse_metadata(raw_message: str) -> dict[str, Any] | None:
     import json
@@ -66,12 +86,9 @@ def parse_metadata(raw_message: str) -> dict[str, Any] | None:
 
 async def transcribe_chunk(
     websocket: WebSocket,
-    audio_bytes: bytes,
+    audio: np.ndarray,
     metadata: dict[str, Any] | None,
 ) -> None:
-    samples = array("h")
-    samples.frombytes(audio_bytes)
-    audio = np.asarray(samples, dtype=np.float32) / 32768.0
 
     segments, info = model.transcribe(
         audio,
