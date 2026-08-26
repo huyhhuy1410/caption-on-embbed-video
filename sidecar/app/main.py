@@ -6,43 +6,62 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 
-SAMPLE_RATE = 16000
-WINDOW_SIZE = 6 * SAMPLE_RATE       # 96,000 samples (6 giây)
-OVERLAP_SIZE = int(1.5 * SAMPLE_RATE) # 24,000 samples (1.5 giây)
-MAX_BUFFER_SIZE = 12 * SAMPLE_RATE # max buffer size = 12 giây để tránh load quá nhiều audio vào memory
+# === BƯỚC 1: Cấu hình hằng số cho Xử lý Bộ đệm Cửa sổ trượt (Sliding Window Buffering) ===
+SAMPLE_RATE = 16000                     # Tần số lấy mẫu âm thanh: 16,000 Hz (16k mẫu/giây)
+WINDOW_SIZE = 6 * SAMPLE_RATE          # Cửa sổ nhận diện 6 giây = 96,000 samples
+OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giây = 24,000 samples
+MAX_BUFFER_SIZE = 12 * SAMPLE_RATE     # Giới hạn bộ đệm tối đa 12 giây (Watchdog chống tràn RAM)
+
+# Khai báo biến toàn cục lưu trữ mô hình Whisper AI
 model: WhisperModel | None = None
 
 
+# === BƯỚC 2: Quản lý Vòng đời Ứng dụng (FastAPI Lifespan) ===
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global model
+    # Nạp mô hình Whisper AI "tiny" vào RAM khi Server vừa khởi động
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
     yield
+    # Giải phóng mô hình khi Server đóng
     model = None
 
 
 app = FastAPI(title="Caption AI Sidecar", lifespan=lifespan)
 
 
+# === BƯỚC 3: Endpoint Health Check ===
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "caption-ai-sidecar"}
 
 
+# === BƯỚC 4: Endpoint WebSocket Nhận Luồng Audio & Trả Phụ Đề Real-time ===
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
+    # 4.1. Bộ đệm âm thanh tích lũy các chunk từ Extension gửi sang
     audio_buffer = np.array([], dtype=np.float32)
+    
     await websocket.accept()
     await websocket.send_json({"type": "status", "state": "listening"})
+    
     pending_metadata: dict[str, Any] | None = None
-
+    window_anchor: dict[str, Any] | None = None  # Anchor ghim metadata của Chunk 1 (đầu window)
+    is_first_chunk = True
     try:
         while True:
             message = await websocket.receive()
+
+            # 4.2. Xử lý Gói tin Text (Metadata JSON từ Extension)
             if message.get("text") is not None:
                 pending_metadata = parse_metadata(message["text"])
+                
+                # Ghim metadata của chunk đầu tiên làm Anchor cho Window 6s này
+                if window_anchor is None:
+                    window_anchor = pending_metadata
                 continue
 
+            # 4.3. Xử lý Gói tin Binary (Audio PCM Bytes)
             audio_bytes = message.get("bytes")
             if audio_bytes is None:
                 continue
@@ -51,33 +70,43 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "error", "message": "Model is not loaded"})
                 continue
 
-            # 1. Khi nhận được audio_bytes:
+            # 4.4. Đổi audio bytes nhị phân sang mảng Float32 và nối vào bộ đệm
             chunk_audio = bytes_to_float32(audio_bytes)
             audio_buffer = np.concatenate((audio_buffer, chunk_audio))
             
-            # Nếu buffer vượt quá max buffer size thì cắt bớt dữ liệu cũ để tránh memory overflow
+            # 4.5. Watchdog Protection: Nếu bộ đệm bị dồn quá 12s, cắt bỏ dữ liệu cũ bị trễ
             if len(audio_buffer) > MAX_BUFFER_SIZE:
                 audio_buffer = audio_buffer[-OVERLAP_SIZE:]
                 print("Watchdog: dropped stale audio", flush=True)
 
-            # 2. Kiểm tra nếu bộ đệm đủ 6 giây (96,000 samples):
+            # 4.6. Khi bộ đệm đủ 6 giây (96,000 samples) -> Chạy Whisper AI
             if len(audio_buffer) >= WINDOW_SIZE:
-                # Lấy đúng 6s đầu tiên để đưa vào Whisper
+                # Cắt đúng 6s âm thanh đầu tiên để đưa vào Whisper
                 window_audio = audio_buffer[:WINDOW_SIZE]
-                await transcribe_chunk(websocket, window_audio, pending_metadata)
-    
-                # 3. Giữ lại 1.5s cuối (24,000 samples) làm ngữ cảnh cho window tiếp theo!
+                
+                # Gọi hàm transcribe với window_anchor (Metadata của Chunk 1)
+                await transcribe_chunk(websocket, window_audio, window_anchor, is_first_chunk)
+
+                is_first_chunk = False
+                # Giữ lại 1.5s cuối (24,000 samples) làm ngữ cảnh gối đầu cho window sau
                 audio_buffer = audio_buffer[-OVERLAP_SIZE:]
+
+                # Reset đinh ghim để chunk tiếp theo sẽ trở thành Anchor mới
+                window_anchor = None
 
             pending_metadata = None
     except WebSocketDisconnect:
         return
 
+
+# === BƯỚC 5: Helper Chuyển đổi Bytes PCM16 -> NumPy Float32 (-1.0 đến 1.0) ===
 def bytes_to_float32(audio_bytes: bytes) -> np.ndarray:
-    samples = array("h")
+    samples = array("h")  # "h" đại diện cho signed short 16-bit
     samples.frombytes(audio_bytes)
     return np.asarray(samples, dtype=np.float32) / 32768.0
 
+
+# === BƯỚC 6: Helper Parse JSON Metadata ===
 def parse_metadata(raw_message: str) -> dict[str, Any] | None:
     import json
 
@@ -89,12 +118,14 @@ def parse_metadata(raw_message: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+# === BƯỚC 7: Hàm Thực thi Whisper AI & Tính mốc thời gian Video chuẩn ===
 async def transcribe_chunk(
     websocket: WebSocket,
     audio: np.ndarray,
     metadata: dict[str, Any] | None,
+    is_first_chunk: bool,
 ) -> None:
-
+    # 7.1. Chạy Whisper AI nhận dạng giọng nói kèm mốc thời gian từng từ
     segments, info = model.transcribe(
         audio,
         beam_size=1,
@@ -102,18 +133,24 @@ async def transcribe_chunk(
         vad_filter=True,
     )
 
+    # 7.2. Lấy mốc thời gian Video tại thời điểm bắt đầu Window (Anchor)
+    raw_video_time = metadata.get("videoTimeAtCapture", 0.0) if metadata else 0.0
+    base_video_time = raw_video_time - (1.5 if not is_first_chunk else 0.0)
     words: list[dict[str, Any]] = []
     for segment in segments:
         for word in segment.words or []:
             words.append(
                 {
-                    "w": word.word.strip(),
-                    "s": word.start,
-                    "e": word.end,
-                    "c": word.probability,
+                    "w": word.word.strip(),                         # Từ ngữ (Word)
+                    "s": word.start,                                # Giây bắt đầu trong Window 6s
+                    "e": word.end,                                  # Giây kết thúc trong Window 6s
+                    "videoStart": round(base_video_time + word.start, 2), # Mốc thời gian thực trên Video
+                    "videoEnd": round(base_video_time + word.end, 2),     # Mốc thời gian thực trên Video
+                    "c": word.probability,                          # Độ tự tin của AI (Confidence)
                 }
             )
 
+    # 7.3. Trả về kết quả JSON chứa danh sách từ đã đồng bộ mốc thời gian Video
     await websocket.send_json(
         {
             "type": "words",
@@ -123,3 +160,4 @@ async def transcribe_chunk(
             "words": words,
         }
     )
+
