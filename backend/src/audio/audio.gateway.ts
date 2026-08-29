@@ -5,6 +5,7 @@ import {
 } from '@nestjs/websockets';
 import { RawData, WebSocket } from 'ws';
 import { SidecarService } from './sidecar/sidecar.service';
+import { TranscriptService } from './transcript/transcript.service';
 
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -12,17 +13,30 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private extensionClient?: WebSocket;
 
   // === BƯỚC 1: Constructor - Thiết lập kết nối hai chiều với Sidecar Service ===
-  constructor(private readonly sidecarService: SidecarService) {
+  constructor(
+    private readonly sidecarService: SidecarService,
+    private readonly transcriptService: TranscriptService,
+  ) {
     // 1.1. Đăng ký callback lắng nghe kết quả Subtitle trả về từ Python Sidecar
     this.sidecarService.setMessageHandler((data) => {
       console.info('Message from sidecar:', data);
-      
+
       // 1.2. Nếu Extension đang mở kết nối, bắn thẳng kết quả JSON về cho Extension!
+
+      const message = data.toString();
+      try {
+        const parsedMessage = JSON.parse(message);
+        if (parsedMessage.type === 'words') {
+          this.transcriptService.addWords(parsedMessage.words);
+        }
+      } catch (error) {
+        console.warn('Failed to parse message', error);
+      }
       if (
         this.extensionClient &&
         this.extensionClient.readyState === WebSocket.OPEN
       ) {
-        this.extensionClient.send(data);
+        this.extensionClient.send(message);
       }
     });
   }
@@ -46,7 +60,32 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       try {
         const parsed: unknown = JSON.parse(data.toString());
         console.info('Received message:', parsed);
-        this.sidecarService.sendMetadata(parsed); // Forward metadata cho Sidecar Python
+        if (isRecord(parsed) && parsed.type === 'seek') {
+          const seekTime = (parsed as { seekTimeAtCapture?: number })
+            .seekTimeAtCapture;
+          console.info('Backend: seek received', parsed);
+          if (seekTime !== undefined) {
+            const from = seekTime;
+            const to = seekTime + 3;
+            const replayWords = this.transcriptService.getRange(from, to);
+            console.info('Seek received:', seekTime);
+            console.info('Replay words:', replayWords.length);
+            if (
+              this.extensionClient &&
+              this.extensionClient.readyState === WebSocket.OPEN
+            ) {
+              this.extensionClient.send(
+                JSON.stringify({
+                  type: 'replay',
+                  seekTime,
+                  words: replayWords,
+                }),
+              );
+            }
+          }
+        } else {
+          this.sidecarService.sendMetadata(parsed); // Forward metadata cho Sidecar Python
+        }
       } catch {
         console.warn('Received invalid JSON message');
       }
@@ -81,4 +120,6 @@ function rawDataLength(data: RawData): number {
   }
   return data.byteLength;
 }
-
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}

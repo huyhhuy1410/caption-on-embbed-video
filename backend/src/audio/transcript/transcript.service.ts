@@ -16,11 +16,22 @@ export class TranscriptService {
     const key = Math.floor(words[0].videoStart);
     const existing = this.cache.get(key) ?? [];
     this.cache.set(key, existing.concat(words));
+    console.info(
+      'Cache words:',
+      words.length,
+      'video range:',
+      words[0].videoStart,
+      words[words.length - 1].videoStart,
+      'key:',
+      key,
+    );
   }
   getRange(fromSec: number, toSec: number) {
     let result: Word[] = [];
     for (const [anchorTime, words] of this.cache.entries()) {
-      if (anchorTime >= fromSec && anchorTime <= toSec) {
+      const lastWord = words[words.length - 1];
+      const bucketEnd = lastWord?.videoEnd ?? anchorTime;
+      if (anchorTime <= toSec && bucketEnd >= fromSec) {
         result = result.concat(words);
       }
     }
@@ -37,6 +48,8 @@ export class TranscriptService {
       }
       depuped.push(word);
     }
-    return depuped;
+    return depuped.filter(
+      (word) => word.videoStart >= fromSec && word.videoStart <= toSec,
+    );
   }
 }

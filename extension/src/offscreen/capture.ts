@@ -1,6 +1,6 @@
 // Biến lưu mốc thời gian video.currentTime mới nhất được gửi từ Content script qua Service worker
 let videoTimeAtCapture = 0;
-
+let backendWebSocket: WebSocket | undefined;
 // === BƯỚC 1: Lắng nghe tin nhắn từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
   // 1.1. Lắng nghe lệnh khởi tạo thu âm Tab Audio từ Service Worker
@@ -8,8 +8,21 @@ chrome.runtime.onMessage.addListener((message) => {
     void captureTabAudio(message.streamId);
   }
   // 1.2. Lắng nghe mốc thời gian video.currentTime cập nhật từ Content script
+  // Chỉ lưu mốc video mới nhất, không relay ngược lại.
   if (message?.type === "video-clock") {
-    videoTimeAtCapture = message.videoTime; // Lưu mốc thời gian video mới nhất
+    videoTimeAtCapture = message.videoTime;
+  }
+  if (message?.type === "seek") {
+    console.info(
+      "Caption AI offscreen: seek received, socket state:",
+      backendWebSocket?.readyState,
+    );
+    if (backendWebSocket?.readyState === WebSocket.OPEN) {
+      backendWebSocket.send(JSON.stringify(message));
+      console.info("Caption AI offscreen: seek sent to backend");
+    } else {
+      console.warn("Caption AI offscreen: backend socket is not open");
+    }
   }
 });
 
@@ -34,6 +47,7 @@ async function captureTabAudio(streamId: string) {
 
   // 2.3. Khởi tạo kết nối WebSocket tới Backend NestJS (Cổng 8000)
   const socket = new WebSocket("ws://127.0.0.1:8000");
+  backendWebSocket = socket;
 
   socket.addEventListener("open", () => {
     console.info("Connected to backend WebSocket");
@@ -76,7 +90,7 @@ async function captureTabAudio(streamId: string) {
             seq: sequence,
             captureTime: performance.now() / 1000,
             sampleRate: audioContext.sampleRate,
-            videoTime: videoTimeAtCapture, // 👈 Đính kèm mốc thời gian video chuẩn
+            videoTimeAtCapture: videoTimeAtCapture, // 👈 Đính kèm mốc thời gian video chuẩn
             frames: chunk.length,
           }),
         );

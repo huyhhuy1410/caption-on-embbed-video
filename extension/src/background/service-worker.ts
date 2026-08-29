@@ -1,3 +1,5 @@
+console.info("Caption AI: service worker loaded");
+
 // === BƯỚC 1: Lắng nghe sự kiện click vào Icon Extension trên thanh Toolbar ===
 chrome.action.onClicked.addListener((tab) => {
   if (tab.id === undefined) return;
@@ -25,6 +27,18 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       type: "video-clock",
       videoTime: message.videoTime,
     });
+  }
+
+  if (message?.type === "seek") {
+    console.info("Caption AI SW: seek received", message);
+    void chrome.runtime
+      .sendMessage({
+        type: "seek",
+        seekTimeAtCapture: message.seekTimeAtCapture,
+      })
+      .catch((error: unknown) => {
+        console.warn("Caption AI SW: could not relay seek", error);
+      });
   }
 });
 
@@ -68,4 +82,3 @@ async function ensureOffscreenDocument() {
     });
   }
 }
-

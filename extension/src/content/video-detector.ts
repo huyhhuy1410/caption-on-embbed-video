@@ -1,12 +1,36 @@
-// === BƯỚC 1: Tìm kiếm các thẻ HTML <video> đang xuất hiện trên trang web ===
-const videos = Array.from(document.querySelectorAll("video"));
+console.info("Caption AI: content script loaded", window.location.href);
 
-if (videos.length > 0) {
-  // Lấy video đầu tiên phát hiện trên trang
-  const video = videos[0];
+function attachVideo(video: HTMLVideoElement) {
+  if (video.dataset.captionAiTracked === "true") return;
+  video.dataset.captionAiTracked = "true";
+  console.info("Caption AI: tracking video", video);
 
-  // === BƯỚC 2: Tạo nút bấm Giao diện "Enable Caption AI" cố định ở góc màn hình ===
+  // Gửi video-clock theo sự kiện timeupdate (chỉ khi currentTime đổi),
+  // thay cho setInterval 500ms — giảm tải message khi video không chạy.
+  video.addEventListener("timeupdate", () => {
+    void chrome.runtime.sendMessage({
+      type: "video-clock",
+      videoTime: video.currentTime,
+    }).catch(() => {
+      // Service worker may not be ready yet.
+    });
+  });
+
+  video.addEventListener("seeked", () => {
+    const message = {
+      type: "seek",
+      seekTimeAtCapture: video.currentTime,
+    };
+    console.info("Caption AI: video seeked", message);
+    void chrome.runtime.sendMessage(message).catch((error: unknown) => {
+      console.warn("Caption AI: could not send seek", error);
+    });
+  });
+
+  if (document.querySelector("[data-caption-ai-button]")) return;
+
   const button = document.createElement("button");
+  button.dataset.captionAiButton = "true";
   button.textContent = "Enable Caption AI";
   button.type = "button";
   Object.assign(button.style, {
@@ -21,23 +45,43 @@ if (videos.length > 0) {
     borderRadius: "6px",
     cursor: "pointer",
   });
-
-  // === BƯỚC 3: Xử lý sự kiện khi Người dùng bấm bật Caption AI ===
   button.addEventListener("click", () => {
-    // 3.1. Gửi thông điệp kích hoạt thu âm tới Background Service Worker
-    chrome.runtime.sendMessage({ type: "start-captioning" });
+    void chrome.runtime.sendMessage({ type: "start-captioning" });
     button.textContent = "Caption AI enabled";
-
-    // 3.2. Định kỳ mỗi 500ms gửi mốc thời gian video.currentTime hiện tại cho Extension
-    setInterval(() => {
-      chrome.runtime.sendMessage({
-        type: "video-clock",
-        videoTime: video.currentTime,
-      });
-    }, 500);
   });
-
-  // Chèn nút bấm vào DOM của trang web
   document.documentElement.append(button);
 }
 
+function findVideo() {
+  return document.querySelector("video");
+}
+
+const initialVideo = findVideo();
+console.info("Caption AI: videos found", initialVideo ? 1 : 0);
+
+if (initialVideo) {
+  attachVideo(initialVideo);
+} else {
+  // Chỉ quét lại khi mutation thực sự thêm node có thể chứa <video>.
+  const observer = new MutationObserver((mutations) => {
+    const hasPossibleVideo = mutations.some((mutation) =>
+      Array.from(mutation.addedNodes).some(
+        (node) =>
+          node.nodeType === Node.ELEMENT_NODE &&
+          ((node as Element).matches("video") ||
+            (node as Element).querySelector("video") !== null),
+      ),
+    );
+
+    if (!hasPossibleVideo) return;
+
+    const video = findVideo();
+    if (!video) return;
+
+    observer.disconnect();
+    console.info("Caption AI: videos found", 1);
+    attachVideo(video);
+  });
+
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+}

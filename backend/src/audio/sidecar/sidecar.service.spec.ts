@@ -1,4 +1,20 @@
 import { Test, TestingModule } from '@nestjs/testing';
+
+jest.mock('ws', () => ({
+  WebSocket: class MockWebSocket {
+    static readonly OPEN = 1;
+    readonly readyState = 1;
+
+    on() {
+      return this;
+    }
+
+    close() {
+      return undefined;
+    }
+  },
+}));
+
 import { SidecarService } from './sidecar.service';
 
 describe('SidecarService', () => {
