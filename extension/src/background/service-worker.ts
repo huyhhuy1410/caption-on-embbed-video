@@ -3,9 +3,13 @@ console.info("Caption AI: service worker loaded");
 // === BƯỚC 1: Lắng nghe sự kiện click vào Icon Extension trên thanh Toolbar ===
 chrome.action.onClicked.addListener((tab) => {
   if (tab.id === undefined) return;
-  void startCapture(tab.id).catch((error: unknown) => {
-    console.error("Could not start captioning:", error);
-  });
+  void startCapture(tab.id)
+    .then(() => {
+      return chrome.tabs.sendMessage(tab.id!, { type: "capturing" });
+    })
+    .catch((error: unknown) => {
+      console.error("Could not start captioning:", error);
+    });
 });
 
 // === BƯỚC 2: Lắng nghe tin nhắn từ Content Script hoặc các trang nội bộ ===
