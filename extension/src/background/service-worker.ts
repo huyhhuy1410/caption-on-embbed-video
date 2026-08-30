@@ -18,15 +18,25 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     console.info(
       "Click the Caption AI toolbar icon to grant tab capture access.",
     );
-    void startCapture(tabId);
+    void startCapture(tabId)
+      .then(() => {
+        return chrome.tabs.sendMessage(tabId, { type: "capturing" });
+      })
+      .catch((error: unknown) => {
+        console.error("Could not start captioning:", error);
+      });
   }
 
   // 2.2. Nhận mốc video.currentTime và chuyển tiếp (relay) sang cho Offscreen Document
   if (message?.type === "video-clock") {
-    void chrome.runtime.sendMessage({
-      type: "video-clock",
-      videoTime: message.videoTime,
-    });
+    void chrome.runtime
+      .sendMessage({
+        type: "video-clock",
+        videoTime: message.videoTime,
+      })
+      .catch((error: unknown) => {
+        console.warn("Caption AI SW: could not relay video clock", error);
+      });
   }
 
   if (message?.type === "seek") {
