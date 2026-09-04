@@ -1,0 +1,23 @@
+### Variables
+@baseUrl = http://localhost:8000
+
+### 1. Translate sentence
+POST {{baseUrl}}/translate
+Content-Type: application/json
+
+{
+  "sentence": "Artificial intelligence is transforming the way we work.",
+  "from": "en",
+  "to": "vi"
+}
+
+### 2. Explain word in context
+POST {{baseUrl}}/explain-word
+Content-Type: application/json
+
+{
+  "word": "transforming",
+  "context": "Artificial intelligence is transforming the way we work.",
+  "lang": "vi",
+  "spam": "spam"
+}
