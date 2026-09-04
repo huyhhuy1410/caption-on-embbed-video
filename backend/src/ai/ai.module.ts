@@ -8,14 +8,26 @@ import { ExplainController } from './explain.controller';
 
 @Module({
   providers: [
-    GeminiProvider,
-    {
-      provide: TRANSLATION_PROVIDER,
-      useClass: GeminiProvider,
-    },
-    { provide: EXPLAIN_PROVIDER, useClass: GeminiProvider },
     TranslateService,
     ExplainService,
+    {
+      // Class-token factory: Nest resolves GeminiProvider (by its class) to the
+      // instance this factory builds — the ONE instance both tokens below share.
+      provide: GeminiProvider,
+      useFactory: () =>
+        new GeminiProvider({
+          apiKey: process.env.AI_API_KEY ?? '',
+          model: process.env.AI_MODEL ?? undefined,
+        }),
+    },
+    {
+      provide: TRANSLATION_PROVIDER,
+      useExisting: GeminiProvider,
+    },
+    {
+      provide: EXPLAIN_PROVIDER,
+      useExisting: GeminiProvider,
+    },
   ],
   exports: [
     TRANSLATION_PROVIDER,
