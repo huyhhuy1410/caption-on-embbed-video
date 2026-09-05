@@ -1,82 +1,131 @@
 console.info("Caption AI: content script loaded", window.location.href);
-let captionEnabled = false;
-function attachVideo(video: HTMLVideoElement) {
-  if (video.dataset.captionAiTracked === "true") return;
-  video.dataset.captionAiTracked = "true";
-  console.info("Caption AI: tracking video", video);
 
-  // Gửi video-clock theo sự kiện timeupdate (chỉ khi currentTime đổi),
-  // thay cho setInterval 500ms — giảm tải message khi video không chạy.
-  video.addEventListener("timeupdate", () => {
+let captionEnabled = false;
+let activeVideo: HTMLVideoElement | null = null;
+
+// === BƯỚC 1: Lắng nghe tín hiệu kích hoạt caption từ Service Worker ===
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "capturing") {
+    captionEnabled = true;
+    if (activeVideo) {
+      void chrome.runtime
+        .sendMessage({
+          type: "video-clock",
+          videoTime: activeVideo.currentTime,
+        })
+        .catch((error: unknown) => {
+          console.warn("Caption AI: could not send initial video clock", error);
+        });
+    }
+  }
+});
+
+// === BƯỚC 2: Bắt sự kiện media qua Event Delegation (Capture phase) ===
+// 2.1. Đồng bộ tiến trình video (currentTime) sang Service Worker
+document.addEventListener(
+  "timeupdate",
+  (e) => {
     if (!captionEnabled) return;
+    if (!activeVideo || e.target !== activeVideo) return;
+
     void chrome.runtime
       .sendMessage({
         type: "video-clock",
-        videoTime: video.currentTime,
+        videoTime: activeVideo.currentTime,
       })
       .catch(() => {
         // Service worker may not be ready yet.
       });
-  });
+  },
+  { capture: true },
+);
 
-  video.addEventListener("seeked", () => {
+// 2.2. Gửi tín hiệu tua (seek) để backend reset bộ đệm audio/caption
+document.addEventListener(
+  "seeked",
+  (e) => {
     if (!captionEnabled) return;
+    if (!activeVideo || e.target !== activeVideo) return;
+
     const message = {
       type: "seek",
-      seekTimeAtCapture: video.currentTime,
+      seekTimeAtCapture: activeVideo.currentTime,
     };
     console.info("Caption AI: video seeked", message);
     void chrome.runtime.sendMessage(message).catch((error: unknown) => {
       console.warn("Caption AI: could not send seek", error);
     });
-  });
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message.type === "capturing") {
-      captionEnabled = true;
-      const message = {
-        type: "video-clock",
-        videoTime: video.currentTime,
-      };
-      void chrome.runtime.sendMessage(message).catch((error: unknown) => {
-        console.warn("Caption AI: could not send initial video clock", error);
-      });
+  },
+  { capture: true },
+);
+
+// === BƯỚC 3: Xác định activeVideo theo thứ tự ưu tiên ===
+// Lưu ý: querySelectorAll("video") không tìm được video nằm trong Shadow DOM.
+// Tạm chấp nhận cho phạm vi MVP, cần xử lý đệ quy shadowRoot (open) ở phiên bản sau.
+function reconcile() {
+  const prevVideo = activeVideo;
+  const videos = Array.from(document.querySelectorAll("video"));
+
+  if (videos.length === 0) {
+    activeVideo = null;
+  } else {
+    // 1. Ưu tiên video đang phát
+    const playingVideo = videos.find((v) => !v.paused && !v.ended);
+    if (playingVideo) {
+      activeVideo = playingVideo;
+    } else if (activeVideo && activeVideo.isConnected) {
+      // 2. Giữ nguyên video hiện tại nếu vẫn còn trong DOM
+    } else {
+      // 3. Fallback sang video hiển thị đầu tiên
+      const visibleVideo = videos.find(
+        (v) => v.offsetWidth > 0 || v.offsetHeight > 0,
+      );
+      activeVideo = visibleVideo ?? videos[0];
     }
-  });
+  }
+
+  if (activeVideo !== prevVideo) {
+    console.info("Caption AI: active video reconciled", activeVideo);
+  }
 }
 
-function findVideo() {
-  return document.querySelector("video");
+// === BƯỚC 4: Kích hoạt reconcile theo vòng đời DOM và sự kiện phát ===
+// 4.1. Quét video khi khởi động script
+reconcile();
+
+// 4.2. Chuyển activeVideo ngay khi có video bắt đầu phát
+document.addEventListener(
+  "play",
+  (e) => {
+    if (e.target instanceof HTMLVideoElement) {
+      reconcile();
+    }
+  },
+  { capture: true },
+);
+
+// 4.3. Theo dõi DOM để cập nhật khi có video được thêm/xoá
+function hasPossibleVideoNode(node: Node): boolean {
+  return (
+    node.nodeType === Node.ELEMENT_NODE &&
+    ((node as Element).matches("video") ||
+      (node as Element).querySelector("video") !== null)
+  );
 }
 
-const initialVideo = findVideo();
-console.info("Caption AI: videos found", initialVideo ? 1 : 0);
+const observer = new MutationObserver((mutations) => {
+  const hasVideoChange = mutations.some(
+    (mutation) =>
+      Array.from(mutation.addedNodes).some(hasPossibleVideoNode) ||
+      Array.from(mutation.removedNodes).some(hasPossibleVideoNode),
+  );
 
-if (initialVideo) {
-  attachVideo(initialVideo);
-} else {
-  // Chỉ quét lại khi mutation thực sự thêm node có thể chứa <video>.
-  const observer = new MutationObserver((mutations) => {
-    const hasPossibleVideo = mutations.some((mutation) =>
-      Array.from(mutation.addedNodes).some(
-        (node) =>
-          node.nodeType === Node.ELEMENT_NODE &&
-          ((node as Element).matches("video") ||
-            (node as Element).querySelector("video") !== null),
-      ),
-    );
+  if (hasVideoChange) {
+    reconcile();
+  }
+});
 
-    if (!hasPossibleVideo) return;
-
-    const video = findVideo();
-    if (!video) return;
-
-    observer.disconnect();
-    console.info("Caption AI: videos found", 1);
-    attachVideo(video);
-  });
-
-  observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-  });
-}
+observer.observe(document.documentElement, {
+  childList: true,
+  subtree: true,
+});
