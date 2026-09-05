@@ -70,11 +70,14 @@ async function startCapture(tabId: number) {
     });
   });
 
+  console.info("Caption AI SW: tab capture stream ID acquired", { tabId, streamId });
+
   // 3.2. Đảm bảo Offscreen Document đã được khởi tạo
   await ensureOffscreenDocument();
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
 
   // 3.3. Gửi tin nhắn chứa streamId cho Offscreen Document bắt đầu ghi âm
+  console.info("Caption AI SW: dispatching start-audio-capture to offscreen");
   chrome.runtime.sendMessage({
     type: "start-audio-capture",
     streamId,
@@ -89,6 +92,7 @@ async function ensureOffscreenDocument() {
   );
 
   if (!exists) {
+    console.info("Caption AI SW: creating offscreen document");
     await chrome.offscreen.createDocument({
       url: "dist/offscreen/offscreen.html",
       reasons: [chrome.offscreen.Reason.USER_MEDIA],

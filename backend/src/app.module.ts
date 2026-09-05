@@ -11,11 +11,13 @@ import { ConfigModule } from '@nestjs/config';
 @Module({
   imports: [
     AiModule,
+    // Nạp biến môi trường (.env) toàn cục cho toàn bộ ứng dụng
     ConfigModule.forRoot({
       isGlobal: true,
     }),
   ],
   controllers: [AppController, HealthController],
+  // AudioGateway, SidecarService và TranscriptService phối hợp xử lý pipeline audio
   providers: [AppService, AudioGateway, SidecarService, TranscriptService],
 })
 export class AppModule {}

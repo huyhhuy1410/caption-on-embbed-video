@@ -39,6 +39,11 @@ async function captureTabAudio(streamId: string) {
     video: false,
   });
 
+  const audioTrack = stream.getAudioTracks()[0];
+  audioTrack?.addEventListener("ended", () => {
+    console.warn("Caption AI offscreen: tab audio track ended by browser/user");
+  });
+
   // 2.2. Khởi tạo AudioContext với tần số lấy mẫu chuẩn 16,000 Hz
   const audioContext = new AudioContext({
     sampleRate: 16000,
@@ -51,6 +56,16 @@ async function captureTabAudio(streamId: string) {
 
   socket.addEventListener("open", () => {
     console.info("Connected to backend WebSocket");
+  });
+
+  socket.addEventListener("error", (event) => {
+    console.error("Caption AI offscreen: backend WebSocket error", event);
+  });
+
+  socket.addEventListener("close", (event) => {
+    console.warn(
+      `Caption AI offscreen: backend WebSocket closed (code: ${event.code}, reason: ${event.reason || "none"})`,
+    );
   });
 
   // 2.4. Lắng nghe kết quả Subtitle trả về từ Backend NestJS

@@ -46,6 +46,10 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     console.info('Extension connected to audio WebSocket');
     this.extensionClient = client; // Lưu tham chiếu client vào cấp Class
 
+    client.on('error', (err) => {
+      console.error('Extension audio WebSocket error:', err);
+    });
+
     // 2.1. Lắng nghe từng gói tin từ Extension gửi lên
     client.on('message', (data: RawData, isBinary: boolean) => {
       // Nhánh A: Nếu là dữ liệu Nhị phân (PCM Audio Bytes)

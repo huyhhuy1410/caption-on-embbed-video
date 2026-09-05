@@ -8,6 +8,7 @@ export interface ExplainInput {
   context: string;
   lang: string;
 }
+// Service giải thích từ vựng trong ngữ cảnh: ủy quyền cho ExplainProvider (Gemini)
 @Injectable()
 export class ExplainService {
   constructor(
