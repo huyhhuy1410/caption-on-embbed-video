@@ -1,5 +1,6 @@
 docs/
 CLAUDE.md
+.continueignore
 
 # --- Node / extension / backend ---
 node_modules/

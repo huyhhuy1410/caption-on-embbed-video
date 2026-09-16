@@ -98,6 +98,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
 
+# === Helper: Hàm thuần tính mốc thời gian video cho một từ (tách khỏi whisper để test được) ===
+def compute_video_time(raw_video_time: float, word_time: float, is_first_chunk: bool) -> float:
+    base_video_time = raw_video_time - (1.5 if not is_first_chunk else 0.0)
+    return round(base_video_time + word_time, 2)
 
 # === BƯỚC 5: Helper Chuyển đổi Bytes PCM16 -> NumPy Float32 (-1.0 đến 1.0) ===
 def bytes_to_float32(audio_bytes: bytes) -> np.ndarray:
@@ -135,7 +139,6 @@ async def transcribe_chunk(
 
     # 7.2. Lấy mốc thời gian Video tại thời điểm bắt đầu Window (Anchor)
     raw_video_time = metadata.get("videoTimeAtCapture", 0.0) if metadata else 0.0
-    base_video_time = raw_video_time - (1.5 if not is_first_chunk else 0.0)
     words: list[dict[str, Any]] = []
     for segment in segments:
         for word in segment.words or []:
@@ -144,8 +147,8 @@ async def transcribe_chunk(
                     "w": word.word.strip(),                         # Từ ngữ (Word)
                     "s": word.start,                                # Giây bắt đầu trong Window 6s
                     "e": word.end,                                  # Giây kết thúc trong Window 6s
-                    "videoStart": round(base_video_time + word.start, 2), # Mốc thời gian thực trên Video
-                    "videoEnd": round(base_video_time + word.end, 2),     # Mốc thời gian thực trên Video
+                    "videoStart": compute_video_time(raw_video_time, word.start, is_first_chunk), # Mốc thời gian thực trên Video
+                    "videoEnd": compute_video_time(raw_video_time, word.end, is_first_chunk),    # Mốc thời gian thực trên Video
                     "c": word.probability,                          # Độ tự tin của AI (Confidence)
                 }
             )
