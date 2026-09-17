@@ -1,12 +1,20 @@
+import { CaptionOverlay } from "./overlay";
 console.info("Caption AI: content script loaded", window.location.href);
 
 let captionEnabled = false;
 let activeVideo: HTMLVideoElement | null = null;
+const overlay = new CaptionOverlay();
 
+function repositionOverlay() {
+  if (!activeVideo) return;
+  overlay.position(activeVideo.getBoundingClientRect());
+}
 // === BƯỚC 1: Lắng nghe tín hiệu kích hoạt caption từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "capturing") {
     captionEnabled = true;
+    overlay.show();
+    repositionOverlay();
     if (activeVideo) {
       void chrome.runtime
         .sendMessage({
@@ -18,6 +26,9 @@ chrome.runtime.onMessage.addListener((message) => {
         });
     }
   }
+  if (message.type === "words" && Array.isArray(message.words)) {
+    overlay.setWords(message.words);
+  }
 });
 
 // === BƯỚC 2: Bắt sự kiện media qua Event Delegation (Capture phase) ===
@@ -27,7 +38,8 @@ document.addEventListener(
   (e) => {
     if (!captionEnabled) return;
     if (!activeVideo || e.target !== activeVideo) return;
-
+    overlay.update(activeVideo.currentTime);
+    repositionOverlay();
     void chrome.runtime
       .sendMessage({
         type: "video-clock",
@@ -44,6 +56,10 @@ document.addEventListener(
 document.addEventListener(
   "seeked",
   (e) => {
+    console.info("Caption AI: seeked fired", {
+      enabled: captionEnabled,
+      match: e.target === activeVideo,
+    });
     if (!captionEnabled) return;
     if (!activeVideo || e.target !== activeVideo) return;
 
@@ -103,7 +119,11 @@ document.addEventListener(
   },
   { capture: true },
 );
-
+window.addEventListener("scroll", repositionOverlay, {
+  capture: true,
+  passive: true,
+});
+window.addEventListener("resize", repositionOverlay, { passive: true });
 // 4.3. Theo dõi DOM để cập nhật khi có video được thêm/xoá
 function hasPossibleVideoNode(node: Node): boolean {
   return (
