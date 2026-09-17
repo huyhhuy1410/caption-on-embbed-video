@@ -1,8 +1,12 @@
+let capturedTabId: number | undefined;
+
 console.info("Caption AI: service worker loaded");
 
 // === BƯỚC 1: Lắng nghe sự kiện click vào Icon Extension trên thanh Toolbar ===
 chrome.action.onClicked.addListener((tab) => {
   if (tab.id === undefined) return;
+  capturedTabId = tab.id;
+
   void startCapture(tab.id)
     .then(() => {
       return chrome.tabs.sendMessage(tab.id!, { type: "capturing" });
@@ -18,6 +22,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type === "start-captioning") {
     const tabId = sender.tab?.id;
     if (tabId === undefined) return;
+    capturedTabId = tabId;
 
     console.info(
       "Click the Caption AI toolbar icon to grant tab capture access.",
@@ -54,6 +59,17 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         console.warn("Caption AI SW: could not relay seek", error);
       });
   }
+  // Nhận words từ offscreen (đã qua backend) → chuyển tiếp tới content script
+  if (message?.type === "words" && capturedTabId !== undefined) {
+    void chrome.tabs
+      .sendMessage(capturedTabId, {
+        type: "words",
+        words: message.words,
+      })
+      .catch((error: unknown) => {
+        console.warn("Caption AI SW: could not relay words to content", error);
+      });
+  }
 });
 
 // === BƯỚC 3: Hàm thực hiện lấy Stream ID của Tab và kích hoạt Offscreen ===
@@ -70,7 +86,10 @@ async function startCapture(tabId: number) {
     });
   });
 
-  console.info("Caption AI SW: tab capture stream ID acquired", { tabId, streamId });
+  console.info("Caption AI SW: tab capture stream ID acquired", {
+    tabId,
+    streamId,
+  });
 
   // 3.2. Đảm bảo Offscreen Document đã được khởi tạo
   await ensureOffscreenDocument();
@@ -81,6 +100,7 @@ async function startCapture(tabId: number) {
   chrome.runtime.sendMessage({
     type: "start-audio-capture",
     streamId,
+    tabId,
   });
 }
 

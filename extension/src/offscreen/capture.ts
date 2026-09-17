@@ -71,6 +71,20 @@ async function captureTabAudio(streamId: string) {
   // 2.4. Lắng nghe kết quả Subtitle trả về từ Backend NestJS
   socket.addEventListener("message", (event) => {
     console.info("Words from backend:", event.data);
+    try {
+      const parsed = JSON.parse(event.data);
+      if (parsed.type === "words") {
+        // Offscreen KHÔNG có chrome.tabs ⇒ không gửi thẳng cho content được.
+        // Gửi về SW, SW sẽ chuyển tiếp tới content script của tab.
+        void chrome.runtime
+          .sendMessage({ type: "words", words: parsed.words })
+          .catch((error: unknown) => {
+            console.warn("Caption AI offscreen: could not relay words", error);
+          });
+      }
+    } catch (error) {
+      console.warn("Failed to parse message", error);
+    }
   });
 
   // 2.5. Nạp module AudioWorklet xử lý PCM nhị phân
