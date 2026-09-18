@@ -60,10 +60,13 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       });
   }
   // Nhận words từ offscreen (đã qua backend) → chuyển tiếp tới content script
-  if (message?.type === "words" && capturedTabId !== undefined) {
+  if (
+    (message?.type === "words" || message?.type === "replay") &&
+    capturedTabId !== undefined
+  ) {
     void chrome.tabs
       .sendMessage(capturedTabId, {
-        type: "words",
+        type: message.type,
         words: message.words,
       })
       .catch((error: unknown) => {

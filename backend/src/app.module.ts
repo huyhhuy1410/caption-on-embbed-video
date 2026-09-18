@@ -7,6 +7,7 @@ import { SidecarService } from './audio/sidecar/sidecar.service';
 import { TranscriptService } from './audio/transcript/transcript.service';
 import { AiModule } from './ai/ai.module';
 import { ConfigModule } from '@nestjs/config';
+import { VideoClockService } from './audio/clock/video-clock.service';
 
 @Module({
   imports: [
@@ -18,6 +19,12 @@ import { ConfigModule } from '@nestjs/config';
   ],
   controllers: [AppController, HealthController],
   // AudioGateway, SidecarService và TranscriptService phối hợp xử lý pipeline audio
-  providers: [AppService, AudioGateway, SidecarService, TranscriptService],
+  providers: [
+    AppService,
+    AudioGateway,
+    SidecarService,
+    TranscriptService,
+    VideoClockService,
+  ],
 })
 export class AppModule {}

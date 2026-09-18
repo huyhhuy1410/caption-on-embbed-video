@@ -2,8 +2,9 @@ export interface CaptionWord {
   w: string;
   videoStart: number;
   videoEnd: number;
+  captionStart: number;
 }
-const LINE_GAP_SECONDS = 0.5;
+
 export class CaptionOverlay {
   private host: HTMLDivElement;
   private shadow: ShadowRoot;
@@ -11,6 +12,7 @@ export class CaptionOverlay {
   private viLine: HTMLDivElement;
   private words: CaptionWord[] = [];
   private lastLineKey: number = -1;
+  private lastLineEnd: number = -1;
   private wordSpans: HTMLSpanElement[] = [];
 
   constructor() {
@@ -53,7 +55,7 @@ export class CaptionOverlay {
   text-align: center;
 }
 .word-active {
-  color: #4fc3f7;            /* từ đang nói */
+  color: #4fc3f7;
   text-decoration: underline;
 }
 `;
@@ -87,32 +89,41 @@ export class CaptionOverlay {
     this.words = deduped;
 
     this.lastLineKey = -1;
+    this.lastLineEnd = -1;
   }
 
   update(videoTime: number): void {
-    const currentIndex = this.words.findIndex(
-      (w) => videoTime >= w.videoStart && videoTime <= w.videoEnd,
-    );
+    let currentIndex = -1;
+    for (let i = this.words.length - 1; i >= 0; i--) {
+      if (this.words[i].videoStart <= videoTime) {
+        currentIndex = i;
+        break;
+      }
+    }
+    // Không tìm được ⇒ chưa có từ nào, hoặc video ở vùng CHƯA transcribe
+    // (trước từ đầu tiên) ⇒ để trống, chờ ASR.
     if (currentIndex === -1) return;
+
+    const captionStart = this.words[currentIndex].captionStart;
+
     let start = currentIndex;
-    while (
-      start > 0 &&
-      this.words[start].videoStart - this.words[start - 1].videoEnd <
-        LINE_GAP_SECONDS
-    ) {
+    while (start > 0 && this.words[start - 1].captionStart === captionStart) {
       start--;
     }
+
     let end = currentIndex;
     while (
       end < this.words.length - 1 &&
-      this.words[end + 1].videoStart - this.words[end].videoEnd <
-        LINE_GAP_SECONDS
+      this.words[end + 1].captionStart === captionStart
     ) {
       end++;
     }
-    const lineKey = this.words[start].videoStart;
-    if (lineKey !== this.lastLineKey) {
+
+    const lineKey = captionStart;
+
+    if (lineKey !== this.lastLineKey || end !== this.lastLineEnd) {
       this.lastLineKey = lineKey;
+      this.lastLineEnd = end;
       this.enLine.textContent = "";
       this.wordSpans = [];
       for (let i = start; i <= end; i++) {
@@ -127,6 +138,7 @@ export class CaptionOverlay {
     this.wordSpans.forEach((span, i) => {
       span.className = i === activeOffset ? "word-active" : "";
     });
+
   }
   position(rect: DOMRect): void {
     this.host.style.left = `${rect.left}px`;

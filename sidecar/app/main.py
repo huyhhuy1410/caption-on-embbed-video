@@ -11,6 +11,7 @@ SAMPLE_RATE = 16000                     # Tần số lấy mẫu âm thanh: 16,0
 WINDOW_SIZE = 6 * SAMPLE_RATE          # Cửa sổ nhận diện 6 giây = 96,000 samples
 OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giây = 24,000 samples
 MAX_BUFFER_SIZE = 12 * SAMPLE_RATE     # Giới hạn bộ đệm tối đa 12 giây (Watchdog chống tràn RAM)
+MAX_WORDS_PER_CAPTION = 8
 
 # Khai báo biến toàn cục lưu trữ mô hình Whisper AI
 model: WhisperModel | None = None
@@ -140,18 +141,52 @@ async def transcribe_chunk(
     # 7.2. Lấy mốc thời gian Video tại thời điểm bắt đầu Window (Anchor)
     raw_video_time = metadata.get("videoTimeAtCapture", 0.0) if metadata else 0.0
     words: list[dict[str, Any]] = []
+    caption_start: float | None = None
+    caption_word_count = 0
+
     for segment in segments:
         for word in segment.words or []:
+
+            text = word.word.strip()
+
+            # Video-clock key remains stable across overlap and replay.
+            if caption_start is None:
+                caption_start = compute_video_time(
+                    raw_video_time,
+                    word.start,
+                    is_first_chunk,
+                )
+
             words.append(
                 {
-                    "w": word.word.strip(),                         # Từ ngữ (Word)
-                    "s": word.start,                                # Giây bắt đầu trong Window 6s
-                    "e": word.end,                                  # Giây kết thúc trong Window 6s
-                    "videoStart": compute_video_time(raw_video_time, word.start, is_first_chunk), # Mốc thời gian thực trên Video
-                    "videoEnd": compute_video_time(raw_video_time, word.end, is_first_chunk),    # Mốc thời gian thực trên Video
-                    "c": word.probability,                          # Độ tự tin của AI (Confidence)
+                    "w": text,
+                    "s": word.start,
+                    "e": word.end,
+                    "videoStart": compute_video_time(
+                        raw_video_time,
+                        word.start,
+                        is_first_chunk,
+                    ),
+                    "videoEnd": compute_video_time(
+                        raw_video_time,
+                        word.end,
+                        is_first_chunk,
+                    ),
+                    "captionStart": caption_start,
+                    "c": word.probability,
                 }
             )
+
+            caption_word_count += 1
+
+            # Bound each group so a long segment cannot cover the video.
+            if (
+                caption_word_count >= MAX_WORDS_PER_CAPTION
+                or text.endswith((".", "?", "!"))
+            ):
+                caption_start = None
+                caption_word_count = 0
+
 
     # 7.3. Trả về kết quả JSON chứa danh sách từ đã đồng bộ mốc thời gian Video
     await websocket.send_json(

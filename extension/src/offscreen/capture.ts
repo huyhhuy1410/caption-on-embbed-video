@@ -73,11 +73,14 @@ async function captureTabAudio(streamId: string) {
     console.info("Words from backend:", event.data);
     try {
       const parsed = JSON.parse(event.data);
-      if (parsed.type === "words") {
+      if (
+        (parsed.type === "words" || parsed.type === "replay") &&
+        Array.isArray(parsed.words)
+      ) {
         // Offscreen KHÔNG có chrome.tabs ⇒ không gửi thẳng cho content được.
-        // Gửi về SW, SW sẽ chuyển tiếp tới content script của tab.
+        // Gửi về SW; SW giữ capturedTabId và sẽ gửi đến content script đúng tab.
         void chrome.runtime
-          .sendMessage({ type: "words", words: parsed.words })
+          .sendMessage({ type: parsed.type, words: parsed.words })
           .catch((error: unknown) => {
             console.warn("Caption AI offscreen: could not relay words", error);
           });

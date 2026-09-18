@@ -6,6 +6,7 @@ import {
 import { RawData, WebSocket } from 'ws';
 import { SidecarService } from './sidecar/sidecar.service';
 import { TranscriptService } from './transcript/transcript.service';
+import { VideoClockService } from './clock/video-clock.service';
 
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -16,6 +17,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   constructor(
     private readonly sidecarService: SidecarService,
     private readonly transcriptService: TranscriptService,
+    private readonly videoClockService: VideoClockService,
   ) {
     // 1.1. Đăng ký callback lắng nghe kết quả Subtitle trả về từ Python Sidecar
     this.sidecarService.setMessageHandler((data) => {
@@ -69,6 +71,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             .seekTimeAtCapture;
           console.info('Backend: seek received', parsed);
           if (seekTime !== undefined) {
+            this.videoClockService.reset();
+
             const from = seekTime;
             const to = seekTime + 3;
             const replayWords = this.transcriptService.getRange(from, to);
@@ -88,7 +92,18 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             }
           }
         } else {
-          this.sidecarService.sendMetadata(parsed); // Forward metadata cho Sidecar Python
+          // Gắn lại anchor: video time tại ĐẦU audio của chunk này, không phải
+          // tại lúc gửi. Xem VideoClockService.
+          const withAnchor =
+            isRecord(parsed) && typeof parsed.videoTimeAtCapture === 'number'
+              ? {
+                  ...parsed,
+                  videoTimeAtCapture: this.videoClockService.resolveAnchor(
+                    parsed.videoTimeAtCapture,
+                  ),
+                }
+              : parsed;
+          this.sidecarService.sendMetadata(withAnchor);
         }
       } catch {
         console.warn('Received invalid JSON message');

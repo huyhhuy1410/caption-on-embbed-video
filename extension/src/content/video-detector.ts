@@ -26,7 +26,10 @@ chrome.runtime.onMessage.addListener((message) => {
         });
     }
   }
-  if (message.type === "words" && Array.isArray(message.words)) {
+  if (
+    (message.type === "words" || message.type === "replay") &&
+    Array.isArray(message.words)
+  ) {
     overlay.setWords(message.words);
   }
 });

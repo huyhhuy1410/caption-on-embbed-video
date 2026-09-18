@@ -5,6 +5,7 @@ export type Word = {
   e: number;
   videoStart: number;
   videoEnd: number;
+  captionStart: number;
   c: number;
 };
 

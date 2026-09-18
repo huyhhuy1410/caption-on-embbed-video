@@ -8,6 +8,7 @@ function makeWord(videoStart: number): Word {
     e: 0.5,
     videoStart,
     videoEnd: videoStart + 0.5,
+    captionStart: videoStart,
     c: 1,
   };
 }
@@ -23,6 +24,16 @@ describe('TranscriptService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+  it('keeps captionStart when replaying cached words', () => {
+    const word = makeWord(4.2);
+    word.captionStart = 4.0;
+
+    service.addWords([word]);
+
+    expect(service.getRange(4, 5)).toEqual([
+      expect.objectContaining({ captionStart: 4.0 }),
+    ]);
   });
 
   describe('TTL', () => {
