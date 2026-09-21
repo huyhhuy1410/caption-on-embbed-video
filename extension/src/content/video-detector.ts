@@ -3,12 +3,44 @@ console.info("Caption AI: content script loaded", window.location.href);
 
 let captionEnabled = false;
 let activeVideo: HTMLVideoElement | null = null;
+let overlayFrameId: number | null = null;
 const overlay = new CaptionOverlay();
 
 function repositionOverlay() {
   if (!activeVideo) return;
   overlay.position(activeVideo.getBoundingClientRect());
 }
+function updateOverlayFromVideo(): void {
+  if (!captionEnabled || !activeVideo || activeVideo.paused) {
+    overlayFrameId = null;
+    return;
+  }
+  overlay.update(activeVideo.currentTime);
+  overlayFrameId = window.requestAnimationFrame(updateOverlayFromVideo);
+}
+function startOverlayLoop(): void {
+  if (
+    !captionEnabled ||
+    !activeVideo ||
+    activeVideo.paused ||
+    overlayFrameId !== null
+  ) {
+    return;
+  }
+  overlayFrameId = window.requestAnimationFrame(updateOverlayFromVideo);
+}
+function stopOverlayLoop(): void {
+  if (overlayFrameId !== null) {
+    window.cancelAnimationFrame(overlayFrameId);
+    overlayFrameId = null;
+  }
+}
+
+function updateOverlayNow(): void {
+  if (!activeVideo) return;
+  overlay.update(activeVideo.currentTime);
+}
+
 // === BƯỚC 1: Lắng nghe tín hiệu kích hoạt caption từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "capturing") {
@@ -16,6 +48,9 @@ chrome.runtime.onMessage.addListener((message) => {
     overlay.show();
     repositionOverlay();
     if (activeVideo) {
+      updateOverlayNow();
+      startOverlayLoop();
+
       void chrome.runtime
         .sendMessage({
           type: "video-clock",
@@ -31,6 +66,7 @@ chrome.runtime.onMessage.addListener((message) => {
     Array.isArray(message.words)
   ) {
     overlay.setWords(message.words);
+    updateOverlayNow();
   }
 });
 
@@ -41,7 +77,7 @@ document.addEventListener(
   (e) => {
     if (!captionEnabled) return;
     if (!activeVideo || e.target !== activeVideo) return;
-    overlay.update(activeVideo.currentTime);
+
     repositionOverlay();
     void chrome.runtime
       .sendMessage({
@@ -66,14 +102,28 @@ document.addEventListener(
     if (!captionEnabled) return;
     if (!activeVideo || e.target !== activeVideo) return;
 
-    const message = {
-      type: "seek",
-      seekTimeAtCapture: activeVideo.currentTime,
-    };
-    console.info("Caption AI: video seeked", message);
-    void chrome.runtime.sendMessage(message).catch((error: unknown) => {
-      console.warn("Caption AI: could not send seek", error);
-    });
+    updateOverlayNow();
+    repositionOverlay();
+    startOverlayLoop();
+  },
+  { capture: true },
+);
+document.addEventListener(
+  "pause",
+  (e) => {
+    if (e.target === activeVideo) {
+      updateOverlayNow();
+      stopOverlayLoop();
+    }
+  },
+  { capture: true },
+);
+document.addEventListener(
+  "ended",
+  (e) => {
+    if (e.target === activeVideo) {
+      stopOverlayLoop();
+    }
   },
   { capture: true },
 );
@@ -84,27 +134,35 @@ document.addEventListener(
 function reconcile() {
   const prevVideo = activeVideo;
   const videos = Array.from(document.querySelectorAll("video"));
+  let nextVideo: HTMLVideoElement | null = null;
 
   if (videos.length === 0) {
-    activeVideo = null;
+    nextVideo = null;
   } else {
     // 1. Ưu tiên video đang phát
     const playingVideo = videos.find((v) => !v.paused && !v.ended);
     if (playingVideo) {
-      activeVideo = playingVideo;
+      nextVideo = playingVideo;
     } else if (activeVideo && activeVideo.isConnected) {
       // 2. Giữ nguyên video hiện tại nếu vẫn còn trong DOM
+      nextVideo = activeVideo;
     } else {
       // 3. Fallback sang video hiển thị đầu tiên
       const visibleVideo = videos.find(
         (v) => v.offsetWidth > 0 || v.offsetHeight > 0,
       );
-      activeVideo = visibleVideo ?? videos[0];
+      nextVideo = visibleVideo ?? videos[0];
     }
   }
 
-  if (activeVideo !== prevVideo) {
+  if (nextVideo !== activeVideo) {
+    stopOverlayLoop();
+    activeVideo = nextVideo;
     console.info("Caption AI: active video reconciled", activeVideo);
+  }
+
+  if (activeVideo && !activeVideo.paused) {
+    startOverlayLoop();
   }
 }
 
@@ -118,6 +176,7 @@ document.addEventListener(
   (e) => {
     if (e.target instanceof HTMLVideoElement) {
       reconcile();
+      startOverlayLoop();
     }
   },
   { capture: true },
