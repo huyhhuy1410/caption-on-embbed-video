@@ -3,6 +3,7 @@ import { TranslationProvider } from '../contracts/translation-provider';
 import { ExplainProvider } from '../contracts/explain-provider';
 import { Translation } from '../types/translation';
 import { WordExplanation } from '../types/word-explanation';
+import { ProviderUnavailableError } from '../errors';
 
 export interface GeminiConfig {
   apiKey: string;
@@ -10,22 +11,36 @@ export interface GeminiConfig {
 }
 
 /**
- * Trạng thái đáng thử lại: 429 (hết quota tạm thời) và 503 (model quá tải).
- * 500 để nguyên — đó là lỗi phía Gemini, thử lại chỉ tốn thời gian.
+ * 503 (model quá tải) là trạng thái TẠM THỜI và thuộc về chính request đó ⇒
+ * thử lại ngay trong request là hợp lý.
+ *
+ * ⚠️ 429 KHÔNG nằm ở đây — xem `QUOTA_STATUS`. Hết quota là trạng thái của CẢ
+ * PROJECT trong cửa sổ một phút, nên thử lại trong cùng phút chỉ tổ đốt thêm
+ * quota mà chắc chắn vẫn 429.
  */
-const RETRYABLE_STATUS = new Set([429, 503]);
+const RETRYABLE_STATUS = new Set([503]);
+const QUOTA_STATUS = 429;
 const MAX_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 8_000;
 
 /**
- * 429 trả kèm `retryDelay: "5s"` trong body — tôn trọng nó. 503 không có, nên
- * backoff mũ. Luôn lấy giá trị LỚN HƠN để không thử lại sớm hơn server cho phép.
+ * Backoff cho 503. 503 không kèm `retryDelay`, nên dùng backoff mũ và cap lại
+ * để một request hỏng không treo luồng quá lâu.
  */
-export function retryDelayMs(body: string, attempt: number): number {
+export function retryDelayMs(attempt: number): number {
+  return Math.min(1000 * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
+}
+
+/**
+ * Thời gian server dặn chờ, đọc từ `retryDelay` trong body lỗi 429.
+ *
+ * ⚠️ KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
+ * cắt nó xuống dưới một phút — bản trước cap ở 8s — là tự bảo đảm lần thử kế
+ * tiếp rơi đúng vào cửa sổ vừa cạn, rồi 429 lại, và cứ thế.
+ */
+export function serverRetryDelayMs(body: string): number {
   const match = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(body);
-  const fromServer = match ? Number(match[1]) * 1000 : 0;
-  const backoff = 1000 * 2 ** (attempt - 1);
-  return Math.min(Math.max(fromServer, backoff), MAX_RETRY_DELAY_MS);
+  return match ? Number(match[1]) * 1000 : 0;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -91,15 +106,30 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
     if (!res.ok) {
       const text = await res.text();
       const status = res.status;
-      // 429/503 là tạm thời; 500 để nguyên — thử lại chỉ tốn thời gian.
+
+      // 429: không thử lại ở đây. Quota là của cả project trong một phút, nên
+      // request này chắc chắn 429 tiếp. Ném lên để tầng gateway tạm dừng MỌI
+      // request rồi thử lại sau — và giữ nguyên thời gian server dặn.
+      if (status === QUOTA_STATUS) {
+        const retryAfterMs = serverRetryDelayMs(text);
+        this.logger.warn(
+          `HTTP 429 (quota), pausing ${Math.round(retryAfterMs / 1000)}s`,
+        );
+        throw new ProviderUnavailableError(
+          `Request failed (HTTP 429)`,
+          retryAfterMs,
+        );
+      }
+
       if (RETRYABLE_STATUS.has(status) && attempt < MAX_ATTEMPTS) {
-        const delay = retryDelayMs(text, attempt);
+        const delay = retryDelayMs(attempt);
         this.logger.warn(
           `HTTP ${status}, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`,
         );
         await sleep(delay);
         continue;
       }
+
       // Parse Gemini error body without leaking the key (key is in URL, not echoed).
       this.logger.error(`HTTP ${status}: ${text}`);
       throw new Error(`Request failed (HTTP ${status})`);

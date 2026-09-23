@@ -1,4 +1,4 @@
-import { GeminiProvider, retryDelayMs } from './gemini.provider';
+import { GeminiProvider, retryDelayMs, serverRetryDelayMs } from './gemini.provider';
 
 describe('GeminiProvider', () => {
   // Provider config
@@ -192,18 +192,28 @@ describe('GeminiProvider', () => {
     });
   });
 
-  describe('retryDelayMs', () => {
-    it('honours a server retryDelay longer than the backoff', () => {
-      expect(retryDelayMs('{"retryDelay":"5s"}', 1)).toBe(5000);
+  describe('retryDelayMs (503 backoff)', () => {
+    it('backs off exponentially', () => {
+      expect(retryDelayMs(1)).toBe(1000);
+      expect(retryDelayMs(2)).toBe(2000);
     });
 
-    it('falls back to exponential backoff when the server gives none', () => {
-      expect(retryDelayMs('{}', 1)).toBe(1000);
-      expect(retryDelayMs('{}', 2)).toBe(2000);
+    it('caps the wait so one bad request cannot stall the stream', () => {
+      expect(retryDelayMs(10)).toBe(8000);
+    });
+  });
+
+  describe('serverRetryDelayMs (429 quota)', () => {
+    it('reads the delay the server asked for', () => {
+      expect(serverRetryDelayMs('{"retryDelay":"22.7s"}')).toBe(22700);
     });
 
-    it('caps the wait so a bad value cannot stall the stream', () => {
-      expect(retryDelayMs('{"retryDelay":"600s"}', 1)).toBe(8000);
+    it('does NOT cap it — quota is per minute, so a short wait is wasted', () => {
+      expect(serverRetryDelayMs('{"retryDelay":"22s"}')).toBe(22000);
+    });
+
+    it('returns 0 when the server gave no delay', () => {
+      expect(serverRetryDelayMs('{}')).toBe(0);
     });
   });
 });

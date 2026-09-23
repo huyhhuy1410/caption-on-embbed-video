@@ -8,6 +8,7 @@ import { SidecarService } from './sidecar/sidecar.service';
 import { TranscriptService } from './transcript/transcript.service';
 import { VideoClockService } from './clock/video-clock.service';
 import { TranslateService } from '../ai/translate.service';
+import { ProviderUnavailableError } from '../ai/errors';
 
 /** Một caption group: các từ dùng chung một `captionStart`. */
 type CaptionGroup = { captionStart: number; text: string };
@@ -36,6 +37,10 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
 
   private lastDrainAt = 0;
+
+  private draining = false;
+
+  private cooldownUntil = 0;
 
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<number, number>();
@@ -103,16 +108,28 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.scheduleDrain();
   }
 
+  /**
+   * Hẹn lượt drain kế tiếp, tôn trọng cả khoảng cách tối thiểu lẫn cooldown.
+   *
+   * ⚠️ Guard `draining` là bắt buộc, không phải cho đẹp: `drainTimer` được xoá
+   * lúc timer NỔ, không phải lúc drain XONG. Một drain có retry 503 sẽ await
+   * hàng giây, suốt thời gian đó `drainTimer` là `undefined` ⇒ không còn gì
+   * chặn việc hẹn drain mới ⇒ nhiều request chạy chồng, cùng key, cùng bucket
+   * quota.
+   */
   private scheduleDrain(): void {
-    if (this.pending.size === 0 || this.drainTimer !== undefined) return;
+    if (this.pending.size === 0) return;
+    if (this.drainTimer !== undefined || this.draining) return;
 
     // Chừa khoảng cách tối thiểu giữa hai request để không vượt trần RPM.
     const elapsed = Date.now() - this.lastDrainAt;
-    const delay = Math.max(0, TRANSLATE_MIN_INTERVAL_MS - elapsed);
+    const spacing = Math.max(0, TRANSLATE_MIN_INTERVAL_MS - elapsed);
+    const cooldown = Math.max(0, this.cooldownUntil - Date.now());
+
     this.drainTimer = setTimeout(() => {
       this.drainTimer = undefined;
       void this.drain();
-    }, delay);
+    }, Math.max(spacing, cooldown));
   }
 
   /**
@@ -130,15 +147,10 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (batch.length === 0) return;
 
     this.lastDrainAt = Date.now();
+    this.draining = true;
     for (const group of batch) {
-      // `inFlight` chặn trùng trong lúc chờ: nguồn dữ liệu re-emit cùng nhóm
-      // mỗi ~4.5s, và cache chỉ ghi khi THÀNH CÔNG nên thất bại không để lại
-      // dấu vết nào.
+      // Chặn nhóm đang bay khỏi bị enqueue lại lần nữa.
       this.inFlight.add(group.captionStart);
-      this.attempts.set(
-        group.captionStart,
-        (this.attempts.get(group.captionStart) ?? 0) + 1,
-      );
     }
 
     try {
@@ -147,6 +159,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         'vi',
         'en',
       );
+
+      // Qua được ⇒ quota đã mở lại.
+      this.cooldownUntil = 0;
 
       batch.forEach((group, index) => {
         const vi = results[index]?.text.trim();
@@ -165,14 +180,36 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
       });
     } catch (error: unknown) {
-      console.warn(
-        `Translation batch skipped (${batch.length} sentences):`,
-        error instanceof Error ? error.message : error,
-      );
+      // ⚠️ Lỗi quota KHÔNG thuộc về câu nào cả — cả project đang cạn quota.
+      // Trả các nhóm về hàng đợi và KHÔNG tăng `attempts`: đếm nó là công của
+      // câu thì một đợt cạn quota kéo dài sẽ xoá sổ bản dịch của cả video.
+      if (error instanceof ProviderUnavailableError) {
+        this.cooldownUntil = Date.now() + error.retryAfterMs;
+        for (const group of batch) {
+          this.pending.set(group.captionStart, group.text);
+        }
+        console.warn(
+          `Translation paused ${Math.round(error.retryAfterMs / 1000)}s (quota), ` +
+            `re-queued ${batch.length} sentences`,
+        );
+      } else {
+        // Lỗi thật sự thuộc về batch này ⇒ tính công, bỏ sau MAX lần.
+        for (const group of batch) {
+          this.attempts.set(
+            group.captionStart,
+            (this.attempts.get(group.captionStart) ?? 0) + 1,
+          );
+        }
+        console.warn(
+          `Translation batch skipped (${batch.length} sentences):`,
+          error instanceof Error ? error.message : error,
+        );
+      }
     } finally {
       for (const group of batch) {
         this.inFlight.delete(group.captionStart);
       }
+      this.draining = false;
       // Nhóm mới có thể đã về trong lúc đang chờ request này.
       this.scheduleDrain();
     }
