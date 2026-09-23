@@ -69,6 +69,9 @@ chrome.runtime.onMessage.addListener((message) => {
     syncOverlayVisibility();
     repositionOverlay();
     if (activeVideo) {
+      // `dispose()` lúc tắt đã gỡ nút và xoá target, nên phải gắn lại ở đây —
+      // không thì nút CC fullscreen chỉ mọc lại khi tình cờ có mutation DOM.
+      fullscreen.setTarget(activeVideo, overlay);
       updateOverlayNow();
       startOverlayLoop();
 
@@ -88,6 +91,14 @@ chrome.runtime.onMessage.addListener((message) => {
   ) {
     overlay.setWords(message.words);
     updateOverlayNow();
+  }
+  if (message.type === "captions-off") {
+    captionEnabled = false;
+    stopOverlayLoop();
+    overlay.clear();
+    fullscreen.dispose();
+    // Visibility suy ra từ state nên set cờ là đủ để overlay tự ẩn.
+    syncOverlayVisibility();
   }
 });
 

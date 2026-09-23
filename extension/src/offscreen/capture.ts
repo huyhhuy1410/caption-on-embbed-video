@@ -1,13 +1,30 @@
 // Biến lưu mốc thời gian video.currentTime mới nhất được gửi từ Content script qua Service worker
 let videoTimeAtCapture = 0;
+
+/**
+ * Tài nguyên của phiên capture, giữ ở module scope để còn TẮT được.
+ *
+ * ⚠️ Trước đây các biến này nằm trong `captureTabAudio` nên không có đường
+ * teardown: tắt caption là socket, AudioContext, `setInterval` RMS và media
+ * track đều sống tiếp cho tới khi reload extension.
+ */
 let backendWebSocket: WebSocket | undefined;
+let audioContext: AudioContext | undefined;
+let capturedStream: MediaStream | undefined;
+let audioSource: MediaStreamAudioSourceNode | undefined;
+let rmsIntervalId: ReturnType<typeof setInterval> | undefined;
+
 // === BƯỚC 1: Lắng nghe tin nhắn từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
   // 1.1. Lắng nghe lệnh khởi tạo thu âm Tab Audio từ Service Worker
   if (message?.type === "start-audio-capture") {
     void captureTabAudio(message.streamId);
   }
-  // 1.2. Lắng nghe mốc thời gian video.currentTime cập nhật từ Content script
+  // 1.2. Dọn sạch khi user tắt caption
+  if (message?.type === "stop-audio-capture") {
+    void stopTabAudio();
+  }
+  // 1.3. Lắng nghe mốc thời gian video.currentTime cập nhật từ Content script
   // Chỉ lưu mốc video mới nhất, không relay ngược lại.
   if (message?.type === "video-clock") {
     videoTimeAtCapture = message.videoTime;
@@ -26,8 +43,44 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
+/**
+ * Dừng phiên capture và giải phóng mọi tài nguyên.
+ *
+ * Thứ tự: dừng bộ đếm trước (nó ghi log mỗi giây), rồi đóng socket, rồi ngắt
+ * audio graph và transport. `chrome.offscreen.closeDocument()` KHÔNG được gọi —
+ * SW giữ document sống để lần bật sau không phải chờ listener sẵn sàng
+ * (Issue 2.3).
+ */
+async function stopTabAudio(): Promise<void> {
+  console.info("Caption AI offscreen: stopping tab audio");
+
+  if (rmsIntervalId !== undefined) {
+    clearInterval(rmsIntervalId);
+    rmsIntervalId = undefined;
+  }
+
+  backendWebSocket?.close();
+  backendWebSocket = undefined;
+
+  audioSource?.disconnect();
+  audioSource = undefined;
+
+  capturedStream?.getTracks().forEach((track) => track.stop());
+  capturedStream = undefined;
+
+  await audioContext?.close().catch((error: unknown) => {
+    console.warn("Caption AI offscreen: audio context close failed", error);
+  });
+  audioContext = undefined;
+
+  videoTimeAtCapture = 0;
+}
+
 // === BƯỚC 2: Hàm thực hiện Thu âm Tab và Truyền dữ liệu qua WebSocket ===
 async function captureTabAudio(streamId: string) {
+  // Bật lại khi phiên cũ chưa dọn (hiếm) ⇒ dọn trước, tránh hai socket cùng sống.
+  await stopTabAudio();
+
   // 2.1. Lấy luồng âm thanh MediaStream của Tab trình duyệt từ streamId
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -38,6 +91,7 @@ async function captureTabAudio(streamId: string) {
     } as MediaTrackConstraints,
     video: false,
   });
+  capturedStream = stream;
 
   const audioTrack = stream.getAudioTracks()[0];
   audioTrack?.addEventListener("ended", () => {
@@ -45,10 +99,11 @@ async function captureTabAudio(streamId: string) {
   });
 
   // 2.2. Khởi tạo AudioContext với tần số lấy mẫu chuẩn 16,000 Hz
-  const audioContext = new AudioContext({
+  const context = new AudioContext({
     sampleRate: 16000,
   });
-  console.info("Sample rate:", audioContext.sampleRate);
+  audioContext = context;
+  console.info("Sample rate:", context.sampleRate);
 
   // 2.3. Khởi tạo kết nối WebSocket tới Backend NestJS (Cổng 8000)
   const socket = new WebSocket("ws://127.0.0.1:8000");
@@ -73,17 +128,13 @@ async function captureTabAudio(streamId: string) {
     console.info("Words from backend:", event.data);
     try {
       const parsed = JSON.parse(event.data);
-      if (
-        (parsed.type === "words" || parsed.type === "replay") &&
-        Array.isArray(parsed.words)
-      ) {
-        // Offscreen KHÔNG có chrome.tabs ⇒ không gửi thẳng cho content được.
-        // Gửi về SW; SW giữ capturedTabId và sẽ gửi đến content script đúng tab.
-        void chrome.runtime
-          .sendMessage({ type: parsed.type, words: parsed.words })
-          .catch((error: unknown) => {
-            console.warn("Caption AI offscreen: could not relay words", error);
-          });
+      // ⚠️ Chuyển NGUYÊN message, không dựng lại object `{type, words}` như
+      // trước — cách đó làm rơi mọi field khác mà backend gửi kèm. Offscreen
+      // KHÔNG có `chrome.tabs` ⇒ gửi về SW, SW biết tab nào (Issue 5.1).
+      if (parsed.type === "words" || parsed.type === "replay") {
+        void chrome.runtime.sendMessage(parsed).catch((error: unknown) => {
+          console.warn("Caption AI offscreen: could not relay message", error);
+        });
       }
     } catch (error) {
       console.warn("Failed to parse message", error);
@@ -91,11 +142,11 @@ async function captureTabAudio(streamId: string) {
   });
 
   // 2.5. Nạp module AudioWorklet xử lý PCM nhị phân
-  await audioContext.audioWorklet.addModule(
+  await context.audioWorklet.addModule(
     chrome.runtime.getURL("dist/recorder-worklet.js"),
   );
 
-  const worklet = new AudioWorkletNode(audioContext, "recorder-processor");
+  const worklet = new AudioWorkletNode(context, "recorder-processor");
   let pendingSamples: number[] = [];
   let chunkCount = 0;
   let sequence = 0;
@@ -121,7 +172,7 @@ async function captureTabAudio(streamId: string) {
             type: "audio",
             seq: sequence,
             captureTime: performance.now() / 1000,
-            sampleRate: audioContext.sampleRate,
+            sampleRate: context.sampleRate,
             videoTimeAtCapture: videoTimeAtCapture, // 👈 Đính kèm mốc thời gian video chuẩn
             frames: chunk.length,
           }),
@@ -135,15 +186,17 @@ async function captureTabAudio(streamId: string) {
   };
 
   // 2.9. Nối luồng âm thanh từ Tab vào AudioWorklet và đầu ra Loa
-  const source = audioContext.createMediaStreamSource(stream);
+  const source = context.createMediaStreamSource(stream);
+  audioSource = source;
   source.connect(worklet);
-  source.connect(audioContext.destination);
+  // Audio phải được route lại ra loa, nếu không user mất tiếng khi capture.
+  source.connect(context.destination);
 
   // 2.10. Giám sát mức âm lượng (RMS) để kiểm tra luồng thu âm có âm thanh hay không
-  const analyser = audioContext.createAnalyser();
+  const analyser = context.createAnalyser();
   source.connect(analyser);
   const data = new Uint8Array(analyser.fftSize);
-  setInterval(() => {
+  rmsIntervalId = setInterval(() => {
     analyser.getByteTimeDomainData(data);
     let sum = 0;
     for (const value of data) {
