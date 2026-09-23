@@ -90,7 +90,17 @@ chrome.runtime.onMessage.addListener((message) => {
     Array.isArray(message.words)
   ) {
     overlay.setWords(message.words);
+    // Replay mang kèm bản dịch đã cache ⇒ VI hiện ngay, không đợi AI (FR-7.5).
+    if (Array.isArray(message.translations)) {
+      overlay.setTranslations(message.translations);
+    }
     updateOverlayNow();
+  }
+  if (
+    message.type === "translation" &&
+    typeof message.captionStart === "number"
+  ) {
+    overlay.setTranslation(message.captionStart, String(message.vi ?? ""));
   }
   if (message.type === "captions-off") {
     captionEnabled = false;

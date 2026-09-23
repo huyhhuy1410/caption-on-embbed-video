@@ -5,6 +5,13 @@ export interface CaptionWord {
   captionStart: number;
 }
 
+/** Bản dịch một câu. `captionStart` là khoá nhóm, ổn định qua replay. */
+export interface SentenceTranslation {
+  captionStart: number;
+  text: string;
+  vi: string;
+}
+
 export class CaptionOverlay {
   private host: HTMLDivElement;
   private shadow: ShadowRoot;
@@ -13,7 +20,11 @@ export class CaptionOverlay {
   private words: CaptionWord[] = [];
   private lastLineKey: number = -1;
   private lastLineEnd: number = -1;
+  private lastViKey: number = -1;
   private wordSpans: HTMLSpanElement[] = [];
+
+  /** Bản dịch theo `captionStart`. Bản dịch về muộn hơn words nên giữ riêng. */
+  private translations = new Map<number, string>();
 
   constructor() {
     this.host = document.createElement("div");
@@ -131,6 +142,10 @@ export class CaptionOverlay {
         this.enLine.appendChild(span);
         this.wordSpans.push(span);
       }
+      // Nhóm chưa có bản dịch ⇒ để trống; `setTranslation` sẽ điền khi nó về.
+      this.applyVi(lineKey, true);
+    } else {
+      this.applyVi(lineKey, false);
     }
 
     const activeOffset = currentIndex - start;
@@ -139,6 +154,38 @@ export class CaptionOverlay {
     });
 
   }
+  /**
+   * Ghi dòng VI cho nhóm đang hiện.
+   *
+   * `update()` chạy mỗi frame rAF nên chỉ được chạm DOM khi giá trị ĐỔI —
+   * `lastViKey` làm việc đó, giống `lastLineKey` cho dòng EN.
+   */
+  private applyVi(lineKey: number, force: boolean): void {
+    if (!force && this.lastViKey === lineKey) return;
+    this.lastViKey = lineKey;
+    this.viLine.textContent = this.translations.get(lineKey) ?? "";
+  }
+
+  /** Bản dịch vừa về cho một nhóm. Điền ngay nếu đó là nhóm đang hiện. */
+  setTranslation(captionStart: number, vi: string): void {
+    this.translations.set(captionStart, vi);
+    if (this.lastLineKey === captionStart) {
+      this.lastViKey = -1;
+      this.applyVi(captionStart, true);
+    }
+  }
+
+  /** Bản dịch từ cache khi replay — nạp hàng loạt. */
+  setTranslations(list: SentenceTranslation[]): void {
+    for (const item of list) {
+      this.translations.set(item.captionStart, item.vi);
+    }
+    if (this.lastLineKey !== -1 && this.translations.has(this.lastLineKey)) {
+      this.lastViKey = -1;
+      this.applyVi(this.lastLineKey, true);
+    }
+  }
+
   position(rect: DOMRect): void {
     this.host.style.left = `${rect.left}px`;
     this.host.style.width = `${rect.width}px`;
@@ -158,8 +205,10 @@ export class CaptionOverlay {
    */
   clear(): void {
     this.words = [];
+    this.translations.clear();
     this.lastLineKey = -1;
     this.lastLineEnd = -1;
+    this.lastViKey = -1;
     this.wordSpans = [];
     this.enLine.textContent = "";
     this.viLine.textContent = "";

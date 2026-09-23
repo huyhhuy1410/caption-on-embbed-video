@@ -3,6 +3,7 @@ import { AudioGateway } from './audio.gateway';
 import { SidecarService } from './sidecar/sidecar.service';
 import { TranscriptService } from './transcript/transcript.service';
 import { VideoClockService } from './clock/video-clock.service';
+import { TranslateService } from '../ai/translate.service';
 
 describe('AudioGateway', () => {
   let gateway: AudioGateway;
@@ -14,6 +15,8 @@ describe('AudioGateway', () => {
         { provide: SidecarService, useValue: { setMessageHandler: jest.fn() } },
         TranscriptService,
         VideoClockService,
+        // Mock: phần dịch là fire-and-forget, không phải thứ spec này kiểm tra.
+        { provide: TranslateService, useValue: { translate: jest.fn() } },
       ],
     }).compile();
 

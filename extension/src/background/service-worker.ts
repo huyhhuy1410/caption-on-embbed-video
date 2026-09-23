@@ -72,7 +72,11 @@ chrome.runtime.onMessage.addListener((message) => {
   // 2.2. Chuyển tiếp kết quả từ backend xuống content script của tab đang capture.
   // ⚠️ Phải chuyển NGUYÊN message, không dựng lại object `{type, words}` như
   // trước — cách đó làm rơi mọi field khác mà backend gửi kèm.
-  if (message?.type === "words" || message?.type === "replay") {
+  if (
+    message?.type === "words" ||
+    message?.type === "replay" ||
+    message?.type === "translation"
+  ) {
     void (async () => {
       // Đọc từ storage chứ không dùng biến in-memory: SW có thể đã ngủ và tỉnh
       // dậy, lúc đó `capturedTabId` là `undefined` dù phiên vẫn đang chạy.

@@ -36,6 +36,77 @@ describe('TranscriptService', () => {
     ]);
   });
 
+  describe('translations', () => {
+    it('returns a stored translation for its captionStart', () => {
+      service.setTranslation({
+        captionStart: 12.0,
+        text: 'the model overfits',
+        vi: 'mô hình bị quá khớp',
+      });
+
+      expect(service.getTranslation(12.0)?.vi).toBe('mô hình bị quá khớp');
+      expect(service.getTranslations(11, 13)).toEqual([
+        {
+          captionStart: 12.0,
+          text: 'the model overfits',
+          vi: 'mô hình bị quá khớp',
+        },
+      ]);
+    });
+
+    it('getTranslation lets the gateway skip work already done', () => {
+      expect(service.getTranslation(4.0)).toBeUndefined();
+      service.setTranslation({ captionStart: 4.0, text: 'a', vi: 'b' });
+      expect(service.getTranslation(4.0)).toEqual({
+        captionStart: 4.0,
+        text: 'a',
+        vi: 'b',
+      });
+    });
+
+    it('filters by range and sorts by captionStart', () => {
+      service.setTranslation({ captionStart: 30, text: 'c', vi: 'C' });
+      service.setTranslation({ captionStart: 10, text: 'a', vi: 'A' });
+      service.setTranslation({ captionStart: 20, text: 'b', vi: 'B' });
+
+      // 20 nằm ngoài [21, 31] ⇒ chỉ còn 30
+      expect(service.getTranslations(21, 31)).toEqual([
+        { captionStart: 30, text: 'c', vi: 'C' },
+      ]);
+      // cả ba, đã sort
+      expect(service.getTranslations(0, 100).map((t) => t.captionStart)).toEqual(
+        [10, 20, 30],
+      );
+    });
+
+    it('drops a translation past TTL on read', () => {
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      service.setTranslation({ captionStart: 5, text: 'a', vi: 'A' });
+
+      nowSpy.mockReturnValue(1_000_000 + 31 * 60 * 1000);
+      expect(service.getTranslations(0, 10)).toEqual([]);
+      nowSpy.mockRestore();
+    });
+
+    it('evicts the least-recently-used translation when over MAX_BUCKETS', () => {
+      let fakeNow = 0;
+      const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => fakeNow);
+
+      for (let i = 0; i < 301; i++) {
+        fakeNow = i;
+        service.setTranslation({
+          captionStart: i,
+          text: `t${i}`,
+          vi: `v${i}`,
+        });
+      }
+
+      expect(service.getTranslation(0)).toBeUndefined();
+      expect(service.getTranslation(300)).toBeDefined();
+      nowSpy.mockRestore();
+    });
+  });
+
   describe('TTL', () => {
     it('removes a bucket that has not been accessed past TTL', () => {
       // BƯỚC 1: mock Date.now về một mốc cố định
