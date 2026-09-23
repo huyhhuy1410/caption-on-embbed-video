@@ -21,4 +21,13 @@ export class TranslateService {
       input.from,
     );
   }
+
+  /** Dịch nhiều câu trong 1 request — xem `TranslationProvider.translateBatch`. */
+  async translateBatch(
+    sentences: string[],
+    to: string,
+    from: string,
+  ): Promise<Translation[]> {
+    return this.translationProvider.translateBatch(sentences, to, from);
+  }
 }

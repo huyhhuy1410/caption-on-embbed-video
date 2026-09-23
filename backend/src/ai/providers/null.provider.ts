@@ -33,6 +33,18 @@ export class NullProvider implements TranslationProvider, ExplainProvider {
     );
   }
 
+  translateBatch(
+    sentences: string[],
+    to: string,
+    from: string,
+  ): Promise<Translation[]> {
+    return Promise.reject(
+      new Error(
+        `NullProvider.translateBatch: no AI provider configured (${sentences.length} sentences, ${from}->${to})`,
+      ),
+    );
+  }
+
   explainWord(
     word: string,
     context: string,

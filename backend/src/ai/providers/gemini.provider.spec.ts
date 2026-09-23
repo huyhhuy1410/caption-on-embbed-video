@@ -139,6 +139,59 @@ describe('GeminiProvider', () => {
     expect(global.fetch).toHaveBeenCalledTimes(3);
   });
 
+  describe('translateBatch', () => {
+    it('sends one request for many sentences and maps them back in order', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: '{"translations":[{"index":1,"translation":"A"},{"index":2,"translation":"B"}]}',
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      });
+
+      const result = await provider.translateBatch(['one', 'two'], 'vi', 'en');
+
+      expect(result.map((r) => r.text)).toEqual(['A', 'B']);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects rather than mismatching when a sentence is missing', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: '{"translations":[{"index":1,"translation":"A"}]}' },
+                ],
+              },
+            },
+          ],
+        }),
+      });
+
+      await expect(
+        provider.translateBatch(['one', 'two'], 'vi', 'en'),
+      ).rejects.toThrow('missing sentence 2 of 2');
+    });
+
+    it('makes no request for an empty batch', async () => {
+      global.fetch = jest.fn();
+      expect(await provider.translateBatch([], 'vi', 'en')).toEqual([]);
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+  });
+
   describe('retryDelayMs', () => {
     it('honours a server retryDelay longer than the backoff', () => {
       expect(retryDelayMs('{"retryDelay":"5s"}', 1)).toBe(5000);

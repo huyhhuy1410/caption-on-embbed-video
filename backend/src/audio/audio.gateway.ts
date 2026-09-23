@@ -15,6 +15,14 @@ type CaptionGroup = { captionStart: number; text: string };
 /** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
 const MAX_TRANSLATE_ATTEMPTS = 3;
 
+/**
+ * Khoang cach toi thieu giua hai request dich.
+ *
+ * Gemini free tier cho ~15 request/phut => 60/15 = 4000ms. Giu dung 4000ms thi
+ * khong bao gio vuot tran, ke ca khi caption ve don dap.
+ */
+const TRANSLATE_MIN_INTERVAL_MS = 4_000;
+
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Biến lưu trữ tham chiếu WebSocket client của Extension Chrome đang kết nối
@@ -22,6 +30,12 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   /** Nhóm đang dịch dở, khoá theo `captionStart`. */
   private readonly inFlight = new Set<number>();
+
+  private readonly pending = new Map<number, string>();
+
+  private drainTimer: ReturnType<typeof setTimeout> | undefined;
+
+  private lastDrainAt = 0;
 
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<number, number>();
@@ -45,7 +59,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         if (parsedMessage.type === 'words') {
           this.transcriptService.addWords(parsedMessage.words);
           // Dịch SAU khi đã forward/ghi cache — không chặn đường words.
-          this.translateGroups(collectCaptionGroups(parsedMessage.words));
+          this.enqueueForTranslation(collectCaptionGroups(parsedMessage.words));
         }
       } catch (error) {
         console.warn('Failed to parse message', error);
@@ -60,13 +74,18 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
-   * Dịch các caption group chưa có bản dịch.
+   * Xếp các caption group chưa có bản dịch vào hàng đợi, rồi hẹn một lượt
+   * drain.
    *
-   * Fire-and-forget: FR-5.2 cho phép VI đến muộn 1–3s, nên không được để một
-   * HTTP call chặn luồng `words`. Lỗi (hết quota, mạng, không có key) chỉ log —
-   * caption EN phải chạy bất kể.
+   * ⚠️ Vì sao xếp hàng thay vì gọi ngay: dịch từng câu riêng tốn 1 request/câu.
+   * Nhịp sinh caption là ~15–25 nhóm/phút, mà Gemini free tier cho ~15
+   * request/phút ⇒ vượt trần ngay trong điều kiện bình thường. Gộp nhiều câu
+   * vào một request là cách duy nhất giảm số request mà không giảm số câu.
+   *
+   * `enqueue` là ĐỒNG BỘ, `drain` chạy ở macrotask sau ⇒ mọi nhóm trong cùng
+   * một message `words` tự nhiên gộp thành một request, không cần chờ thêm.
    */
-  private translateGroups(groups: CaptionGroup[]): void {
+  private enqueueForTranslation(groups: CaptionGroup[]): void {
     for (const group of groups) {
       const cached = this.transcriptService.getTranslation(group.captionStart);
       // ⚠️ So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
@@ -74,44 +93,88 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // kiểm tra khoá thì bản dịch NỬA CÂU đã cache sẽ chặn luôn bản đầy đủ.
       if (cached && cached.text === group.text) continue;
 
-      // Cache chỉ được ghi khi dịch THÀNH CÔNG, nên thất bại không để lại dấu
-      // vết: không chặn ở đây thì mỗi message `words` (~4.5s) lại gọi lại đúng
-      // câu đó. `inFlight` chặn trùng trong lúc chờ; `attempts` chặn vĩnh viễn
-      // sau khi đã thử đủ.
       const tried = this.attempts.get(group.captionStart) ?? 0;
-      if (this.inFlight.has(group.captionStart)) continue;
       if (tried >= MAX_TRANSLATE_ATTEMPTS) continue;
 
+      // Ghi đè: nhóm có thể đã trong hàng đợi với text CŨ (ngắn hơn), giờ dài
+      // ra. Bản mới nhất là bản đúng.
+      this.pending.set(group.captionStart, group.text);
+    }
+    this.scheduleDrain();
+  }
+
+  private scheduleDrain(): void {
+    if (this.pending.size === 0 || this.drainTimer !== undefined) return;
+
+    // Chừa khoảng cách tối thiểu giữa hai request để không vượt trần RPM.
+    const elapsed = Date.now() - this.lastDrainAt;
+    const delay = Math.max(0, TRANSLATE_MIN_INTERVAL_MS - elapsed);
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = undefined;
+      void this.drain();
+    }, delay);
+  }
+
+  /**
+   * Dịch mọi nhóm đang chờ trong MỘT request.
+   *
+   * Fire-and-forget: FR-5.2 cho phép VI đến muộn 1–3s, nên không được để HTTP
+   * call chặn luồng `words`. Lỗi (hết quota, mạng, thiếu key) chỉ log — caption
+   * EN phải chạy bất kể.
+   */
+  private async drain(): Promise<void> {
+    const batch = Array.from(this.pending.entries()).map(
+      ([captionStart, text]) => ({ captionStart, text }),
+    );
+    this.pending.clear();
+    if (batch.length === 0) return;
+
+    this.lastDrainAt = Date.now();
+    for (const group of batch) {
+      // `inFlight` chặn trùng trong lúc chờ: nguồn dữ liệu re-emit cùng nhóm
+      // mỗi ~4.5s, và cache chỉ ghi khi THÀNH CÔNG nên thất bại không để lại
+      // dấu vết nào.
       this.inFlight.add(group.captionStart);
-      this.attempts.set(group.captionStart, tried + 1);
+      this.attempts.set(
+        group.captionStart,
+        (this.attempts.get(group.captionStart) ?? 0) + 1,
+      );
+    }
 
-      void this.translateService
-        .translate({ sentence: group.text, from: 'en', to: 'vi' })
-        .then((translation) => {
-          const vi = translation.text.trim();
-          if (!vi) return;
+    try {
+      const results = await this.translateService.translateBatch(
+        batch.map((g) => g.text),
+        'vi',
+        'en',
+      );
 
-          this.transcriptService.setTranslation({
-            captionStart: group.captionStart,
-            text: group.text,
-            vi,
-          });
-          this.sendToExtension({
-            type: 'translation',
-            captionStart: group.captionStart,
-            text: group.text,
-            vi,
-          });
-        })
-        .catch((error: unknown) => {
-          console.warn(
-            `Translation skipped for "${group.text}":`,
-            error instanceof Error ? error.message : error,
-          );
-        })
-        .finally(() => {
-          this.inFlight.delete(group.captionStart);
+      batch.forEach((group, index) => {
+        const vi = results[index]?.text.trim();
+        if (!vi) return;
+
+        this.transcriptService.setTranslation({
+          captionStart: group.captionStart,
+          text: group.text,
+          vi,
         });
+        this.sendToExtension({
+          type: 'translation',
+          captionStart: group.captionStart,
+          text: group.text,
+          vi,
+        });
+      });
+    } catch (error: unknown) {
+      console.warn(
+        `Translation batch skipped (${batch.length} sentences):`,
+        error instanceof Error ? error.message : error,
+      );
+    } finally {
+      for (const group of batch) {
+        this.inFlight.delete(group.captionStart);
+      }
+      // Nhóm mới có thể đã về trong lúc đang chờ request này.
+      this.scheduleDrain();
     }
   }
 

@@ -37,6 +37,11 @@ interface GeminiTranslateResult {
   translation: string;
 }
 
+/** Envelope cho batch: mỗi phần tử tự mang số thứ tự câu của nó. */
+interface GeminiTranslateBatchResult {
+  translations: Array<{ index: number; translation: string }>;
+}
+
 /** Stable JSON envelope Gemini returns for explain (via responseSchema). */
 interface GeminiExplainResult {
   meaning: string;
@@ -132,6 +137,70 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
 
     // 3. Return { text: result.translation, from, to }
     return { text: result.translation, from, to };
+  }
+
+  /**
+   * Dịch nhiều câu trong 1 request (design §4.3 "batched on finalize").
+   *
+   * Mảng trả về SONG SONG với mảng vào: `result[i].text` là bản dịch của
+   * `sentences[i]`. Nếu Gemini trả thiếu/ thừa phần tử thì ném lỗi — im lặng
+   * ghép lệch index sẽ gán bản dịch của câu này cho câu khác, tệ hơn là không
+   * dịch gì.
+   */
+  async translateBatch(
+    sentences: string[],
+    to: string,
+    from: string,
+  ): Promise<Translation[]> {
+    if (sentences.length === 0) return [];
+    if (sentences.length === 1) {
+      const one = await this.translate(sentences[0], to, from);
+      return [one];
+    }
+
+    // Đánh số từng câu để model không trộn thứ tự và để kiểm tra khớp index.
+    const numbered = sentences
+      .map((sentence, index) => `${index + 1}. ${sentence}`)
+      .join('\n');
+
+    const prompt = `Translate each numbered ${from} sentence below to ${to}.
+Return one translation per input sentence, in the same order, keeping the same numbering.
+Translate only; do not explain, merge, split, or skip any sentence.
+
+${numbered}`;
+
+    const result = await this.callGemini<GeminiTranslateBatchResult>(prompt, {
+      type: 'object',
+      properties: {
+        translations: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              index: { type: 'integer' },
+              translation: { type: 'string' },
+            },
+            required: ['index', 'translation'],
+          },
+        },
+      },
+      required: ['translations'],
+    });
+
+    const byIndex = new Map<number, string>();
+    for (const item of result.translations) {
+      byIndex.set(item.index, item.translation);
+    }
+
+    return sentences.map((_, i) => {
+      const text = byIndex.get(i + 1);
+      if (text === undefined) {
+        throw new Error(
+          `Batch translation missing sentence ${i + 1} of ${sentences.length}`,
+        );
+      }
+      return { text, from, to };
+    });
   }
 
   async explainWord(
