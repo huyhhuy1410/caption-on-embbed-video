@@ -56,7 +56,6 @@ export class CaptionOverlay {
 }
 .word-active {
   color: #4fc3f7;
-  text-decoration: underline;
 }
 `;
 
@@ -151,5 +150,22 @@ export class CaptionOverlay {
   }
   hide(): void {
     this.host.style.display = "none";
+  }
+
+  /**
+   * `words` là mảng tích luỹ và videoStart là mốc thời gian riêng của từng
+   * video — đổi video mà không xoá thì phụ đề bài cũ sẽ hiện lên bài mới.
+   */
+  clear(): void {
+    this.words = [];
+    this.lastLineKey = -1;
+    this.lastLineEnd = -1;
+    this.wordSpans = [];
+    this.enLine.textContent = "";
+    this.viLine.textContent = "";
+  }
+
+  get element(): HTMLElement {
+    return this.host;
   }
 }

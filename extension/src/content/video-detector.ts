@@ -1,3 +1,4 @@
+import { CaptionFullscreen } from "./fullscreen";
 import { CaptionOverlay } from "./overlay";
 console.info("Caption AI: content script loaded", window.location.href);
 
@@ -5,9 +6,16 @@ let captionEnabled = false;
 let activeVideo: HTMLVideoElement | null = null;
 let overlayFrameId: number | null = null;
 const overlay = new CaptionOverlay();
+const fullscreen = new CaptionFullscreen();
 
 function repositionOverlay() {
   if (!activeVideo) return;
+  // Trong CC fullscreen, getBoundingClientRect là element box phủ kín màn hình
+  // chứ không phải vùng ảnh — uỷ quyền cho fullscreen tính cho đúng.
+  if (fullscreen.isActive()) {
+    fullscreen.repositionOverlay();
+    return;
+  }
   overlay.position(activeVideo.getBoundingClientRect());
 }
 function updateOverlayFromVideo(): void {
@@ -41,11 +49,24 @@ function updateOverlayNow(): void {
   overlay.update(activeVideo.currentTime);
 }
 
+/**
+ * Visibility suy ra từ state. Nếu để show()/hide() bật tắt ở hai nơi khác nhau
+ * thì sau khi SPA gỡ video làm overlay ẩn, không còn gì bật lại — show() chỉ
+ * chạy lúc nhận `capturing`.
+ */
+function syncOverlayVisibility(): void {
+  if (captionEnabled && activeVideo) {
+    overlay.show();
+  } else {
+    overlay.hide();
+  }
+}
+
 // === BƯỚC 1: Lắng nghe tín hiệu kích hoạt caption từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "capturing") {
     captionEnabled = true;
-    overlay.show();
+    syncOverlayVisibility();
     repositionOverlay();
     if (activeVideo) {
       updateOverlayNow();
@@ -132,7 +153,9 @@ document.addEventListener(
 // Lưu ý: querySelectorAll("video") không tìm được video nằm trong Shadow DOM.
 // Tạm chấp nhận cho phạm vi MVP, cần xử lý đệ quy shadowRoot (open) ở phiên bản sau.
 function reconcile() {
-  const prevVideo = activeVideo;
+  // Phiên CC fullscreen có thể đã hỏng mà không sinh fullscreenchange nào.
+  fullscreen.recoverIfBroken();
+
   const videos = Array.from(document.querySelectorAll("video"));
   let nextVideo: HTMLVideoElement | null = null;
 
@@ -159,6 +182,25 @@ function reconcile() {
     stopOverlayLoop();
     activeVideo = nextVideo;
     console.info("Caption AI: active video reconciled", activeVideo);
+
+    // videoStart là mốc thời gian riêng của từng video, nên từ vựng giữ lại sẽ
+    // khớp nhầm với video mới và hiện phụ đề của bài trước.
+    overlay.clear();
+  }
+
+  // Không đổi target khi đang ở CC fullscreen: wrapper và nút đang gắn với
+  // video cũ, đổi giữa chừng sẽ bỏ rơi nó trong wrapper.
+  if (activeVideo && !fullscreen.isActive()) {
+    fullscreen.setTarget(activeVideo, overlay);
+  }
+
+  syncOverlayVisibility();
+
+  // Vẽ ngay: vòng rAF chỉ chạy khi video đang phát, nên video mới lúc pause sẽ
+  // không được vẽ lần nào cho tới khi user bấm play.
+  if (captionEnabled && activeVideo) {
+    updateOverlayNow();
+    repositionOverlay();
   }
 
   if (activeVideo && !activeVideo.paused) {
