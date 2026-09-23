@@ -1,4 +1,4 @@
-import { GeminiProvider } from './gemini.provider';
+import { GeminiProvider, retryDelayMs } from './gemini.provider';
 
 describe('GeminiProvider', () => {
   // Provider config
@@ -75,6 +75,19 @@ describe('GeminiProvider', () => {
       pronunciation: null,
     });
   });
+  it('does not retry a 500', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: async () => 'boom',
+    });
+
+    await expect(provider.translate('Hello', 'vi', 'en')).rejects.toThrow(
+      'Request failed (HTTP 500)',
+    );
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('throws HTTP error when fetch !ok', async () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
@@ -89,5 +102,55 @@ describe('GeminiProvider', () => {
     await expect(
       provider.explainWord('Hello', 'Hello, how are you?', 'vi'),
     ).rejects.toThrow('Request failed (HTTP 500)');
+  });
+
+  it('retries a 503 then succeeds', async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        text: async () => '{"error":{"status":"UNAVAILABLE"}}',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          candidates: [
+            { content: { parts: [{ text: '{"translation":"Xin chào"}' }] } },
+          ],
+        }),
+      });
+
+    const result = await provider.translate('Hello', 'vi', 'en');
+    expect(result.text).toBe('Xin chào');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives up after 3 attempts on a persistent 503', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: async () => '{"error":{"status":"UNAVAILABLE"}}',
+    });
+
+    await expect(provider.translate('Hello', 'vi', 'en')).rejects.toThrow(
+      'Request failed (HTTP 503)',
+    );
+    expect(global.fetch).toHaveBeenCalledTimes(3);
+  });
+
+  describe('retryDelayMs', () => {
+    it('honours a server retryDelay longer than the backoff', () => {
+      expect(retryDelayMs('{"retryDelay":"5s"}', 1)).toBe(5000);
+    });
+
+    it('falls back to exponential backoff when the server gives none', () => {
+      expect(retryDelayMs('{}', 1)).toBe(1000);
+      expect(retryDelayMs('{}', 2)).toBe(2000);
+    });
+
+    it('caps the wait so a bad value cannot stall the stream', () => {
+      expect(retryDelayMs('{"retryDelay":"600s"}', 1)).toBe(8000);
+    });
   });
 });

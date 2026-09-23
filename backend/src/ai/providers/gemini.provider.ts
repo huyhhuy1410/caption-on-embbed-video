@@ -9,6 +9,29 @@ export interface GeminiConfig {
   model?: string;
 }
 
+/**
+ * Trạng thái đáng thử lại: 429 (hết quota tạm thời) và 503 (model quá tải).
+ * 500 để nguyên — đó là lỗi phía Gemini, thử lại chỉ tốn thời gian.
+ */
+const RETRYABLE_STATUS = new Set([429, 503]);
+const MAX_ATTEMPTS = 3;
+const MAX_RETRY_DELAY_MS = 8_000;
+
+/**
+ * 429 trả kèm `retryDelay: "5s"` trong body — tôn trọng nó. 503 không có, nên
+ * backoff mũ. Luôn lấy giá trị LỚN HƠN để không thử lại sớm hơn server cho phép.
+ */
+export function retryDelayMs(body: string, attempt: number): number {
+  const match = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(body);
+  const fromServer = match ? Number(match[1]) * 1000 : 0;
+  const backoff = 1000 * 2 ** (attempt - 1);
+  return Math.min(Math.max(fromServer, backoff), MAX_RETRY_DELAY_MS);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /** Stable JSON envelope Gemini returns for translate (via responseSchema). */
 interface GeminiTranslateResult {
   translation: string;
@@ -37,10 +60,17 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
     this.model = config.model ?? 'gemini-2.5-flash';
   }
 
-  /** POST one generateContent call asking for structured JSON. Returns parsed + validated body. */
+  /**
+   * POST one generateContent call asking for structured JSON.
+   *
+   * 429 (hết quota phút) và 503 (model quá tải) là trạng thái TẠM THỜI của
+   * Gemini — thử lại thay vì bỏ luôn câu đó. Không có queue nên vẫn có thể
+   * vượt trần RPM khi caption về dồn dập; retry chỉ giảm số câu mất trắng.
+   */
   private async callGemini<T>(prompt: string, schema: object): Promise<T> {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
 
+    for (let attempt = 1; ; attempt++) {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -54,10 +84,20 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
     });
 
     if (!res.ok) {
-      // Parse Gemini error body without leaking the key (key is in URL, not echoed).
       const text = await res.text();
-      this.logger.error(`HTTP ${res.status}: ${text}`);
-      throw new Error(`Request failed (HTTP ${res.status})`);
+      const status = res.status;
+      // 429/503 là tạm thời; 500 để nguyên — thử lại chỉ tốn thời gian.
+      if (RETRYABLE_STATUS.has(status) && attempt < MAX_ATTEMPTS) {
+        const delay = retryDelayMs(text, attempt);
+        this.logger.warn(
+          `HTTP ${status}, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`,
+        );
+        await sleep(delay);
+        continue;
+      }
+      // Parse Gemini error body without leaking the key (key is in URL, not echoed).
+      this.logger.error(`HTTP ${status}: ${text}`);
+      throw new Error(`Request failed (HTTP ${status})`);
     }
 
     const data = (await res.json()) as {
@@ -67,7 +107,8 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
     if (!text) {
       throw new Error('Returned no text content');
     }
-    return JSON.parse(text) as T;
+      return JSON.parse(text) as T;
+    }
   }
 
   // ---- TODO (Parker): implement below, using the helpers above ----

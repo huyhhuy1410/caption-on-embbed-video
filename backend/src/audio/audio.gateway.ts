@@ -12,10 +12,19 @@ import { TranslateService } from '../ai/translate.service';
 /** Một caption group: các từ dùng chung một `captionStart`. */
 type CaptionGroup = { captionStart: number; text: string };
 
+/** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
+const MAX_TRANSLATE_ATTEMPTS = 3;
+
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Biến lưu trữ tham chiếu WebSocket client của Extension Chrome đang kết nối
   private extensionClient?: WebSocket;
+
+  /** Nhóm đang dịch dở, khoá theo `captionStart`. */
+  private readonly inFlight = new Set<number>();
+
+  /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
+  private readonly attempts = new Map<number, number>();
 
   // === BƯỚC 1: Constructor - Thiết lập kết nối hai chiều với Sidecar Service ===
   constructor(
@@ -65,6 +74,17 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // kiểm tra khoá thì bản dịch NỬA CÂU đã cache sẽ chặn luôn bản đầy đủ.
       if (cached && cached.text === group.text) continue;
 
+      // Cache chỉ được ghi khi dịch THÀNH CÔNG, nên thất bại không để lại dấu
+      // vết: không chặn ở đây thì mỗi message `words` (~4.5s) lại gọi lại đúng
+      // câu đó. `inFlight` chặn trùng trong lúc chờ; `attempts` chặn vĩnh viễn
+      // sau khi đã thử đủ.
+      const tried = this.attempts.get(group.captionStart) ?? 0;
+      if (this.inFlight.has(group.captionStart)) continue;
+      if (tried >= MAX_TRANSLATE_ATTEMPTS) continue;
+
+      this.inFlight.add(group.captionStart);
+      this.attempts.set(group.captionStart, tried + 1);
+
       void this.translateService
         .translate({ sentence: group.text, from: 'en', to: 'vi' })
         .then((translation) => {
@@ -88,6 +108,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             `Translation skipped for "${group.text}":`,
             error instanceof Error ? error.message : error,
           );
+        })
+        .finally(() => {
+          this.inFlight.delete(group.captionStart);
         });
     }
   }
