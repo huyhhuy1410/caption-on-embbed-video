@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { TranslateService } from './translate.service';
 import { TranslationRateLimiter } from './translation-rate-limiter.service';
+import { ProviderUnavailableError } from './errors';
 import { TranslateDto } from './dto/translate.dto';
 
 @Controller('translate')
@@ -24,7 +25,7 @@ export class TranslateController {
     //
     // Trả 429 ngay thay vì xếp hàng chờ: đây là HTTP, client tự quyết định thử
     // lại; giữ connection treo tới 60s thì tệ hơn nhiều.
-    const waitMs = this.rateLimiter.msUntilRoom();
+    const waitMs = this.rateLimiter.tryAcquire();
     if (waitMs > 0) {
       throw new HttpException(
         {
@@ -38,7 +39,25 @@ export class TranslateController {
       );
     }
 
-    this.rateLimiter.recordCall();
-    return this.translateService.translate(body);
+    try {
+      return await this.translateService.translate(body);
+    } catch (error: unknown) {
+      // Provider báo hết quota ⇒ đây là trạng thái của cả PROJECT. Đẩy cooldown
+      // vào bộ đếm dùng chung để đường WebSocket cũng dừng lại, rồi trả 429 cho
+      // caller thay vì để lỗi thành 500 — ngữ nghĩa HTTP đúng và client biết
+      // phải chờ bao lâu.
+      if (error instanceof ProviderUnavailableError && !error.retryable) {
+        this.rateLimiter.pauseUntil(Date.now() + error.retryAfterMs);
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            message: 'Translation provider quota exhausted.',
+            retryAfterMs: error.retryAfterMs,
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      throw error;
+    }
   }
 }

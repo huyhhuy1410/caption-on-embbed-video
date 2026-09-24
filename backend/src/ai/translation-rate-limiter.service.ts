@@ -31,6 +31,16 @@ export class TranslationRateLimiter {
   private readonly callTimes: number[] = [];
 
   /**
+   * Mốc thời gian được phép gọi lại sau khi provider báo hết quota.
+   *
+   * ⚠️ Nằm ở ĐÂY chứ không ở gateway: hết quota là trạng thái của cả project, nên
+   * một đường phát hiện ra (HTTP hay WebSocket) thì đường kia cũng phải dừng. Để
+   * riêng trong gateway thì request HTTP gặp 429 vẫn không ngăn được caption
+   * tiếp tục đốt quota.
+   */
+  private cooldownUntil = 0;
+
+  /**
    * Còn bao lâu nữa thì cửa sổ mới có chỗ cho một request.
    *
    * Trả 0 nếu còn chỗ. Nếu đã đầy, trả đúng khoảng thời gian để request CŨ NHẤT
@@ -40,11 +50,27 @@ export class TranslationRateLimiter {
    * hơn, vì cửa sổ của provider trượt theo thời gian chứ không reset theo lượt.
    */
   msUntilRoom(now: number = Date.now()): number {
+    // ⚠️ Cooldown phải được kiểm TRA TRƯỚC khi xét cửa sổ trượt. Trả sớm "còn
+    // chỗ" khi cửa sổ chưa đầy thì bỏ qua cooldown ⇒ `pauseUntil()` trở thành
+    // một dòng code chết và đường khác vẫn đốt quota. Đã xảy ra (Issue 5.16).
+    const byCooldown = Math.max(0, this.cooldownUntil - now);
+    if (byCooldown > 0) return byCooldown;
+
     const live = this.trim(now);
     if (live.length < TRANSLATE_MAX_PER_WINDOW) return 0;
 
     const oldest = live[0];
     return Math.max(0, oldest + TRANSLATE_WINDOW_MS - now);
+  }
+
+  /**
+   * Tạm dừng MỌI request tới một mốc thời gian, sau khi provider báo hết quota.
+   *
+   * Chỉ dùng cho lỗi quota (`retryable = false`). Giữ nguyên `retryAfterMs`
+   * server dặn, không cap — xem `serverRetryDelayMs`.
+   */
+  pauseUntil(untilMs: number): void {
+    this.cooldownUntil = Math.max(this.cooldownUntil, untilMs);
   }
 
   /**
@@ -60,6 +86,26 @@ export class TranslationRateLimiter {
   /** Số request đang tính trong cửa sổ — dùng cho test và log. */
   callsInWindow(now: number = Date.now()): number {
     return this.trim(now).length;
+  }
+
+  /**
+   * Xin một suất: còn chỗ thì ghi nhận luôn và trả 0; hết chỗ thì trả số ms
+   * phải chờ.
+   *
+   * ⚠️ Gộp kiểm-tra và ghi-nhận vào MỘT lời gọi là chủ ý. Tách thành
+   * `msUntilRoom()` rồi `recordCall()` ở tầng gọi là mở khoảng hở: hai caller
+   * cùng thấy "còn chỗ" trước khi ai kịp ghi, và cả hai cùng bắn. Hàm này chạy
+   * đồng bộ từ đầu tới cuối nên không có `await` nào chen vào giữa.
+   *
+   * Dùng cho đường HTTP, nơi hết chỗ thì từ chối ngay. Đường WebSocket không
+   * dùng hàm này vì nó cần *hẹn giờ* chứ không từ chối — xem `msUntilRoom()`.
+   */
+  tryAcquire(now: number = Date.now()): number {
+    const wait = this.msUntilRoom(now);
+    if (wait > 0) return wait;
+
+    this.recordCall(now);
+    return 0;
   }
 
   /**

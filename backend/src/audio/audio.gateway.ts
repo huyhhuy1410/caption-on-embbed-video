@@ -22,22 +22,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Biến lưu trữ tham chiếu WebSocket client của Extension Chrome đang kết nối
   private extensionClient?: WebSocket;
 
-  /** Nhóm đang dịch dở, khoá theo `captionStart`. */
-  private readonly inFlight = new Set<number>();
-
   private readonly pending = new Map<number, string>();
 
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
 
   private draining = false;
-
-  /**
-   * Mốc thời gian được phép gọi lại sau khi provider báo hết quota.
-   *
-   * Chỉ dùng cho lỗi quota (`retryable = false`) — đó là trạng thái của CẢ
-   * PROJECT, nên phải tạm dừng MỌI request chứ không riêng batch vừa hỏng.
-   */
-  private cooldownUntil = 0;
 
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<number, number>();
@@ -121,10 +110,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Còn chỗ trong cửa sổ thì bắn ngay. Đây là chủ ý: caption về theo từng đợt
     // ~4.5s, nên gộp được nhóm nào thì dòng VI hiện sớm được nhóm đó — chờ thêm
     // chỉ làm bản dịch đến muộn mà không giúp gì cho quota.
-    const wait = Math.max(
-      this.rateLimiter.msUntilRoom(),
-      this.cooldownUntil - Date.now(),
-    );
+    // `msUntilRoom()` đã bao gồm cả cooldown toàn cục — xem
+    // TranslationRateLimiter.pauseUntil.
+    const wait = this.rateLimiter.msUntilRoom();
 
     this.drainTimer = setTimeout(() => {
       this.drainTimer = undefined;
@@ -161,11 +149,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Ghi mốc NGAY TRƯỚC khi bắn — đây là bộ đếm quota, phải khớp số request
     // thật đã rời máy, kể cả request rồi thất bại.
     this.rateLimiter.recordCall();
-    for (const group of batch) {
-      // Chặn nhóm đang bay khỏi bị enqueue lại lần nữa.
-      this.inFlight.add(group.captionStart);
-    }
-
     try {
       const results = await this.translateService.translateBatch(
         batch.map((g) => g.text),
@@ -198,7 +181,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // nó là công của câu thì một đợt cạn quota kéo dài sẽ xoá sổ bản dịch của
       // cả video.
       if (error instanceof ProviderUnavailableError && !error.retryable) {
-        this.cooldownUntil = Date.now() + error.retryAfterMs;
+        // Cooldown nằm ở limiter dùng chung, nên đường HTTP cũng dừng theo.
+        this.rateLimiter.pauseUntil(Date.now() + error.retryAfterMs);
         for (const group of batch) {
           this.pending.set(group.captionStart, group.text);
         }
@@ -222,9 +206,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         );
       }
     } finally {
-      for (const group of batch) {
-        this.inFlight.delete(group.captionStart);
-      }
       this.draining = false;
       // Nhóm mới có thể đã về trong lúc đang chờ request này.
       this.scheduleDrain();

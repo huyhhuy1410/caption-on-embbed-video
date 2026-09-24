@@ -32,4 +32,30 @@ describe('TranslationRateLimiter', () => {
     expect(limiter.callsInWindow(120_000)).toBe(0);
     expect(limiter.msUntilRoom(120_000)).toBe(0);
   });
+
+  it('blocks on cooldown even when the sliding window has room', () => {
+    // ⚠️ Hồi quy cho Issue 5.16: cửa sổ còn trống (0 request) KHÔNG được phép
+    // bỏ qua cooldown — nếu không thì `pauseUntil` là dòng code chết và đường
+    // khác tiếp tục bắn provider trong khi nó đã báo hết quota.
+    limiter.pauseUntil(10_000);
+
+    expect(limiter.msUntilRoom(0)).toBe(10_000);
+    expect(limiter.msUntilRoom(9_999)).toBe(1);
+    expect(limiter.msUntilRoom(10_001)).toBe(0);
+  });
+
+  it('never shortens a cooldown that is already running', () => {
+    limiter.pauseUntil(30_000);
+    limiter.pauseUntil(5_000);
+
+    expect(limiter.msUntilRoom(0)).toBe(30_000);
+  });
+
+  it('takes the longer of the cooldown and the sliding window', () => {
+    for (let i = 0; i < 15; i++) limiter.recordCall(i);
+    limiter.pauseUntil(80_000);
+
+    // Cửa sổ mở lại ở 60s nhưng provider còn bảo chờ tới 80s ⇒ phải chờ 80s.
+    expect(limiter.msUntilRoom(1_000)).toBe(79_000);
+  });
 });
