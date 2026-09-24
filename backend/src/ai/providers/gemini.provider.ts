@@ -11,21 +11,25 @@ export interface GeminiConfig {
 }
 
 /**
- * 503 (model quá tải) là trạng thái TẠM THỜI và thuộc về chính request đó ⇒
- * thử lại ngay trong request là hợp lý.
+ * 503 (model quá tải) là trạng thái TẠM THỜI. Lần thử lại được đặt ở TẦNG GATEWAY,
+ * không phải ở đây — xem `callGemini`.
  *
- * ⚠️ 429 KHÔNG nằm ở đây — xem `QUOTA_STATUS`. Hết quota là trạng thái của CẢ
- * PROJECT trong cửa sổ một phút, nên thử lại trong cùng phút chỉ tổ đốt thêm
- * quota mà chắc chắn vẫn 429.
+ * ⚠️ 429 KHÔNG retry ở đâu cả — xem `QUOTA_STATUS`. Hết quota là trạng thái của
+ * CẢ PROJECT trong cửa sổ một phút, nên thử lại trong cùng phút chỉ tổ đốt thêm
+ * quota mà chắc chắn vẫn 429. Chỉ có bộ đếm cửa sổ 60s ở gateway mới biết lúc nào
+ * quota mở lại.
  */
 const RETRYABLE_STATUS = new Set([503]);
 const QUOTA_STATUS = 429;
-const MAX_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 8_000;
 
 /**
- * Backoff cho 503. 503 không kèm `retryDelay`, nên dùng backoff mũ và cap lại
- * để một request hỏng không treo luồng quá lâu.
+ * Backoff gợi ý cho 503. 503 không kèm `retryDelay`, nên dùng backoff mũ và cap
+ * lại để một request hỏng không treo luồng quá lâu.
+ *
+ * ⚠️ Chỉ là GỢI Ý đặt vào `ProviderUnavailableError.retryAfterMs` cho tầng
+ * gateway. Việc thử lại thật do gateway làm, vì chỉ nó đếm được số request trong
+ * cửa sổ quota.
  */
 export function retryDelayMs(attempt: number): number {
   return Math.min(1000 * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
@@ -41,10 +45,6 @@ export function retryDelayMs(attempt: number): number {
 export function serverRetryDelayMs(body: string): number {
   const match = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(body);
   return match ? Number(match[1]) * 1000 : 0;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Stable JSON envelope Gemini returns for translate (via responseSchema). */
@@ -81,16 +81,24 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
   }
 
   /**
-   * POST one generateContent call asking for structured JSON.
+   * POST MỘT generateContent call và trả JSON đã parse.
    *
-   * 429 (hết quota phút) và 503 (model quá tải) là trạng thái TẠM THỜI của
-   * Gemini — thử lại thay vì bỏ luôn câu đó. Không có queue nên vẫn có thể
-   * vượt trần RPM khi caption về dồn dập; retry chỉ giảm số câu mất trắng.
+   * ⚠️ Hàm này KHÔNG tự thử lại, và đó là chủ ý — đừng thêm retry vào đây.
+   *
+   * Lý do: throttle của gateway đếm số request để giữ trần 15 request/phút của
+   * Gemini free tier. Retry nội bộ ở đây khiến MỘT lượt drain bắn nhiều HTTP call
+   * mà bộ đếm không thấy gì cả. Probe đo được đúng hệ quả đó: 26 request/phút so
+   * với trần 15 (Issue 5.12, vòng 2).
+   *
+   * Nên cả 429 lẫn 503 đều ném `ProviderUnavailableError` lên gateway, kèm cờ
+   * `retryable` để gateway biết phải tính công (503 — lỗi của chính batch) hay
+   * re-queue không tính công (429 — quota của cả project):
+   * - 429 (`retryable = false`): giữ nguyên `retryDelay` server dặn, không cap.
+   * - 503 (`retryable = true`): không có `retryDelay`, dùng backoff mũ có cap.
    */
   private async callGemini<T>(prompt: string, schema: object): Promise<T> {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
 
-    for (let attempt = 1; ; attempt++) {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -107,9 +115,10 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
       const text = await res.text();
       const status = res.status;
 
-      // 429: không thử lại ở đây. Quota là của cả project trong một phút, nên
-      // request này chắc chắn 429 tiếp. Ném lên để tầng gateway tạm dừng MỌI
-      // request rồi thử lại sau — và giữ nguyên thời gian server dặn.
+      // 429: quota của cả project trong một phút — KHÔNG thử lại ở bất kỳ đâu.
+      // Ném lên để gateway tạm dừng MỌI request, và giữ nguyên thời gian server
+      // dặn (cap nó xuống dưới một phút là tự bảo đảm lần thử sau rơi đúng vào
+      // cửa sổ vừa cạn).
       if (status === QUOTA_STATUS) {
         const retryAfterMs = serverRetryDelayMs(text);
         this.logger.warn(
@@ -118,16 +127,19 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
         throw new ProviderUnavailableError(
           `Request failed (HTTP 429)`,
           retryAfterMs,
+          false,
         );
       }
 
-      if (RETRYABLE_STATUS.has(status) && attempt < MAX_ATTEMPTS) {
-        const delay = retryDelayMs(attempt);
-        this.logger.warn(
-          `HTTP ${status}, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`,
+      // 503: model quá tải — tạm thời và thuộc về chính batch này. Gateway sẽ
+      // thử lại, nhưng TÍNH CÔNG để một đợt quá tải dài không giữ câu vô hạn.
+      if (RETRYABLE_STATUS.has(status)) {
+        this.logger.warn(`HTTP ${status} (overloaded), deferring retry`);
+        throw new ProviderUnavailableError(
+          `Request failed (HTTP ${status})`,
+          retryDelayMs(1),
+          true,
         );
-        await sleep(delay);
-        continue;
       }
 
       // Parse Gemini error body without leaking the key (key is in URL, not echoed).
@@ -142,8 +154,7 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
     if (!text) {
       throw new Error('Returned no text content');
     }
-      return JSON.parse(text) as T;
-    }
+    return JSON.parse(text) as T;
   }
 
   // ---- TODO (Parker): implement below, using the helpers above ----

@@ -66,17 +66,45 @@ describe('AudioGateway', () => {
       );
     });
 
-    it('spaces consecutive requests so the RPM ceiling is never exceeded', async () => {
+    it('never exceeds the per-minute request ceiling, even under a 503 storm', async () => {
+      // ⚠️ Đây là bug đã đo được: throttle theo KHOẢNG CÁCH giữa các lượt drain
+      // cho ra 26 request/phút, vì mỗi drain tự thử lại 3 lần bên trong. Giờ
+      // throttle đếm SỐ REQUEST trong cửa sổ 60s, và retry nằm ở gateway.
+      translateBatch.mockRejectedValue(
+        new ProviderUnavailableError('HTTP 503', 1_000, true),
+      );
+
+      // Ghi lại MỐC THỜI GIAN từng request để kiểm tra đúng bất biến.
+      const callTimes: number[] = [];
+      translateBatch.mockImplementation(async () => {
+        callTimes.push(Date.now());
+        throw new ProviderUnavailableError('HTTP 503', 1_000, true);
+      });
+
+      // Caption về liên tục trong 4 phút, dày hơn nhịp thật.
+      for (let t = 0; t < 240; t++) {
+        internals.enqueueForTranslation([{ captionStart: 100 + t, text: 'x' }]);
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
+
+      expect(callTimes.length).toBeGreaterThan(30);
+
+      // ⚠️ Bất biến thật: KHÔNG cửa sổ 60s nào chứa quá 15 request. Đây đúng
+      // là cách provider đếm quota, khác hẳn "tổng số chia cho số phút".
+      for (const at of callTimes) {
+        const inWindow = callTimes.filter((t) => t > at - 60_000 && t <= at);
+        expect(inWindow.length).toBeLessThanOrEqual(15);
+      }
+    });
+
+    it('holds a request back until the window frees up', async () => {
       internals.enqueueForTranslation([{ captionStart: 1, text: 'one' }]);
-      await jest.runOnlyPendingTimersAsync();
+      await jest.advanceTimersByTimeAsync(1);
       expect(translateBatch).toHaveBeenCalledTimes(1);
 
-      // Nhóm mới về ngay sau đó — phải bị giữ lại, không được bắn ngay.
+      // Nhóm mới về ngay sau đó — còn quota nên được bắn, nhưng không chồng lên.
       internals.enqueueForTranslation([{ captionStart: 2, text: 'two' }]);
-      await jest.advanceTimersByTimeAsync(1_000);
-      expect(translateBatch).toHaveBeenCalledTimes(1);
-
-      await jest.advanceTimersByTimeAsync(4_000);
+      await jest.advanceTimersByTimeAsync(1);
       expect(translateBatch).toHaveBeenCalledTimes(2);
     });
 
@@ -95,7 +123,8 @@ describe('AudioGateway', () => {
     });
 
     it('gives up on a group after 3 failed attempts', async () => {
-      translateBatch.mockRejectedValue(new Error('HTTP 503'));
+      // Lỗi thuộc về chính batch (400/401/500...) ⇒ đếm công rồi bỏ.
+      translateBatch.mockRejectedValue(new Error('HTTP 500'));
 
       for (let round = 0; round < 5; round++) {
         internals.enqueueForTranslation([{ captionStart: 9, text: 'retry me' }]);

@@ -17,12 +17,15 @@ type CaptionGroup = { captionStart: number; text: string };
 const MAX_TRANSLATE_ATTEMPTS = 3;
 
 /**
- * Khoang cach toi thieu giua hai request dich.
+ * Trần số request dịch trong cửa sổ trượt một phút.
  *
- * Gemini free tier cho ~15 request/phut => 60/15 = 4000ms. Giu dung 4000ms thi
- * khong bao gio vuot tran, ke ca khi caption ve don dap.
+ * Gemini free tier cho 15 request/phút (`quotaValue: 15` trong chính response
+ * 429). Đây là con số DUY NHẤT phải giữ.
  */
-const TRANSLATE_MIN_INTERVAL_MS = 4_000;
+const TRANSLATE_MAX_PER_WINDOW = 15;
+
+/** Độ dài cửa sổ quota — quota của Gemini là PER MINUTE. */
+const TRANSLATE_WINDOW_MS = 60_000;
 
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -36,11 +39,25 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
 
-  private lastDrainAt = 0;
-
   private draining = false;
 
+  /**
+   * Mốc thời gian được phép gọi lại sau khi provider báo hết quota.
+   *
+   * Chỉ dùng cho lỗi quota (`retryable = false`) — đó là trạng thái của CẢ
+   * PROJECT, nên phải tạm dừng MỌI request chứ không riêng batch vừa hỏng.
+   */
   private cooldownUntil = 0;
+
+  /**
+   * Mốc thời gian của từng request đã bắn, trong cửa sổ 60s gần nhất.
+   *
+   * ⚠️ Đây là bộ đếm quota, và nó phải đếm SỐ REQUEST — không phải khoảng cách
+   * giữa các lượt drain. Bản trước throttle bằng khoảng cách và đo được 26
+   * request/phút so với trần 15, vì mỗi lượt drain còn tự thử lại bên trong
+   * `GeminiProvider` (Issue 5.12). Retry giờ nằm ở đây nên con số này là sự thật.
+   */
+  private readonly translateCallTimes: number[] = [];
 
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<number, number>();
@@ -109,27 +126,52 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
-   * Hẹn lượt drain kế tiếp, tôn trọng cả khoảng cách tối thiểu lẫn cooldown.
+   * Hẹn lượt drain kế tiếp, chờ tới khi cửa sổ quota còn chỗ.
    *
    * ⚠️ Guard `draining` là bắt buộc, không phải cho đẹp: `drainTimer` được xoá
-   * lúc timer NỔ, không phải lúc drain XONG. Một drain có retry 503 sẽ await
-   * hàng giây, suốt thời gian đó `drainTimer` là `undefined` ⇒ không còn gì
-   * chặn việc hẹn drain mới ⇒ nhiều request chạy chồng, cùng key, cùng bucket
-   * quota.
+   * lúc timer NỔ, không phải lúc drain XONG. Một drain có retry sẽ await hàng
+   * giây, suốt thời gian đó `drainTimer` là `undefined` ⇒ không còn gì chặn việc
+   * hẹn drain mới ⇒ nhiều request chạy chồng, cùng key, cùng bucket quota.
    */
   private scheduleDrain(): void {
     if (this.pending.size === 0) return;
     if (this.drainTimer !== undefined || this.draining) return;
 
-    // Chừa khoảng cách tối thiểu giữa hai request để không vượt trần RPM.
-    const elapsed = Date.now() - this.lastDrainAt;
-    const spacing = Math.max(0, TRANSLATE_MIN_INTERVAL_MS - elapsed);
-    const cooldown = Math.max(0, this.cooldownUntil - Date.now());
+    // Còn chỗ trong cửa sổ thì bắn ngay. Đây là chủ ý: caption về theo từng đợt
+    // ~4.5s, nên gộp được nhóm nào thì dòng VI hiện sớm được nhóm đó — chờ thêm
+    // chỉ làm bản dịch đến muộn mà không giúp gì cho quota.
+    const wait = Math.max(
+      this.msUntilWindowHasRoom(Date.now()),
+      this.cooldownUntil - Date.now(),
+    );
 
     this.drainTimer = setTimeout(() => {
       this.drainTimer = undefined;
       void this.drain();
-    }, Math.max(spacing, cooldown));
+    }, wait);
+  }
+
+  /**
+   * Còn bao lâu nữa thì cửa sổ 60s mới có chỗ cho một request.
+   *
+   * Trả 0 nếu còn chỗ. Nếu đã đầy, trả đúng khoảng thời gian để request CŨ NHẤT
+   * trong cửa sổ rơi ra ngoài — lúc đó quota mới thật sự mở lại.
+   *
+   * Đây là chỗ hiện thực hoá "quota là per MINUTE": không có cách nào thử nhanh
+   * hơn, vì cửa sổ của provider trượt theo thời gian chứ không reset theo lượt.
+   */
+  private msUntilWindowHasRoom(now: number): number {
+    const live = this.translateCallTimes.filter(
+      (at) => at > now - TRANSLATE_WINDOW_MS,
+    );
+    // Ghi lại danh sách đã lọc — mỗi lần gọi cũng là một lần dọn rác.
+    this.translateCallTimes.length = 0;
+    this.translateCallTimes.push(...live);
+
+    if (live.length < TRANSLATE_MAX_PER_WINDOW) return 0;
+
+    const oldest = live[0];
+    return Math.max(0, oldest + TRANSLATE_WINDOW_MS - now);
   }
 
   /**
@@ -140,14 +182,26 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    * EN phải chạy bất kể.
    */
   private async drain(): Promise<void> {
+    // ⚠️ Kiểm lại quota NGAY TRƯỚC khi tiêu, dù `scheduleDrain` đã tính rồi.
+    // Đây là chốt chặn duy nhất nằm đúng chỗ request thật sự rời máy, nên bất
+    // biến "≤15 request/60s" được giữ tại đây thay vì phụ thuộc vào việc timer
+    // không bao giờ nổ sớm (đồng hồ hệ thống nhảy, timer bị dồn...). Trả batch về
+    // hàng đợi rồi hẹn lại — không mất câu nào.
+    if (this.msUntilWindowHasRoom(Date.now()) > 0) {
+      this.scheduleDrain();
+      return;
+    }
+
     const batch = Array.from(this.pending.entries()).map(
       ([captionStart, text]) => ({ captionStart, text }),
     );
     this.pending.clear();
     if (batch.length === 0) return;
 
-    this.lastDrainAt = Date.now();
     this.draining = true;
+    // Ghi mốc NGAY TRƯỚC khi bắn — đây là bộ đếm quota, phải khớp số request
+    // thật đã rời máy, kể cả request rồi thất bại.
+    this.translateCallTimes.push(Date.now());
     for (const group of batch) {
       // Chặn nhóm đang bay khỏi bị enqueue lại lần nữa.
       this.inFlight.add(group.captionStart);
@@ -159,9 +213,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         'vi',
         'en',
       );
-
-      // Qua được ⇒ quota đã mở lại.
-      this.cooldownUntil = 0;
 
       batch.forEach((group, index) => {
         const vi = results[index]?.text.trim();
@@ -180,10 +231,14 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
       });
     } catch (error: unknown) {
-      // ⚠️ Lỗi quota KHÔNG thuộc về câu nào cả — cả project đang cạn quota.
-      // Trả các nhóm về hàng đợi và KHÔNG tăng `attempts`: đếm nó là công của
-      // câu thì một đợt cạn quota kéo dài sẽ xoá sổ bản dịch của cả video.
-      if (error instanceof ProviderUnavailableError) {
+      // ⚠️ Cờ `retryable` quyết định nhánh nào — hai nhánh KHÁC NHAU về hậu quả.
+      // Xem `ProviderUnavailableError` để biết vì sao không được gộp chúng.
+      //
+      // Lỗi quota (`retryable = false`): KHÔNG thuộc về câu nào cả, cả project
+      // đang cạn quota. Trả các nhóm về hàng đợi và KHÔNG tăng `attempts` — đếm
+      // nó là công của câu thì một đợt cạn quota kéo dài sẽ xoá sổ bản dịch của
+      // cả video.
+      if (error instanceof ProviderUnavailableError && !error.retryable) {
         this.cooldownUntil = Date.now() + error.retryAfterMs;
         for (const group of batch) {
           this.pending.set(group.captionStart, group.text);
@@ -193,7 +248,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             `re-queued ${batch.length} sentences`,
         );
       } else {
-        // Lỗi thật sự thuộc về batch này ⇒ tính công, bỏ sau MAX lần.
+        // Còn lại — kể cả 503 model quá tải — là lỗi thuộc về CHÍNH batch này,
+        // nên tính công rồi bỏ sau MAX lần; không thể giữ câu trong hàng đợi vô
+        // hạn chỉ vì model đang quá tải.
         for (const group of batch) {
           this.attempts.set(
             group.captionStart,

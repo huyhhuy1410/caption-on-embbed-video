@@ -1,4 +1,5 @@
 import { GeminiProvider, retryDelayMs, serverRetryDelayMs } from './gemini.provider';
+import { ProviderUnavailableError } from '../errors';
 
 describe('GeminiProvider', () => {
   // Provider config
@@ -104,39 +105,42 @@ describe('GeminiProvider', () => {
     ).rejects.toThrow('Request failed (HTTP 500)');
   });
 
-  it('retries a 503 then succeeds', async () => {
-    global.fetch = jest
-      .fn()
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        text: async () => '{"error":{"status":"UNAVAILABLE"}}',
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          candidates: [
-            { content: { parts: [{ text: '{"translation":"Xin chào"}' }] } },
-          ],
-        }),
-      });
-
-    const result = await provider.translate('Hello', 'vi', 'en');
-    expect(result.text).toBe('Xin chào');
-    expect(global.fetch).toHaveBeenCalledTimes(2);
-  });
-
-  it('gives up after 3 attempts on a persistent 503', async () => {
+  it('does NOT retry a 503 internally — defers the retry to the gateway', async () => {
+    // ⚠️ Đây là điều kiện để throttle của gateway đo ĐÚNG số request. Retry nội
+    // bộ ở đây sẽ khiến một lượt drain bắn nhiều HTTP call mà throttle không
+    // thấy (probe từng đo 26 request/phút so với trần 15).
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 503,
       text: async () => '{"error":{"status":"UNAVAILABLE"}}',
     });
 
-    await expect(provider.translate('Hello', 'vi', 'en')).rejects.toThrow(
-      'Request failed (HTTP 503)',
+    await expect(provider.translate('Hello', 'vi', 'en')).rejects.toBeInstanceOf(
+      ProviderUnavailableError,
     );
-    expect(global.fetch).toHaveBeenCalledTimes(3);
+    // Đúng MỘT lần gọi: không thử lại bên trong.
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks a 503 as retryable but a 429 as not', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: async () => '{"error":{"status":"UNAVAILABLE"}}',
+    });
+    await expect(provider.translate('Hello', 'vi', 'en')).rejects.toMatchObject({
+      retryable: true,
+    });
+
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 429,
+      text: async () => '{"error":{"details":[{"retryDelay":"22s"}]}}',
+    });
+    await expect(provider.translate('Hello', 'vi', 'en')).rejects.toMatchObject({
+      retryable: false,
+      retryAfterMs: 22_000,
+    });
   });
 
   describe('translateBatch', () => {
