@@ -5,6 +5,13 @@ export interface CaptionWord {
   captionStart: number;
 }
 
+/** Từ user vừa bấm, kèm câu chứa nó — `/explain-word` cần ngữ cảnh để giải
+ * nghĩa đúng nghĩa trong video, không phải nghĩa từ điển. */
+export interface WordPick {
+  word: string;
+  context: string;
+}
+
 /** Bản dịch một câu. `captionStart` là khoá nhóm, ổn định qua replay. */
 export interface SentenceTranslation {
   captionStart: number;
@@ -25,6 +32,9 @@ export class CaptionOverlay {
 
   /** Bản dịch theo `captionStart`. Bản dịch về muộn hơn words nên giữ riêng. */
   private translations = new Map<number, string>();
+
+  /** Gửi từ user bấm ra ngoài. Xem `onWordPick`. */
+  private wordPick: ((pick: WordPick) => void) | null = null;
 
   constructor() {
     this.host = document.createElement("div");
@@ -56,6 +66,18 @@ export class CaptionOverlay {
   border-radius: 6px;
   text-align: center;
   line-height: 1.35;
+  /* Chỉ dòng EN nhận chuột — nó là bề mặt click-any-word (FR-6.1). Giữ
+     :host ở pointer-events:none để phần còn lại của overlay vẫn không chắn
+     thao tác lên video (controls, tua, chuột phải). */
+  pointer-events: auto;
+  cursor: pointer;
+  /* Cao hơn :host để mọi phần tử con (span) cũng nhận chuột, không chỉ nền
+     của div — pointer-events không tự kế thừa xuống. */
+  z-index: 1;
+}
+.word-picked {
+  color: #ffd84d;
+  text-decoration: underline;
 }
 .line-vi {
   background: rgba(0, 0, 0, 0.6);
@@ -73,8 +95,56 @@ export class CaptionOverlay {
     this.shadow.appendChild(style);
     this.shadow.appendChild(this.enLine);
     this.shadow.appendChild(this.viLine);
+
+    // Dùng event delegation trên dòng EN thay vì gắn listener vào từng span:
+    // `update()` dựng lại span mỗi khi nhóm caption đổi, gắn listener từng span
+    // nghĩa là phải gắn lại mỗi lần — và span cũ giữ listener thành rò bộ nhớ.
+    this.enLine.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const index = Number(target.getAttribute("data-index"));
+      if (!Number.isInteger(index)) return;
+      const pick = this.pickAt(index);
+      if (pick) this.wordPick?.(pick);
+    });
+
     document.body.appendChild(this.host);
     this.hide();
+  }
+
+  /**
+   * Lấy từ + câu chứa nó từ span thứ `index` của dòng đang hiện.
+   *
+   * `index` là lệch trong NHÓM đang hiện, nên cần quyết lại `start` y hệt cách
+   * `update()` dò — dùng lại logic ở đây thay vì lưu cả nhóm vào span, vì
+   * `data-index` phải là số nhỏ để attribute gọn.
+   */
+  private pickAt(index: number): WordPick | null {
+    if (this.lastLineKey === -1) return null;
+    const current = this.words.findIndex(
+      (w) => w.captionStart === this.lastLineKey,
+    );
+    if (current === -1) return null;
+
+    let start = current;
+    while (start > 0 && this.words[start - 1].captionStart === this.lastLineKey) {
+      start--;
+    }
+    const word = this.words[start + index];
+    if (!word) return null;
+
+    // Câu = mọi từ cùng `captionStart`. Rút gọn khoảng trắng vì `join(" ")`.
+    const context = this.words
+      .filter((w) => w.captionStart === word.captionStart)
+      .map((w) => w.w)
+      .join(" ")
+      .trim();
+    return { word: word.w, context };
+  }
+
+  /** Đăng ký callback khi user bấm một từ. Xem `WordPick`. */
+  setWordPickHandler(handler: (pick: WordPick) => void): void {
+    this.wordPick = handler;
   }
 
   setWords(words: CaptionWord[]): void {
@@ -139,6 +209,8 @@ export class CaptionOverlay {
       for (let i = start; i <= end; i++) {
         const span = document.createElement("span");
         span.textContent = this.words[i].w + " ";
+        // Lệch trong nhóm — `pickAt` dùng đúng số này để tra từ.
+        span.dataset.index = String(i - start);
         this.enLine.appendChild(span);
         this.wordSpans.push(span);
       }

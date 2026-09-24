@@ -3,9 +3,10 @@
   "name": "Caption AI (Local)",
   "version": "0.1.0",
   "description": "Local bilingual captions for embedded HTML video.",
-  "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "sidePanel"],
+  "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "sidePanel", "contextMenus"],
   "host_permissions": ["http://127.0.0.1:8000/*"],
   "background": { "service_worker": "dist/background/service-worker.js" },
+  "side_panel": { "default_path": "dist/side-panel/side-panel.html" },
   "content_scripts": [{
     "matches": ["<all_urls>"],
     "js": ["dist/content/video-detector.js"],

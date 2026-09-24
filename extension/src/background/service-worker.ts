@@ -44,6 +44,31 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 // === BƯỚC 2: Lắng nghe tin nhắn từ Content Script hoặc các trang nội bộ ===
+// Side panel MỞ bằng click chuột phải lên icon, KHÔNG dùng
+// `openPanelOnActionClick`: click trái đã là công tắc bật/tắt capture (và là
+// gesture duy nhất cấp `activeTab` — xem gotcha #3), bật option đó thì Chrome
+// nuốt click và không bật/tắt capture nữa.
+chrome.contextMenus.create({
+  id: "open-explain-panel",
+  title: "Giải nghĩa từ (Caption AI)",
+  contexts: ["action"],
+});
+
+// `contexts: ["action"]` cần quyền contextMenus, và `create` phải chạy ở
+// top-level của extension page (kể cả khi SW tỉnh dậy) — gọi trong listener
+// sẽ bị Chrome từ chối.
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== "open-explain-panel") return;
+  // ⚠️ `OnClickData` KHÔNG có `windowId` — window phải lấy từ tham số thứ hai
+  // (`tab`). `tab` là undefined ở ngữ cảnh không có trang (launcher, cửa sổ
+  // trình duyệt rỗng) ⇒ không có window để mở panel.
+  const windowId = tab?.windowId;
+  if (windowId === undefined) return;
+  void chrome.sidePanel.open({ windowId }).catch((error: unknown) => {
+    console.warn("Caption AI SW: could not open side panel", error);
+  });
+});
+
 chrome.runtime.onMessage.addListener((message) => {
   // 2.1. Nhận mốc video.currentTime và chuyển tiếp (relay) sang cho Offscreen Document
   if (message?.type === "video-clock") {
@@ -66,6 +91,24 @@ chrome.runtime.onMessage.addListener((message) => {
       })
       .catch((error: unknown) => {
         console.warn("Caption AI SW: could not relay seek", error);
+      });
+  }
+
+  // 2.3. Chuyển tiếp lời gọi "giải nghĩa từ" từ content script sang side panel.
+  // ⚠️ Chỉ relay TÍN HIỆU (ai cần giải nghĩa từ nào) — bản thân lời gọi
+  // `POST /explain-word` do side panel tự đi, vì nó là extension page đã có
+  // `host_permissions` tới 127.0.0.1:8000. Không để SW gọi thay: SW bị giết
+  // sau ~30s idle và phải giữ state qua `storage.session` (gotcha #21).
+  if (message?.type === "explain-request") {
+    void chrome.runtime
+      .sendMessage({
+        type: "explain-request",
+        word: message.word,
+        context: message.context,
+      })
+      .catch((error: unknown) => {
+        // Xảy ra khi side panel CHƯA mở — không phải lỗi.
+        console.info("Caption AI SW: side panel chưa mở, bỏ qua explain", error);
       });
   }
 

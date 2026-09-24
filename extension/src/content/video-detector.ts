@@ -8,6 +8,22 @@ let overlayFrameId: number | null = null;
 const overlay = new CaptionOverlay();
 const fullscreen = new CaptionFullscreen();
 
+// Click vào một từ trên overlay → SW relay → side panel gọi /explain-word.
+// Không gọi thẳng từ content script: content script không được fetch tới
+// host ngoài (CORS), và side panel là nơi có chỗ hiển thị lời giải nghĩa.
+overlay.setWordPickHandler((pick) => {
+  void chrome.runtime
+    .sendMessage({
+      type: "explain-request",
+      word: pick.word,
+      context: pick.context,
+    })
+    .catch((error: unknown) => {
+      // Side panel chưa mở là chuyện thường, không phải lỗi cần báo user.
+      console.info("Caption AI: explain request chưa tới side panel", error);
+    });
+});
+
 function repositionOverlay() {
   if (!activeVideo) return;
   // Trong CC fullscreen, getBoundingClientRect là element box phủ kín màn hình
