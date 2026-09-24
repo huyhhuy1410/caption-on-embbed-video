@@ -8,6 +8,7 @@ import { SidecarService } from './sidecar/sidecar.service';
 import { TranscriptService } from './transcript/transcript.service';
 import { VideoClockService } from './clock/video-clock.service';
 import { TranslateService } from '../ai/translate.service';
+import { TranslationRateLimiter } from '../ai/translation-rate-limiter.service';
 import { ProviderUnavailableError } from '../ai/errors';
 
 /** Một caption group: các từ dùng chung một `captionStart`. */
@@ -15,17 +16,6 @@ type CaptionGroup = { captionStart: number; text: string };
 
 /** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
 const MAX_TRANSLATE_ATTEMPTS = 3;
-
-/**
- * Trần số request dịch trong cửa sổ trượt một phút.
- *
- * Gemini free tier cho 15 request/phút (`quotaValue: 15` trong chính response
- * 429). Đây là con số DUY NHẤT phải giữ.
- */
-const TRANSLATE_MAX_PER_WINDOW = 15;
-
-/** Độ dài cửa sổ quota — quota của Gemini là PER MINUTE. */
-const TRANSLATE_WINDOW_MS = 60_000;
 
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -49,16 +39,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    */
   private cooldownUntil = 0;
 
-  /**
-   * Mốc thời gian của từng request đã bắn, trong cửa sổ 60s gần nhất.
-   *
-   * ⚠️ Đây là bộ đếm quota, và nó phải đếm SỐ REQUEST — không phải khoảng cách
-   * giữa các lượt drain. Bản trước throttle bằng khoảng cách và đo được 26
-   * request/phút so với trần 15, vì mỗi lượt drain còn tự thử lại bên trong
-   * `GeminiProvider` (Issue 5.12). Retry giờ nằm ở đây nên con số này là sự thật.
-   */
-  private readonly translateCallTimes: number[] = [];
-
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<number, number>();
 
@@ -68,6 +48,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly transcriptService: TranscriptService,
     private readonly videoClockService: VideoClockService,
     private readonly translateService: TranslateService,
+    private readonly rateLimiter: TranslationRateLimiter,
   ) {
     // 1.1. Đăng ký callback lắng nghe kết quả Subtitle trả về từ Python Sidecar
     this.sidecarService.setMessageHandler((data) => {
@@ -141,7 +122,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // ~4.5s, nên gộp được nhóm nào thì dòng VI hiện sớm được nhóm đó — chờ thêm
     // chỉ làm bản dịch đến muộn mà không giúp gì cho quota.
     const wait = Math.max(
-      this.msUntilWindowHasRoom(Date.now()),
+      this.rateLimiter.msUntilRoom(),
       this.cooldownUntil - Date.now(),
     );
 
@@ -151,28 +132,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }, wait);
   }
 
-  /**
-   * Còn bao lâu nữa thì cửa sổ 60s mới có chỗ cho một request.
-   *
-   * Trả 0 nếu còn chỗ. Nếu đã đầy, trả đúng khoảng thời gian để request CŨ NHẤT
-   * trong cửa sổ rơi ra ngoài — lúc đó quota mới thật sự mở lại.
-   *
-   * Đây là chỗ hiện thực hoá "quota là per MINUTE": không có cách nào thử nhanh
-   * hơn, vì cửa sổ của provider trượt theo thời gian chứ không reset theo lượt.
-   */
-  private msUntilWindowHasRoom(now: number): number {
-    const live = this.translateCallTimes.filter(
-      (at) => at > now - TRANSLATE_WINDOW_MS,
-    );
-    // Ghi lại danh sách đã lọc — mỗi lần gọi cũng là một lần dọn rác.
-    this.translateCallTimes.length = 0;
-    this.translateCallTimes.push(...live);
-
-    if (live.length < TRANSLATE_MAX_PER_WINDOW) return 0;
-
-    const oldest = live[0];
-    return Math.max(0, oldest + TRANSLATE_WINDOW_MS - now);
-  }
 
   /**
    * Dịch mọi nhóm đang chờ trong MỘT request.
@@ -187,7 +146,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // biến "≤15 request/60s" được giữ tại đây thay vì phụ thuộc vào việc timer
     // không bao giờ nổ sớm (đồng hồ hệ thống nhảy, timer bị dồn...). Trả batch về
     // hàng đợi rồi hẹn lại — không mất câu nào.
-    if (this.msUntilWindowHasRoom(Date.now()) > 0) {
+    if (this.rateLimiter.msUntilRoom() > 0) {
       this.scheduleDrain();
       return;
     }
@@ -201,7 +160,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.draining = true;
     // Ghi mốc NGAY TRƯỚC khi bắn — đây là bộ đếm quota, phải khớp số request
     // thật đã rời máy, kể cả request rồi thất bại.
-    this.translateCallTimes.push(Date.now());
+    this.rateLimiter.recordCall();
     for (const group of batch) {
       // Chặn nhóm đang bay khỏi bị enqueue lại lần nữa.
       this.inFlight.add(group.captionStart);

@@ -5,6 +5,7 @@ import { TranscriptService } from './transcript/transcript.service';
 import { VideoClockService } from './clock/video-clock.service';
 import { TranslateService } from '../ai/translate.service';
 import { ProviderUnavailableError } from '../ai/errors';
+import { TranslationRateLimiter } from '../ai/translation-rate-limiter.service';
 
 /** Truy cập method private để test hàng đợi mà không phải dựng cả WS. */
 type GatewayInternals = {
@@ -25,6 +26,7 @@ describe('AudioGateway', () => {
         { provide: SidecarService, useValue: { setMessageHandler: jest.fn() } },
         TranscriptService,
         VideoClockService,
+        TranslationRateLimiter,
         {
           provide: TranslateService,
           useValue: { translate: jest.fn(), translateBatch },
