@@ -17,6 +17,20 @@ type CaptionGroup = { captionStart: number; text: string };
 /** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
 const MAX_TRANSLATE_ATTEMPTS = 3;
 
+/**
+ * Trần thời gian giữ một câu trong hàng đợi khi provider quá tải (503).
+ *
+ * ⚠️ Vì sao 503 không dùng chung `MAX_TRANSLATE_ATTEMPTS`: 503 là lỗi tạm thời
+ * của provider và **không tiêu quota**, nên giữ câu chờ là an toàn — trần quota
+ * 15 req/phút do bộ đếm cửa sổ giữ, không phải do việc bỏ sau N lần. Trước đây
+ * 503 đi chung nhánh "tính công rồi bỏ", nên một đợt Gemini quá tải vài phút
+ * **xoá vĩnh viễn bản dịch VI của cả đoạn** chứ không chỉ chậm hơn — đúng cái
+ * "xoá sổ bản dịch cả video" đã xảy ra ở Issue 5.12. Vẫn cần trần để một lỗi
+ * 503 kéo dài (model bị thu hồi, key hết hạn mà lỗi trả về 503) không giữ câu
+ * vô hạn.
+ */
+const TRANSIENT_HOLD_MAX_MS = 5 * 60_000;
+
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Biến lưu trữ tham chiếu WebSocket client của Extension Chrome đang kết nối
@@ -30,6 +44,25 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<number, number>();
+
+  /**
+   * Mốc lúc một nhóm bắt đầu bị GIỮ vì 503 — khác `attempts` ở chỗ nó đo
+   * THỜI GIAN chờ, không đếm lần. Xem `TRANSIENT_HOLD_MAX_MS`.
+   */
+  private readonly heldSince = new Map<number, number>();
+
+  /**
+   * Không được thử lại trước mốc này sau một đợt 503.
+   *
+   * ⚠️ Cần riêng vì `msUntilRoom()` chỉ biết QUOTA, không biết provider đang
+   * quá tải: sau 503 thì cửa sổ vẫn còn chỗ ⇒ timer nổ ngay lập tức ⇒ 503 lặp
+   * liên tục, đốt hết lượt của các câu mới trong lúc model đang chết.
+   *
+   * Giữ ở gateway chứ không `pauseUntil` trên limiter dùng chung: 503 là lỗi
+   * của CHÍNH request (gotcha #26), không phải trạng thái của cả project — đường
+   * HTTP không có lý do bị chặn theo.
+   */
+  private drainNotBefore = 0;
 
   // === BƯỚC 1: Constructor - Thiết lập kết nối hai chiều với Sidecar Service ===
   constructor(
@@ -111,8 +144,13 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // ~4.5s, nên gộp được nhóm nào thì dòng VI hiện sớm được nhóm đó — chờ thêm
     // chỉ làm bản dịch đến muộn mà không giúp gì cho quota.
     // `msUntilRoom()` đã bao gồm cả cooldown toàn cục — xem
-    // TranslationRateLimiter.pauseUntil.
-    const wait = this.rateLimiter.msUntilRoom();
+    // TranslationRateLimiter.pauseUntil. Lấy max với `drainNotBefore` để
+    // không thử lại trong lúc provider còn đang quá tải.
+    const wait = Math.max(
+      this.rateLimiter.msUntilRoom(),
+      this.drainNotBefore - Date.now(),
+      0,
+    );
 
     this.drainTimer = setTimeout(() => {
       this.drainTimer = undefined;
@@ -120,6 +158,12 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }, wait);
   }
 
+
+  /** Nhóm này đã bị giữ chờ 503 quá lâu chưa? Xem `TRANSIENT_HOLD_MAX_MS`. */
+  private hasHeldTooLong(captionStart: number, now: number): boolean {
+    const since = this.heldSince.get(captionStart);
+    return since !== undefined && now - since >= TRANSIENT_HOLD_MAX_MS;
+  }
 
   /**
    * Dịch mọi nhóm đang chờ trong MỘT request.
@@ -157,6 +201,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       );
 
       batch.forEach((group, index) => {
+        // Xoá mốc giữ NGAY khi thành công: để sót lại thì lần 503 sau nhóm này
+        // bị coi là "đã giữ quá lâu" và bị bỏ oan.
+        this.heldSince.delete(group.captionStart);
         const vi = results[index]?.text.trim();
         if (!vi) return;
 
@@ -173,16 +220,21 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
       });
     } catch (error: unknown) {
-      // ⚠️ Cờ `retryable` quyết định nhánh nào — hai nhánh KHÁC NHAU về hậu quả.
-      // Xem `ProviderUnavailableError` để biết vì sao không được gộp chúng.
-      //
-      // Lỗi quota (`retryable = false`): KHÔNG thuộc về câu nào cả, cả project
-      // đang cạn quota. Trả các nhóm về hàng đợi và KHÔNG tăng `attempts` — đếm
-      // nó là công của câu thì một đợt cạn quota kéo dài sẽ xoá sổ bản dịch của
-      // cả video.
-      if (error instanceof ProviderUnavailableError && !error.retryable) {
+      // ⚠️ Ba nhánh, KHÁC NHAU về hậu quả — xem `ProviderUnavailableError`.
+      const now = Date.now();
+      const quotaError =
+        error instanceof ProviderUnavailableError && !error.retryable;
+      const overloaded = error instanceof ProviderUnavailableError && error.retryable;
+      // 503 đã giữ quá trần ⇒ bỏ (còn câu mới trong hàng đợi vẫn được thử).
+      const heldTooLong = batch.some((g) => this.hasHeldTooLong(g.captionStart, now));
+
+      if (quotaError) {
+        // Lỗi quota: KHÔNG thuộc về câu nào cả, cả project đang cạn quota.
+        // Trả các nhóm về hàng đợi và KHÔNG tăng `attempts` — đếm nó là công
+        // của câu thì một đợt cạn quota kéo dài sẽ xoá sổ bản dịch của cả
+        // video.
         // Cooldown nằm ở limiter dùng chung, nên đường HTTP cũng dừng theo.
-        this.rateLimiter.pauseUntil(Date.now() + error.retryAfterMs);
+        this.rateLimiter.pauseUntil(now + error.retryAfterMs);
         for (const group of batch) {
           this.pending.set(group.captionStart, group.text);
         }
@@ -190,15 +242,35 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           `Translation paused ${Math.round(error.retryAfterMs / 1000)}s (quota), ` +
             `re-queued ${batch.length} sentences`,
         );
+      } else if (overloaded && !heldTooLong) {
+        // 503 = model quá tải: TẠM THỜI và không tiêu quota ⇒ giữ câu trong
+        // hàng đợi, KHÔNG tính công, chờ provider hồi.
+        //
+        // ⚠️ Phải khai báo lịch nghỉ cho chính drain này (`drainNotBefore`),
+        // không chỉ re-queue: cửa sổ quota vẫn còn chỗ sau 503 nên nếu không,
+        // `scheduleDrain` hẹn 0ms và 503 lặp lại liên tục.
+        this.drainNotBefore = Math.max(
+          this.drainNotBefore,
+          now + error.retryAfterMs,
+        );
+        for (const group of batch) {
+          if (!this.heldSince.has(group.captionStart)) {
+            this.heldSince.set(group.captionStart, now);
+          }
+          this.pending.set(group.captionStart, group.text);
+        }
+        console.warn(
+          `Translation held (provider overloaded), re-queued ${batch.length} sentences`,
+        );
       } else {
-        // Còn lại — kể cả 503 model quá tải — là lỗi thuộc về CHÍNH batch này,
-        // nên tính công rồi bỏ sau MAX lần; không thể giữ câu trong hàng đợi vô
-        // hạn chỉ vì model đang quá tải.
+        // Còn lại: lỗi của CHÍNH batch (400/401/500) — tính công rồi bỏ sau MAX
+        // lần; hoặc 503 đã giữ quá `TRANSIENT_HOLD_MAX_MS`.
         for (const group of batch) {
           this.attempts.set(
             group.captionStart,
             (this.attempts.get(group.captionStart) ?? 0) + 1,
           );
+          this.heldSince.delete(group.captionStart);
         }
         console.warn(
           `Translation batch skipped (${batch.length} sentences):`,

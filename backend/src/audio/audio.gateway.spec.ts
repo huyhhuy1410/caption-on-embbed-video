@@ -184,5 +184,76 @@ describe('AudioGateway', () => {
       expect(translateBatch).toHaveBeenCalledTimes(2);
       expect(translateBatch).toHaveBeenLastCalledWith(['hold me'], 'vi', 'en');
     });
+
+    it('does not count a 503 as an attempt, so a provider outage keeps the sentence', async () => {
+      // ⚠️ Issue 5.18: 503 là lỗi TẠM THỜI của provider, không tiêu quota. Trước
+      // đây nó đi chung nhánh "tính công rồi bỏ" với 400/500, nên một đợt Gemini
+      // quá tải vài phút XOÁ VĨNH VIỄN bản dịch của cả đoạn — đúng cái "xoá sổ
+      // bản dịch cả video" ở Issue 5.12.
+      translateBatch.mockRejectedValue(
+        new ProviderUnavailableError('HTTP 503', 1_000, true),
+      );
+
+      internals.enqueueForTranslation([{ captionStart: 3, text: 'keep me' }]);
+
+      // Nhiều lượt 503 liên tiếp. Nếu 503 tính công như lỗi vĩnh viễn thì câu bị
+      // bỏ sau 3 lượt (MAX_TRANSLATE_ATTEMPTS) và số lượt DỪNG Ở 3 — đó chính
+      // là bất biến cần phá. Không assert số lượt tuyệt đối: backoff của
+      // provider (1s) không chia hết một lần advance nên đếm dễ sai.
+      for (let round = 0; round < 5; round++) {
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
+      expect(translateBatch.mock.calls.length).toBeGreaterThan(3);
+
+      // Provider hồi ⇒ câu vẫn còn trong hàng đợi, dịch được ngay.
+      translateBatch.mockResolvedValue([
+        { text: 'giu toi', from: 'en', to: 'vi' },
+      ]);
+      await jest.advanceTimersByTimeAsync(2_000);
+      expect(translateBatch).toHaveBeenLastCalledWith(['keep me'], 'vi', 'en');
+    });
+
+    it('backs off between 503 retries instead of hammering the provider', async () => {
+      // ⚠️ Không có nhánh 503 thì `scheduleDrain` hẹn 0ms (cửa sổ quota vẫn
+      // còn chỗ sau 503) ⇒ 503 lặp liên tục, đốt lượt của chính các câu đang
+      // chờ trong khi model đã chết.
+      translateBatch.mockRejectedValue(
+        new ProviderUnavailableError('HTTP 503', 1_000, true),
+      );
+
+      internals.enqueueForTranslation([{ captionStart: 4, text: 'slow down' }]);
+      // Chỉ 1ms để lượt ĐẦU nổ (cửa sổ quota còn chỗ) — nếu advance 1s thì lượt
+      // thứ hai cũng nằm trong cùng lần advance và test không còn ý nghĩa.
+      await jest.advanceTimersByTimeAsync(1);
+      expect(translateBatch).toHaveBeenCalledTimes(1);
+
+      // Chưa tới mốc provider dặn (1s) ⇒ không thử lại.
+      await jest.advanceTimersByTimeAsync(200);
+      expect(translateBatch).toHaveBeenCalledTimes(1);
+
+      // Qua mốc thì thử đúng một lượt nữa.
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(translateBatch).toHaveBeenCalledTimes(2);
+    });
+
+    it('gives up on a sentence held past the transient cap', async () => {
+      // Trần giữ tồn tại để một 503 kéo dài vô hạn (model bị thu hồi, key chết)
+      // không giữ câu mãi mà không báo ai.
+      translateBatch.mockRejectedValue(
+        new ProviderUnavailableError('HTTP 503', 1_000, true),
+      );
+
+      internals.enqueueForTranslation([{ captionStart: 6, text: 'give up' }]);
+
+      // 5 phút + dư chút (TRANSIENT_HOLD_MAX_MS = 5 * 60_000).
+      for (let round = 0; round < 310; round++) {
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
+      const callsAtCap = translateBatch.mock.calls.length;
+
+      // Hết trần ⇒ bỏ câu, hàng đợi rỗng ⇒ không còn lượt nào nữa.
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(translateBatch.mock.calls.length).toBe(callsAtCap);
+    });
   });
 });
