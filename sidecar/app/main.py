@@ -10,6 +10,15 @@ from faster_whisper import WhisperModel
 SAMPLE_RATE = 16000                     # Tần số lấy mẫu âm thanh: 16,000 Hz (16k mẫu/giây)
 WINDOW_SIZE = 6 * SAMPLE_RATE          # Cửa sổ nhận diện 6 giây = 96,000 samples
 OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giây = 24,000 samples
+# Window "bắt kịp" cho lượt transcribe ĐẦU TIÊN sau reset/đầu stream (Issue 5.22).
+#
+# ⚠️ Video vẫn chạy realtime trong lúc ASR xử lý, nên nếu window đầu cũng đòi
+# đủ 6s thì caption chỉ xuất hiện khi video đã đi qua ~6s — đúng cái khoảng
+# trống thấy được ngay sau khi tua. Window nhỏ cho caption xuất hiện sớm hơn.
+#
+# ⚠️ Phải LỚN HƠN `OVERLAP_SIZE`: sau lượt này bộ đệm còn `[-OVERLAP_SIZE:]`
+# và `compute_video_time` trừ đúng 1.5s cho nó. Nhỏ hơn thì phép trừ đó sai.
+CATCHUP_WINDOW_SIZE = 3 * SAMPLE_RATE
 MAX_BUFFER_SIZE = 12 * SAMPLE_RATE     # Giới hạn bộ đệm tối đa 12 giây (Watchdog chống tràn RAM)
 MAX_WORDS_PER_CAPTION = 8
 
@@ -98,10 +107,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 audio_buffer = audio_buffer[-OVERLAP_SIZE:]
                 print("Watchdog: dropped stale audio", flush=True)
 
-            # 4.6. Khi bộ đệm đủ 6 giây (96,000 samples) -> Chạy Whisper AI
-            if len(audio_buffer) >= WINDOW_SIZE:
-                # Cắt đúng 6s âm thanh đầu tiên để đưa vào Whisper
-                window_audio = audio_buffer[:WINDOW_SIZE]
+            # 4.6. Đủ audio cho một window -> Chạy Whisper AI
+            #
+            # ⚠️ Cỡ window KHÔNG cố định: lượt đầu sau reset dùng window nhỏ
+            # để bắt kịp — xem `resolve_window_size` (Issue 5.22).
+            window_size = resolve_window_size(is_first_chunk)
+            if len(audio_buffer) >= window_size:
+                window_audio = audio_buffer[:window_size]
                 
                 # Gọi hàm transcribe với window_anchor (Metadata của Chunk 1)
                 await transcribe_chunk(websocket, window_audio, window_anchor, is_first_chunk)
@@ -126,6 +138,21 @@ def is_reset_command(metadata: dict[str, Any] | None) -> bool:
     phụ đề sau khi tua có khớp nội dung hay không.
     """
     return metadata is not None and metadata.get("type") == "reset"
+
+
+# === Helper: Cỡ window cho lượt transcribe kế tiếp (tách khỏi vòng lặp để test được) ===
+def resolve_window_size(is_first_chunk: bool) -> int:
+    """Window nhỏ cho lượt ĐẦU sau reset/đầu stream, cỡ chuẩn cho các lượt sau.
+
+    `is_first_chunk=True` nghĩa là bộ đệm bắt đầu ĐÚNG tại anchor (không có gì
+    để trừ 1.5s) — đúng hai thời điểm user đang chờ caption xuất hiện: đầu
+    stream, và ngay sau khi tua. Chờ đủ 6s ở đó tạo khoảng trống nhìn thấy được
+    (Issue 5.22).
+
+    Tách thành hàm thuần theo bài học Issue 4.20 — nhánh này nằm trong vòng lặp
+    websocket thì không test được.
+    """
+    return CATCHUP_WINDOW_SIZE if is_first_chunk else WINDOW_SIZE
 
 
 # === Helper: Hàm thuần tính mốc thời gian video cho một từ (tách khỏi whisper để test được) ===
