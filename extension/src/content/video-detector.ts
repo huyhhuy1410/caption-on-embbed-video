@@ -163,6 +163,23 @@ document.addEventListener(
     updateOverlayNow();
     repositionOverlay();
     startOverlayLoop();
+
+    // Hỏi lại cache của backend cho vùng vừa tua tới (FR-7.2, FR-7.5).
+    //
+    // ⚠️ Lời gọi này từng bị xoá ở `aa5eca4` khi viết lại handler `seeked` cho
+    // rAF, và việc xoá đó KHÔNG lộ ra khi test: overlay tích luỹ `words` trong
+    // RAM, nên tua về vùng ĐÃ XEM thì chữ vẫn hiện ngay — trông y hệt replay
+    // thật. Nhưng sau `overlay.clear()` (đổi video, SPA đổi route) thì cache
+    // backend là nguồn duy nhất còn dữ liệu; không có message này, cả chuỗi
+    // SW → offscreen → backend không bao giờ chạy, và nhánh `type === 'seek'`
+    // trong `audio.gateway.ts` thành code không tới được (Issue 5.19).
+    const message = {
+      type: "seek",
+      seekTimeAtCapture: activeVideo.currentTime,
+    };
+    void chrome.runtime.sendMessage(message).catch((error: unknown) => {
+      console.warn("Caption AI: could not send seek", error);
+    });
   },
   { capture: true },
 );
