@@ -12,18 +12,71 @@ type GatewayInternals = {
   enqueueForTranslation(groups: { captionStart: number; text: string }[]): void;
 };
 
+/**
+ * Client giả cho WebSocket của extension.
+ *
+ * ⚠️ Phải giữ lại CẢ HAI chiều mới test được đường seek: gateway nhận vào qua
+ * `client.on('message')` và trả ra qua `client.send`. Một mock chỉ có `on()`
+ * rỗng thì không bắn được message nào vào, và không đọc được `replay` bắn ra.
+ */
+type FakeClient = {
+  readyState: number;
+  sent: { type?: string }[];
+  on(event: string, handler: (data: Buffer, isBinary: boolean) => void): void;
+  send(payload: string): void;
+  emit(event: string, data: Buffer, isBinary: boolean): void;
+};
+
+function makeClient(): FakeClient {
+  const handlers = new Map<
+    string,
+    (data: Buffer, isBinary: boolean) => void
+  >();
+  const sent: { type?: string }[] = [];
+  return {
+    readyState: 1, // WebSocket.OPEN
+    sent,
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+    send(payload: string) {
+      sent.push(JSON.parse(payload) as { type?: string });
+    },
+    emit(event, data, isBinary) {
+      handlers.get(event)?.(data, isBinary);
+    },
+  };
+}
+
+/** Bắn một gói JSON text vào gateway, đúng như extension làm. */
+function sendToGateway(client: FakeClient, payload: object): void {
+  client.emit('message', Buffer.from(JSON.stringify(payload)), false);
+}
+
 describe('AudioGateway', () => {
   let gateway: AudioGateway;
   let internals: GatewayInternals;
   let translateBatch: jest.Mock;
+  let sidecar: {
+    setMessageHandler: jest.Mock;
+    sendReset: jest.Mock;
+    sendAudio: jest.Mock;
+    sendMetadata: jest.Mock;
+  };
 
   beforeEach(async () => {
     translateBatch = jest.fn().mockResolvedValue([]);
+    sidecar = {
+      setMessageHandler: jest.fn(),
+      sendReset: jest.fn(),
+      sendAudio: jest.fn(),
+      sendMetadata: jest.fn(),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AudioGateway,
-        { provide: SidecarService, useValue: { setMessageHandler: jest.fn() } },
+        { provide: SidecarService, useValue: sidecar },
         TranscriptService,
         VideoClockService,
         TranslationRateLimiter,
@@ -40,6 +93,44 @@ describe('AudioGateway', () => {
 
   it('should be defined', () => {
     expect(gateway).toBeDefined();
+  });
+
+  describe('seek', () => {
+    it('tells the sidecar to drop its audio buffer', () => {
+      // ⚠️ Issue 5.21: sidecar giữ tới 6s tiếng của đoạn TRƯỚC khi tua. Reset
+      // clock ở backend là chưa đủ — không báo xuống thì window kế tiếp trộn
+      // tiếng cũ với tiếng mới nhưng dán mốc mới ⇒ phụ đề đúng ngay lúc tua
+      // rồi lệch ở đoạn ngay sau.
+      const client = makeClient();
+      gateway.handleConnection(client as never);
+
+      sendToGateway(client, { type: 'seek', seekTimeAtCapture: 17.72 });
+
+      expect(sidecar.sendReset).toHaveBeenCalledTimes(1);
+    });
+
+    it('replays cached words for the sought range', () => {
+      // Bằng chứng của Issue 5.19: nhánh seek phải bắn ra message `replay`.
+      // Không có nó thì cache backend là code không tới được, và phụ đề sau khi
+      // tua chỉ có thể đến từ cache trong RAM của overlay.
+      const client = makeClient();
+      gateway.handleConnection(client as never);
+
+      sendToGateway(client, { type: 'seek', seekTimeAtCapture: 17.72 });
+
+      expect(client.sent.some((m) => m.type === 'replay')).toBe(true);
+    });
+
+    it('does not reset the sidecar for a seek without a time', () => {
+      // Gói seek thiếu `seekTimeAtCapture` không đủ dữ liệu để replay; báo sidecar
+      // xoá buffer lúc đó là xoá oan.
+      const client = makeClient();
+      gateway.handleConnection(client as never);
+
+      sendToGateway(client, { type: 'seek' });
+
+      expect(sidecar.sendReset).not.toHaveBeenCalled();
+    });
   });
 
   describe('batching', () => {

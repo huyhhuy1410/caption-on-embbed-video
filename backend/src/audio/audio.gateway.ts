@@ -323,6 +323,12 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           if (seekTime !== undefined) {
             this.videoClockService.reset();
 
+            // ⚠️ Phải báo XUỐNG sidecar nữa, không chỉ reset clock ở đây.
+            // Sidecar đang giữ tới 6s tiếng của đoạn TRƯỚC khi tua; để nguyên
+            // thì window kế tiếp trộn tiếng cũ với tiếng mới nhưng dán mốc mới
+            // ⇒ phụ đề đúng ngay lúc tua rồi lệch ở đoạn ngay sau (Issue 5.21).
+            this.sidecarService.sendReset();
+
             const from = seekTime;
             const to = seekTime + 3;
             const replayWords = this.transcriptService.getRange(from, to);

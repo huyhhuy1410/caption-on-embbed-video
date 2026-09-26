@@ -51,6 +51,19 @@ export class SidecarService implements OnModuleDestroy {
     this.socket.send(JSON.stringify(metadata));
   }
 
+  // === BƯỚC 3b: Báo sidecar xoá bộ đệm audio (Issue 5.21) ===
+  /**
+   * Gọi khi user tua. Không có lệnh này thì sidecar vẫn giữ tới 6s tiếng của
+   * đoạn TRƯỚC khi tua, rồi dán mốc của đoạn SAU khi tua lên đó ⇒ cụm phụ đề
+   * ngay sau lúc tua bị lệch nội dung.
+   *
+   * Đi cùng đường với `sendMetadata` — cùng socket, cùng định dạng JSON — để
+   * sidecar chỉ cần thêm một nhánh `if` ngay chỗ nó vốn đã parse metadata.
+   */
+  sendReset() {
+    this.sendMetadata({ type: 'reset' });
+  }
+
   // === BƯỚC 4: Hàm Đăng ký Callback Handler từ bên ngoài (AudioGateway) ===
   setMessageHandler(handler: (data: string) => void) {
     this.onMessage = handler; // Lưu hàm handler vào biến private onMessage

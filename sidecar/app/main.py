@@ -56,7 +56,25 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # 4.2. Xử lý Gói tin Text (Metadata JSON từ Extension)
             if message.get("text") is not None:
                 pending_metadata = parse_metadata(message["text"])
-                
+
+                # Lệnh reset từ backend: user vừa tua (Issue 5.21).
+                #
+                # ⚠️ Bộ đệm đang giữ tới 6s tiếng của đoạn TRƯỚC khi tua, còn
+                # `window_anchor` thì sắp bị ghim bằng mốc của đoạn SAU khi tua.
+                # Để nguyên thì window kế tiếp là [tiếng cũ] + [tiếng mới] nhưng
+                # bị dán mốc mới ⇒ phụ đề đúng ngay lúc tua rồi lệch ở đoạn ngay
+                # sau, và tự khỏi sau đúng một chu kỳ.
+                #
+                # `is_first_chunk = True` vì bộ đệm rỗng nghĩa là window kế tiếp
+                # bắt đầu ĐÚNG tại anchor, không còn 1.5s gối đầu để trừ đi.
+                if is_reset_command(pending_metadata):
+                    audio_buffer = np.array([], dtype=np.float32)
+                    window_anchor = None
+                    pending_metadata = None
+                    is_first_chunk = True
+                    print("Reset: dropped audio buffer after seek", flush=True)
+                    continue
+
                 # Ghim metadata của chunk đầu tiên làm Anchor cho Window 6s này
                 if window_anchor is None:
                     window_anchor = pending_metadata
@@ -98,6 +116,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             pending_metadata = None
     except WebSocketDisconnect:
         return
+
+# === Helper: Nhận diện lệnh reset từ backend (tách khỏi vòng lặp để test được) ===
+def is_reset_command(metadata: dict[str, Any] | None) -> bool:
+    """Backend gửi type="reset" khi user tua (Issue 5.21).
+
+    Tách thành hàm thuần theo đúng bài học Issue 4.20: logic nằm trong vòng lặp
+    `while` của websocket thì không test được, mà đây lại là nhánh quyết định
+    phụ đề sau khi tua có khớp nội dung hay không.
+    """
+    return metadata is not None and metadata.get("type") == "reset"
+
 
 # === Helper: Hàm thuần tính mốc thời gian video cho một từ (tách khỏi whisper để test được) ===
 def compute_video_time(raw_video_time: float, word_time: float, is_first_chunk: bool) -> float:
