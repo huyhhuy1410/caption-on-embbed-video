@@ -93,11 +93,11 @@ export class CaptionFullscreen {
     return this.wrapper !== null;
   }
 
-  repositionOverlay(): void {
+  repositionOverlay(force = false): void {
     const video = this.targetVideo;
     const overlay = this.targetOverlay;
     if (!this.wrapper || !video || !overlay) return;
-    overlay.position(videoContentRect(video));
+    overlay.position(videoContentRect(video), force);
   }
 
   /**
@@ -275,7 +275,11 @@ export class CaptionFullscreen {
       wrapper.style.height = "100%";
       // Lúc này layout fullscreen mới áp. Gọi trong enter() sẽ đo nhầm box cũ,
       // còn vòng rAF chỉ chạy khi video đang phát.
-      this.repositionOverlay();
+      //
+      // ⚠️ `force = true`: overlay đã bị user kéo đi chỗ khác (FR-4.4) thì
+      // `position()` sẽ bỏ qua, mà `left`/`top` đang lưu theo viewport của
+      // TRANG — trong wrapper 100%×100% toạ độ đó không còn đúng.
+      this.repositionOverlay(true);
       this.setButtonLabel();
       return;
     }
@@ -316,8 +320,12 @@ export class CaptionFullscreen {
       overlay.element.style.cssText = this.savedOverlayStyle ?? "";
       document.body.appendChild(overlay.element);
       // Về layout thường, và không có gì reposition khi video đang pause.
+      //
+      // ⚠️ ÉP neo lại: `left`/`top` lúc trong fullscreen theo viewport toàn màn
+      // hình, không theo toạ độ trang — giữ lại thì overlay về trang ở chỗ lệch.
       if (video) {
-        overlay.position(video.getBoundingClientRect());
+        overlay.resetToVideoAnchor();
+        overlay.position(video.getBoundingClientRect(), true);
       }
     }
 
