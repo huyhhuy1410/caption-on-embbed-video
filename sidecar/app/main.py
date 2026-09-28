@@ -1,5 +1,6 @@
 from array import array
 from contextlib import asynccontextmanager
+import time
 from typing import Any
 
 import numpy as np
@@ -158,6 +159,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if len(audio_buffer) >= window_size:
                 window_audio = audio_buffer[:window_size]
                 
+                # Mốc thời gian thật để đo độ trễ — xem `log_latency`.
+                window_started_at = time.perf_counter()
+
                 # Gọi hàm transcribe với window_anchor (Metadata của Chunk 1).
                 # `active_source` là nguồn TẠI THỜI ĐIỂM transcribe, còn anchor
                 # mang nguồn của lúc window mở đầu — hai cái này bằng nhau vì
@@ -170,6 +174,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     active_source,
                 )
 
+                # Độ trễ = lúc này trừ lúc bắt đầu đợi + số giây audio đã gom mà
+                # whisper vừa xử lý. Cộng `window_size` vì kể từ lúc frame đầu
+                # tiên của window được gửi đi, video đã chạy được bấy nhiêu đó.
+                log_latency(
+                    window_anchor,
+                    window_size,
+                    time.perf_counter() - window_started_at,
+                    is_first_chunk,
+                    window_started_at,
+                )
+
                 is_first_chunk = False
                 # Giữ lại 1.5s cuối (24,000 samples) làm ngữ cảnh gối đầu cho window sau
                 audio_buffer = audio_buffer[-OVERLAP_SIZE:]
@@ -180,6 +195,49 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             pending_metadata = None
     except WebSocketDisconnect:
         return
+
+# === Helper: Ghi log độ trễ để đo thật (2026-09-28) ===
+def log_latency(
+    anchor: dict[str, Any] | None,
+    window_size: int,
+    whisper_seconds: float,
+    is_first_chunk: bool,
+    window_started_at: float,
+) -> None:
+    """In một dòng log đủ để TÍNH ĐỘ TRỄ thật, không chỉ log thời điểm.
+
+    ⚠️ Vì sao cần: log backend KHÔNG có timestamp (gotcha #36), nên từ log đó
+    không đo được độ trễ. Dòng này gộp ba mốc cần thiết, mỗi mốc một tên gọi
+    riêng để grep/sort được.
+
+    Ba mốc:
+    - `audioStartAt` — giây monotonic lúc frame đầu tiên của window được gom.
+    - `sentAt`       — giây monotonic lúc gửi `words` đi.
+    - `lagSec`       — **độ trễ tính sẵn**, không cần tự trừ.
+
+    ⚠️ `lagSec` = thời gian chờ whisper + độ dài audio đã gom. Lý do cộng độ
+    dài audio: tính từ lúc window BẮT ĐẦU gom, video đã chạy được
+    `window_size` giây rồi, mà trong `window_size` giây đó người dùng chưa
+    thấy chữ nào. Nói cách khác đây là độ trễ so với thời điểm video bắt đầu
+    phát đoạn audio đó — cái mà mắt người thật sự so.
+
+    ⚠️ `videoTime` là mốc VIDEO của đoạn, khác `audioStartAt` (mốc máy). Hai
+    cái này không trừ vào nhau được; giữ cả hai để khi đọc log mới biết đoạn
+    nào ứng với video từ đâu.
+    """
+    sent_at = time.perf_counter()
+    video_time = anchor.get("videoTimeAtCapture", 0.0) if anchor else 0.0
+    window_seconds = window_size / SAMPLE_RATE
+    lag = whisper_seconds + window_seconds
+    kind = "catchup" if is_first_chunk else "steady"
+    print(
+        f"LAT windowStart={window_started_at:.3f} sent={sent_at:.3f} "
+        f"lagSec={lag:.2f} whisperSec={whisper_seconds:.2f} "
+        f"windowSec={window_seconds:.1f} videoTime={video_time:.2f} "
+        f"source={anchor.get('sourceId') if anchor else None} kind={kind}",
+        flush=True,
+    )
+
 
 # === Helper: Nhận diện lệnh reset từ backend (tách khỏi vòng lặp để test được) ===
 def is_reset_command(metadata: dict[str, Any] | None) -> bool:
