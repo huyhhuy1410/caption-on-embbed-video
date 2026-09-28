@@ -1,5 +1,6 @@
 import { CaptionFullscreen } from "./fullscreen";
 import { CaptionOverlay } from "./overlay";
+import { isVisible, VideoPicker } from "./video-picker";
 console.info("Caption AI: content script loaded", window.location.href);
 
 let captionEnabled = false;
@@ -7,6 +8,15 @@ let activeVideo: HTMLVideoElement | null = null;
 let overlayFrameId: number | null = null;
 const overlay = new CaptionOverlay();
 const fullscreen = new CaptionFullscreen();
+
+/** Video user CHỈ ĐỊNH qua picker — thắng heuristic của `reconcile()`. */
+let userPickedVideo: HTMLVideoElement | null = null;
+
+const picker = new VideoPicker(overlay.element, (video) => {
+  // Bấm lại video đang chọn thì bỏ chọn, quay về heuristic tự động.
+  userPickedVideo = userPickedVideo === video ? null : video;
+  reconcile();
+});
 
 // Click vào một từ trên overlay → SW relay → side panel gọi /explain-word.
 // Không gọi thẳng từ content script: content script không được fetch tới
@@ -26,6 +36,12 @@ overlay.setWordPickHandler((pick) => {
 
 function repositionOverlay() {
   if (!activeVideo) return;
+  // Không neo vào hộp 0×0 (Issue 5.23) — vị trí tính ra cũng vô nghĩa, và để
+  // nguyên `left/top` cũ thì overlay nhảy về chỗ của video TRƯỚC lúc user đổi.
+  if (!fullscreen.isActive() && !isVisible(activeVideo)) {
+    overlay.hide();
+    return;
+  }
   // Trong CC fullscreen, getBoundingClientRect là element box phủ kín màn hình
   // chứ không phải vùng ảnh — uỷ quyền cho fullscreen tính cho đúng.
   if (fullscreen.isActive()) {
@@ -78,11 +94,33 @@ function syncOverlayVisibility(): void {
   }
 }
 
+/**
+ * Ẩn overlay khi video được chọn không có chỗ để hiện (Issue 5.23).
+ *
+ * ⚠️ Cố ý KHÔNG đổi sang video nhìn thấy: nhiều trang dùng video 0×0 làm nguồn
+ * audio, mà nó VẪN phát ra tiếng và `tabCapture` vẫn bắt. Ưu tiên "video nhìn
+ * thấy" sẽ neo nhầm sang video khác trong cùng trang — tệ hơn hẳn việc không
+ * hiện gì. Người dùng tự chọn video qua picker nếu muốn xem phụ đề.
+ *
+ * Vẫn GIỮ overlay trong trường hợp này về mặt dữ liệu: audio vẫn được
+ * transcribe, chỉ là không có chỗ để vẽ — nên khi user đổi sang video có hình thì
+ * phụ đề của đoạn đang phát hiện ngay, không phải chờ ASR chạy lại từ đầu.
+ */
+function hideOverlayIfNowhereToShow(): void {
+  if (!activeVideo || !isVisible(activeVideo)) {
+    overlay.hide();
+  } else {
+    syncOverlayVisibility();
+  }
+}
+
 // === BƯỚC 1: Lắng nghe tín hiệu kích hoạt caption từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "capturing") {
     captionEnabled = true;
-    syncOverlayVisibility();
+    // `syncOverlayVisibility` thôi ở đây: bật caption trên video audio-only sẽ
+    // bật overlay lên hộp rộng 0 — đúng lỗi Issue 5.23.
+    hideOverlayIfNowhereToShow();
     repositionOverlay();
     if (activeVideo) {
       // `dispose()` lúc tắt đã gỡ nút và xoá target, nên phải gắn lại ở đây —
@@ -128,8 +166,9 @@ chrome.runtime.onMessage.addListener((message) => {
     stopOverlayLoop();
     overlay.clear();
     fullscreen.dispose();
-    // Visibility suy ra từ state nên set cờ là đủ để overlay tự ẩn.
+    // Tắt caption ⇒ ẩn overlay là đúng dù video có hình hay không.
     syncOverlayVisibility();
+    picker.clear();
   }
 });
 
@@ -256,8 +295,21 @@ function reconcile() {
   const videos = Array.from(document.querySelectorAll("video"));
   let nextVideo: HTMLVideoElement | null = null;
 
+  // 0. User chỉ định qua picker thì thắng — đây là ý nghĩa của FR-1.3
+  // ("the user can pick which one"). Chỉ dùng khi video đó vẫn còn trong DOM;
+  // SPA gỡ đi thì rơi về heuristic bên dưới thay vì treo picker ở video ma.
+  const picked =
+    userPickedVideo && userPickedVideo.isConnected
+      ? userPickedVideo
+      : null;
+  if (userPickedVideo && !picked) {
+    userPickedVideo = null;
+  }
+
   if (videos.length === 0) {
     nextVideo = null;
+  } else if (picked) {
+    nextVideo = picked;
   } else {
     // 1. Ưu tiên video đang phát
     const playingVideo = videos.find((v) => !v.paused && !v.ended);
@@ -268,9 +320,7 @@ function reconcile() {
       nextVideo = activeVideo;
     } else {
       // 3. Fallback sang video hiển thị đầu tiên
-      const visibleVideo = videos.find(
-        (v) => v.offsetWidth > 0 || v.offsetHeight > 0,
-      );
+      const visibleVideo = videos.find((v) => isVisible(v));
       nextVideo = visibleVideo ?? videos[0];
     }
   }
@@ -296,7 +346,11 @@ function reconcile() {
     fullscreen.setTarget(activeVideo, overlay);
   }
 
-  syncOverlayVisibility();
+  hideOverlayIfNowhereToShow();
+
+  // Picker đứng ngoài overlay (xem `video-picker.ts`) nên vẫn hiện được khi
+  // overlay bị ẩn — đúng lúc user cần chọn video khác nhất.
+  picker.setVideos(videos, activeVideo);
 
   // Vẽ ngay: vòng rAF chỉ chạy khi video đang phát, nên video mới lúc pause sẽ
   // không được vẽ lần nào cho tới khi user bấm play.
@@ -325,11 +379,21 @@ document.addEventListener(
   },
   { capture: true },
 );
-window.addEventListener("scroll", repositionOverlay, {
-  capture: true,
-  passive: true,
-});
-window.addEventListener("resize", repositionOverlay, { passive: true });
+window.addEventListener(
+  "scroll",
+  () => {
+    // `reconcile()` chỉ chạy khi có mutation DOM, còn video audio-only có thể
+    // đổi từ ẩn sang hiện (hoặc ngược lại) chỉ vì layout đổi theo scroll/resize.
+    // Không kiểm tra lại thì overlay kẹt ở trạng thái ẩn/sai chỗ (Issue 5.23).
+    hideOverlayIfNowhereToShow();
+    repositionOverlay();
+  },
+  { capture: true, passive: true },
+);
+window.addEventListener("resize", () => {
+  hideOverlayIfNowhereToShow();
+  repositionOverlay();
+}, { passive: true });
 // 4.3. Theo dõi DOM để cập nhật khi có video được thêm/xoá
 function hasPossibleVideoNode(node: Node): boolean {
   return (
