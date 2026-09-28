@@ -59,15 +59,10 @@ function repositionOverlay() {
   overlay.position(activeVideo.getBoundingClientRect());
 }
 function updateOverlayFromVideo(): void {
-  if (!captionEnabled || !activeVideo) {
+  if (!captionEnabled || !activeVideo || activeVideo.paused) {
     overlayFrameId = null;
     return;
   }
-  if (isPlaybackStalled(activeVideo)) {
-    overlayFrameId = null;
-    return;
-  }
-  noteVideoTime(activeVideo);
   overlay.update(activeVideo.currentTime);
   overlayFrameId = window.requestAnimationFrame(updateOverlayFromVideo);
 }
@@ -75,46 +70,13 @@ function startOverlayLoop(): void {
   if (
     !captionEnabled ||
     !activeVideo ||
-    isPlaybackStalled(activeVideo) ||
+    activeVideo.paused ||
     overlayFrameId !== null
   ) {
     return;
   }
   overlayFrameId = window.requestAnimationFrame(updateOverlayFromVideo);
 }
-/**
- * Video có đang chạy thật không — dùng cho cả `paused` LẪN đang buffer.
- *
- * ⚠️ `paused` một mình KHÔNG đủ (FR-2.4). Khi video hết dữ liệu, `paused` vẫn
- * là `false` và `currentTime` đứng yên — vòng rAF cứ chạy 60 lần/giây vô ích,
- * và nếu không có `isPlaybackStalled` thì `seeked` lúc đó không được xử lý.
- *
- * ⚠️ Vì sao dùng "đứng yên" mà không dùng `readyState`: `readyState` có thể là
- * `HAVE_ENOUGH_DATA` trong khoảnh khắc ngay trước lúc cạn, nên nó không bắt
- * được trạng thái đang đứng yên thật. So sánh `currentTime` mới là dấu hiệu
- * duy nhất mà người dùng cảm nhận được ("hình đứng, tiếng đứng").
- */
-const STALL_SECONDS = 0.35;
-function isPlaybackStalled(video: HTMLVideoElement): boolean {
-  if (video.paused || video.ended) return true;
-  if (video.seeking) return true;
-  return Math.abs(video.currentTime - lastKnownVideoTime) < STALL_SECONDS;
-}
-
-let lastKnownVideoTime = 0;
-
-/**
- * Cập nhật mốc đã thấy — gọi MỖI frame trong vòng rAF, không chỉ khi `timeupdate`.
- *
- * ⚠️ `timeupdate` chỉ bắn ~4 lần/giây còn rAF chạy 60 lần/giây, nên nếu chỉ cập
- * nhật ở `timeupdate` thì `lastKnownVideoTime` chậm hơn thực tế tới ~0.25s —
- * đủ để `isPlaybackStalled` tưởng video đang chạy là đứng yên ngay lúc vừa
- * bấm play, và dừng overlay vĩnh viễn.
- */
-function noteVideoTime(video: HTMLVideoElement): void {
-  lastKnownVideoTime = video.currentTime;
-}
-
 function stopOverlayLoop(): void {
   if (overlayFrameId !== null) {
     window.cancelAnimationFrame(overlayFrameId);
@@ -172,9 +134,6 @@ chrome.runtime.onMessage.addListener((message) => {
       // `dispose()` lúc tắt đã gỡ nút và xoá target, nên phải gắn lại ở đây —
       // không thì nút CC fullscreen chỉ mọc lại khi tình cờ có mutation DOM.
       fullscreen.setTarget(activeVideo, overlay);
-      // Đồng bộ mốc trước khi bật rAF — mốc còn sót từ lần chạy trước có thể
-      // làm `isPlaybackStalled` tưởng video đang đứng yên.
-      lastKnownVideoTime = activeVideo.currentTime;
       // ⚠️ Bắt nguồn ngay lúc BẬT, không đợi `reconcile()` đổi video: offscreen
       // mới khởi tạo nên `activeSourceId` của nó đang null, và các chunk đầu
       // sẽ rơi vào namespace chung. `reconcile()` chỉ gọi khi video ĐỔI, mà
@@ -228,10 +187,6 @@ document.addEventListener(
   (e) => {
     if (!captionEnabled) return;
     if (!activeVideo || e.target !== activeVideo) return;
-
-    // Nhớ mốc để phân biệt "đang chạy" với "đang đứng yên do hết dữ liệu" —
-    // xem `isPlaybackStalled`.
-    noteVideoTime(activeVideo);
 
     repositionOverlay();
     void chrome.runtime
@@ -296,39 +251,6 @@ document.addEventListener(
     if (e.target === activeVideo) {
       stopOverlayLoop();
     }
-  },
-  { capture: true },
-);
-
-// 2.3. Buffering: `paused` vẫn false nên không có handler nào ở trên bắt được.
-// `waiting` = hết dữ liệu, `stalled` = mạng chậm, `playing` = chạy lại.
-// ⚠️ Cả ba đều DỪNG vòng rAF, không dừng capture: `tabCapture` bắt audio cả
-// tab nên tab vẫn có thể có tiếng khác (EC-5) — cắt audio ở đây sẽ giết phụ đề
-// của các video sau. Xem ghi chú kiến trúc ở `isPlaybackStalled`.
-for (const eventName of ["waiting", "stalled"] as const) {
-  document.addEventListener(
-    eventName,
-    (e) => {
-      if (e.target !== activeVideo) return;
-      console.info(`Caption AI: ${eventName} — freeze overlay loop`);
-      stopOverlayLoop();
-      // Vẽ lại đúng câu đang hiện: sau khi buffer xong, câu có thể đã đổi.
-      updateOverlayNow();
-    },
-    { capture: true },
-  );
-}
-document.addEventListener(
-  "playing",
-  (e) => {
-    const video = e.target as HTMLVideoElement | null;
-    if (!video || video !== activeVideo) return;
-    // Mốc cũ không dùng được nữa — nếu không, `isPlaybackStalled` so với
-    // `currentTime` của lúc trước khi buffer và thấy "đứng yên" ⇒ vòng rAF
-    // không bao giờ chạy lại sau khi hết buffer.
-    lastKnownVideoTime = video.currentTime;
-    updateOverlayNow();
-    startOverlayLoop();
   },
   { capture: true },
 );
@@ -414,9 +336,6 @@ function reconcile() {
   if (nextVideo !== activeVideo) {
     stopOverlayLoop();
     activeVideo = nextVideo;
-    // ⚠️ Phải lấy mốc của video MỚI: nếu giữ mốc cũ và video mới đang phát ở
-    // 0:00 thì `isPlaybackStalled` tưởng nó đứng yên ⇒ rAF không bao giờ chạy.
-    lastKnownVideoTime = nextVideo ? nextVideo.currentTime : 0;
     console.info("Caption AI: active video reconciled", activeVideo);
 
     // videoStart là mốc thời gian riêng của từng video, nên từ vựng giữ lại sẽ
