@@ -64,6 +64,18 @@ export class SidecarService implements OnModuleDestroy {
     this.sendMetadata({ type: 'reset' });
   }
 
+  /**
+   * Báo sidecar: `activeVideo` đã đổi sang nguồn khác (Issue 5.20 / FR-1.3).
+   *
+   * ⚠️ `sourceId` phải đi kèm, không phải tuỳ chọn: sidecar dán nó lên từng từ,
+   * và backend dùng nó để tách cache. Báo đổi nguồn mà không kèm id thì sidecar
+   * xoá bộ đệm (đúng) nhưng từ về sau không gắn được nguồn ⇒ mọi bucket rơi
+   * vào namespace rỗng và replay vẫn lẫn.
+   */
+  sendSourceSwitch(sourceId: string) {
+    this.sendMetadata({ type: 'source-switch', sourceId });
+  }
+
   // === BƯỚC 4: Hàm Đăng ký Callback Handler từ bên ngoài (AudioGateway) ===
   setMessageHandler(handler: (data: string) => void) {
     this.onMessage = handler; // Lưu hàm handler vào biến private onMessage

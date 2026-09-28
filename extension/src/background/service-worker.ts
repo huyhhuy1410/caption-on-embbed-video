@@ -82,6 +82,19 @@ chrome.runtime.onMessage.addListener((message) => {
       });
   }
 
+  // Đổi video: relay xuống offscreen để ghim nguồn vào chunk audio kế tiếp
+  // (Issue 5.20). Không đi qua content script — content đã gửi, SW chỉ nối.
+  if (message?.type === "source-switch") {
+    void chrome.runtime
+      .sendMessage({
+        type: "source-switch",
+        sourceId: message.sourceId,
+      })
+      .catch((error: unknown) => {
+        console.warn("Caption AI SW: could not relay source switch", error);
+      });
+  }
+
   if (message?.type === "seek") {
     console.info("Caption AI SW: seek received", message);
     void chrome.runtime

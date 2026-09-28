@@ -58,6 +58,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     pending_metadata: dict[str, Any] | None = None
     window_anchor: dict[str, Any] | None = None  # Anchor ghim metadata của Chunk 1 (đầu window)
     is_first_chunk = True
+
+    # "Danh tính" nguồn phát đang chạy — xem `is_source_switch` (Issue 5.20).
+    active_source: str | None = None
     try:
         while True:
             message = await websocket.receive()
@@ -82,6 +85,46 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     pending_metadata = None
                     is_first_chunk = True
                     print("Reset: dropped audio buffer after seek", flush=True)
+                    continue
+
+                # Backend báo ĐỔI NGUỒN: activeVideo đổi sang video khác
+                # (Issue 5.20 / FR-1.3). Giữ nguyên bộ đệm ở đây là lỗi: nó còn
+                # tới 6s tiếng của video CŨ, sẽ bị dán mốc thời gian của video MỚI
+                # ⇒ nội dung video cũ hiện lên video mới, đúng triệu chứng đã gặp.
+                #
+                # Xoá y hệt nhánh reset vì đây cùng là "dữ liệu cũ sống sót qua
+                # thời điểm chuyển nguồn" (gotcha #38). Khác ở chỗ: lần này ta
+                # ghi lại danh tính nguồn mới để dán lên từng từ.
+                if is_source_switch(pending_metadata):
+                    # Đọc sourceId TRƯỚC khi xoá metadata, không thì mất.
+                    active_source = str(pending_metadata.get("sourceId") or "") or None
+                    audio_buffer = np.array([], dtype=np.float32)
+                    window_anchor = None
+                    pending_metadata = None
+                    is_first_chunk = True
+                    print(f"Source switch: {active_source}", flush=True)
+                    continue
+
+                # Tự chữa khi lệnh `source-switch` không tới được: mỗi chunk
+                # audio đều mang `sourceId` của video đang phát, nên nhận ra
+                # nguồn đổi ngay từ dữ liệu, không phụ thuộc lệnh đi qua.
+                #
+                # ⚠️ Không thay thế nhánh `source-switch` bên trên: lệnh đó tới
+                # SỚM, xoá bộ đệm trước khi chunk audio mới kịp về — đợi tới đây
+                # thì vài giây tiếng của video cũ vẫn còn nằm trong bộ đệm. Nhánh
+                # này chỉ là lưới an toàn cho lúc backend socket đang đóng.
+                chunk_source = str(pending_metadata.get("sourceId") or "") or None
+                if chunk_source is not None and chunk_source != active_source:
+                    print(
+                        f"Source change seen in metadata: "
+                        f"{active_source} -> {chunk_source}",
+                        flush=True,
+                    )
+                    active_source = chunk_source
+                    audio_buffer = np.array([], dtype=np.float32)
+                    window_anchor = None
+                    pending_metadata = None
+                    is_first_chunk = True
                     continue
 
                 # Ghim metadata của chunk đầu tiên làm Anchor cho Window 6s này
@@ -115,8 +158,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if len(audio_buffer) >= window_size:
                 window_audio = audio_buffer[:window_size]
                 
-                # Gọi hàm transcribe với window_anchor (Metadata của Chunk 1)
-                await transcribe_chunk(websocket, window_audio, window_anchor, is_first_chunk)
+                # Gọi hàm transcribe với window_anchor (Metadata của Chunk 1).
+                # `active_source` là nguồn TẠI THỜI ĐIỂM transcribe, còn anchor
+                # mang nguồn của lúc window mở đầu — hai cái này bằng nhau vì
+                # đổi nguồn đã xoá bộ đệm nên window không thể vắt qua mốc đó.
+                await transcribe_chunk(
+                    websocket,
+                    window_audio,
+                    window_anchor,
+                    is_first_chunk,
+                    active_source,
+                )
 
                 is_first_chunk = False
                 # Giữ lại 1.5s cuối (24,000 samples) làm ngữ cảnh gối đầu cho window sau
@@ -138,6 +190,21 @@ def is_reset_command(metadata: dict[str, Any] | None) -> bool:
     phụ đề sau khi tua có khớp nội dung hay không.
     """
     return metadata is not None and metadata.get("type") == "reset"
+
+
+# === Helper: Nhận diệu lệnh ĐỔI NGUỒN từ backend (tách khỏi vòng lặp để test được) ===
+def is_source_switch(metadata: dict[str, Any] | None) -> bool:
+    """Backend gõ type="source-switch" khi `activeVideo` đổi (Issue 5.20).
+
+    Khác `is_reset_command` ở chỗ KÈM theo `sourceId` — đó là danh tính video
+    mới, dán lên từng từ để backend tách cache theo nguồn (FR-1.3). Nhánh reset
+    không đổi nguồn nên không cần.
+
+    Tách thành hàm thuần theo đúng bài học Issue 4.20: logic nằm trong vòng lặp
+    `while` của websocket thì không test được, mà đây là nhánh quyết định phụ đề
+    sau khi đổi video có lẫn nội dung video trước hay không.
+    """
+    return metadata is not None and metadata.get("type") == "source-switch"
 
 
 # === Helper: Cỡ window cho lượt transcribe kế tiếp (tách khỏi vòng lặp để test được) ===
@@ -185,6 +252,7 @@ async def transcribe_chunk(
     audio: np.ndarray,
     metadata: dict[str, Any] | None,
     is_first_chunk: bool,
+    anchor_source_id: str | None = None,
 ) -> None:
     # 7.1. Chạy Whisper AI nhận dạng giọng nói kèm mốc thời gian từng từ
     segments, info = model.transcribe(
@@ -196,6 +264,10 @@ async def transcribe_chunk(
 
     # 7.2. Lấy mốc thời gian Video tại thời điểm bắt đầu Window (Anchor)
     raw_video_time = metadata.get("videoTimeAtCapture", 0.0) if metadata else 0.0
+    # Danh tính nguồn của WINDOW này — dán lên từng từ để backend tách cache.
+    # Lấy từ anchor của chính window, không phải metadata chunk cuối: window
+    # kéo dài nhiều chunk nên source của các chunk sau có thể đã khác (Issue 5.20).
+    source_id = str(anchor_source_id or "") or None
     words: list[dict[str, Any]] = []
     caption_start: float | None = None
     caption_word_count = 0
@@ -230,6 +302,7 @@ async def transcribe_chunk(
                     ),
                     "captionStart": caption_start,
                     "c": word.probability,
+                    "sourceId": source_id,
                 }
             )
 

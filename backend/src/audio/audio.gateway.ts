@@ -14,6 +14,21 @@ import { ProviderUnavailableError } from '../ai/errors';
 /** Một caption group: các từ dùng chung một `captionStart`. */
 type CaptionGroup = { captionStart: number; text: string };
 
+/**
+ * Khoá hàng đợi dịch = (nguồn, captionStart).
+ *
+ * ⚠️ `captionStart` là mốc thời gian RIÊNG của từng video: video B bắt đầu
+ * câu đầu tiên ở 0:00 cũng hệt video A. Khoá bằng `captionStart` đơn thuần thì
+ * câu của video A bị xem như đã thử (nên bỏ, không dịch lại) hoặc nhận nhầm bản
+ * dịch của video B (Issue 5.20).
+ */
+function queueKey(sourceId: string | null, captionStart: number): string {
+  return `${sourceId ?? ''}|${captionStart}`;
+}
+
+/** Nhóm đã gắn nguồn, dùng khi xếp hàng dịch. Xem `enqueueForTranslation`. */
+type QueuedGroup = { captionStart: number; text: string; sourceId: string | null };
+
 /** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
 const MAX_TRANSLATE_ATTEMPTS = 3;
 
@@ -36,20 +51,31 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Biến lưu trữ tham chiếu WebSocket client của Extension Chrome đang kết nối
   private extensionClient?: WebSocket;
 
-  private readonly pending = new Map<number, string>();
+  /**
+   * `sourceId` của video ĐANG CHẠY — khoá cache theo nguồn (Issue 5.20).
+   *
+   * ⚠️ Đây là biến SỐNG SUỐT phiên, không phải biến đi kèm message: backend
+   * nhận audio của mọi video trong tab (tabCapture), nên nó phải nhớ nguồn hiện
+   * tại để gán cho `getRange`/`getTranslations` khi seek. Đổi video mà không
+   * cập nhật biến này thì replay trả lời của video trước.
+   */
+  private activeSourceId: string | null = null;
+
+  /** value là `QueuedGroup` — phải giữ `sourceId` để drain ghi cache đúng nguồn. */
+  private readonly pending = new Map<string, QueuedGroup>();
 
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
 
   private draining = false;
 
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
-  private readonly attempts = new Map<number, number>();
+  private readonly attempts = new Map<string, number>();
 
   /**
    * Mốc lúc một nhóm bắt đầu bị GIỮ vì 503 — khác `attempts` ở chỗ nó đo
    * THỜI GIAN chờ, không đếm lần. Xem `TRANSIENT_HOLD_MAX_MS`.
    */
-  private readonly heldSince = new Map<number, number>();
+  private readonly heldSince = new Map<string, number>();
 
   /**
    * Không được thử lại trước mốc này sau một đợt 503.
@@ -112,18 +138,30 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    */
   private enqueueForTranslation(groups: CaptionGroup[]): void {
     for (const group of groups) {
-      const cached = this.transcriptService.getTranslation(group.captionStart);
+      const cached = this.transcriptService.getTranslation(
+        this.activeSourceId,
+        group.captionStart,
+      );
       // ⚠️ So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
       // ranh giới window 6s: lần đầu chỉ thấy nửa câu, lần sau mới đủ. Nếu chỉ
       // kiểm tra khoá thì bản dịch NỬA CÂU đã cache sẽ chặn luôn bản đầy đủ.
       if (cached && cached.text === group.text) continue;
 
-      const tried = this.attempts.get(group.captionStart) ?? 0;
+      // Ghi nguồn vào nhóm NGAY LÚC XẾP HÀNG, không đọc `activeSourceId` lúc
+      // drain — drain có thể chạy vài giây sau, mà user đã kịp đổi video ⇒ bản
+      // dịch của video cũ bị ghi vào namespace của video mới.
+      const queued: QueuedGroup = {
+        captionStart: group.captionStart,
+        text: group.text,
+        sourceId: this.activeSourceId,
+      };
+      const key = queueKey(queued.sourceId, queued.captionStart);
+      const tried = this.attempts.get(key) ?? 0;
       if (tried >= MAX_TRANSLATE_ATTEMPTS) continue;
 
       // Ghi đè: nhóm có thể đã trong hàng đợi với text CŨ (ngắn hơn), giờ dài
       // ra. Bản mới nhất là bản đúng.
-      this.pending.set(group.captionStart, group.text);
+      this.pending.set(key, queued);
     }
     this.scheduleDrain();
   }
@@ -160,8 +198,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
 
   /** Nhóm này đã bị giữ chờ 503 quá lâu chưa? Xem `TRANSIENT_HOLD_MAX_MS`. */
-  private hasHeldTooLong(captionStart: number, now: number): boolean {
-    const since = this.heldSince.get(captionStart);
+  private hasHeldTooLong(key: string, now: number): boolean {
+    const since = this.heldSince.get(key);
     return since !== undefined && now - since >= TRANSIENT_HOLD_MAX_MS;
   }
 
@@ -183,9 +221,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    const batch = Array.from(this.pending.entries()).map(
-      ([captionStart, text]) => ({ captionStart, text }),
-    );
+    const batch = Array.from(this.pending.values());
     this.pending.clear();
     if (batch.length === 0) return;
 
@@ -203,14 +239,17 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       batch.forEach((group, index) => {
         // Xoá mốc giữ NGAY khi thành công: để sót lại thì lần 503 sau nhóm này
         // bị coi là "đã giữ quá lâu" và bị bỏ oan.
-        this.heldSince.delete(group.captionStart);
+        this.heldSince.delete(queueKey(group.sourceId, group.captionStart));
         const vi = results[index]?.text.trim();
         if (!vi) return;
 
+        // `sourceId` lấy từ nhóm đã xếp hàng, KHÔNG phải `activeSourceId`:
+        // drain có thể chạy vài giây sau khi user đã đổi sang video khác.
         this.transcriptService.setTranslation({
           captionStart: group.captionStart,
           text: group.text,
           vi,
+          sourceId: group.sourceId,
         });
         this.sendToExtension({
           type: 'translation',
@@ -226,7 +265,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         error instanceof ProviderUnavailableError && !error.retryable;
       const overloaded = error instanceof ProviderUnavailableError && error.retryable;
       // 503 đã giữ quá trần ⇒ bỏ (còn câu mới trong hàng đợi vẫn được thử).
-      const heldTooLong = batch.some((g) => this.hasHeldTooLong(g.captionStart, now));
+      const heldTooLong = batch.some((g) =>
+        this.hasHeldTooLong(queueKey(g.sourceId, g.captionStart), now),
+      );
 
       if (quotaError) {
         // Lỗi quota: KHÔNG thuộc về câu nào cả, cả project đang cạn quota.
@@ -236,7 +277,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Cooldown nằm ở limiter dùng chung, nên đường HTTP cũng dừng theo.
         this.rateLimiter.pauseUntil(now + error.retryAfterMs);
         for (const group of batch) {
-          this.pending.set(group.captionStart, group.text);
+          this.pending.set(queueKey(group.sourceId, group.captionStart), group);
         }
         console.warn(
           `Translation paused ${Math.round(error.retryAfterMs / 1000)}s (quota), ` +
@@ -254,10 +295,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           now + error.retryAfterMs,
         );
         for (const group of batch) {
-          if (!this.heldSince.has(group.captionStart)) {
-            this.heldSince.set(group.captionStart, now);
+          const key = queueKey(group.sourceId, group.captionStart);
+          if (!this.heldSince.has(key)) {
+            this.heldSince.set(key, now);
           }
-          this.pending.set(group.captionStart, group.text);
+          this.pending.set(key, group);
         }
         console.warn(
           `Translation held (provider overloaded), re-queued ${batch.length} sentences`,
@@ -266,11 +308,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Còn lại: lỗi của CHÍNH batch (400/401/500) — tính công rồi bỏ sau MAX
         // lần; hoặc 503 đã giữ quá `TRANSIENT_HOLD_MAX_MS`.
         for (const group of batch) {
-          this.attempts.set(
-            group.captionStart,
-            (this.attempts.get(group.captionStart) ?? 0) + 1,
-          );
-          this.heldSince.delete(group.captionStart);
+          const key = queueKey(group.sourceId, group.captionStart);
+          this.attempts.set(key, (this.attempts.get(key) ?? 0) + 1);
+          this.heldSince.delete(key);
         }
         console.warn(
           `Translation batch skipped (${batch.length} sentences):`,
@@ -316,7 +356,17 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       try {
         const parsed: unknown = JSON.parse(data.toString());
         console.info('Received message:', parsed);
-        if (isRecord(parsed) && parsed.type === 'seek') {
+        if (isRecord(parsed) && parsed.type === 'source-switch') {
+          const sourceId = (parsed as { sourceId?: string }).sourceId;
+          if (typeof sourceId === 'string' && sourceId) {
+            this.activeSourceId = sourceId;
+            this.videoClockService.reset();
+            // Xoá bộ đệm audio cũ bên sidecar — nội dung video trước không được
+            // sống sót qua thời điểm đổi nguồn (gotcha #38).
+            this.sidecarService.sendSourceSwitch(sourceId);
+            console.info('Backend: source switch', sourceId);
+          }
+        } else if (isRecord(parsed) && parsed.type === 'seek') {
           const seekTime = (parsed as { seekTimeAtCapture?: number })
             .seekTimeAtCapture;
           console.info('Backend: seek received', parsed);
@@ -331,9 +381,17 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
             const from = seekTime;
             const to = seekTime + 3;
-            const replayWords = this.transcriptService.getRange(from, to);
+            // Lọc theo nguồn đang chạy: `from`/`to` là mốc RIÊNG của video này,
+            // nên không lọc thì trả luôn lời của video khác (Issue 5.20).
+            const sourceId = this.activeSourceId;
+            const replayWords = this.transcriptService.getRange(
+              sourceId,
+              from,
+              to,
+            );
             // Kèm bản dịch đã cache để VI hiện ngay, không gọi AI lại (FR-7.5).
             const replayTranslations = this.transcriptService.getTranslations(
+              sourceId,
               from,
               to,
             );

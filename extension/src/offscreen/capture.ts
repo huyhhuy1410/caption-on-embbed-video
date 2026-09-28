@@ -2,6 +2,15 @@
 let videoTimeAtCapture = 0;
 
 /**
+ * Danh tính video đang phát — ghim vào MỖI chunk audio (Issue 5.20).
+ *
+ * ⚠️ Phải là biến sống theo phiên chứ không chỉ gửi lúc đổi video: backend dùng
+ * nó để tách cache, mà cache nhận từ `words` về nhiều giây sau. Chunk audio
+ * không mang danh tính thì sidecar không biết dán nguồn nào lên từ.
+ */
+let activeSourceId: string | null = null;
+
+/**
  * Tài nguyên của phiên capture, giữ ở module scope để còn TẮT được.
  *
  * ⚠️ Trước đây các biến này nằm trong `captureTabAudio` nên không có đường
@@ -28,6 +37,18 @@ chrome.runtime.onMessage.addListener((message) => {
   // Chỉ lưu mốc video mới nhất, không relay ngược lại.
   if (message?.type === "video-clock") {
     videoTimeAtCapture = message.videoTime;
+  }
+  if (message?.type === "source-switch") {
+    const sourceId = String(message.sourceId ?? "");
+    if (!sourceId) return;
+    activeSourceId = sourceId;
+    // Báo backend để nó đổi namespace cache và xoá bộ đệm bên sidecar.
+    if (backendWebSocket?.readyState === WebSocket.OPEN) {
+      backendWebSocket.send(JSON.stringify({ type: "source-switch", sourceId }));
+      console.info("Caption AI offscreen: source switch sent", sourceId);
+    } else {
+      console.warn("Caption AI offscreen: backend socket is not open");
+    }
   }
   if (message?.type === "seek") {
     console.info(
@@ -74,6 +95,7 @@ async function stopTabAudio(): Promise<void> {
   audioContext = undefined;
 
   videoTimeAtCapture = 0;
+  activeSourceId = null;
 }
 
 // === BƯỚC 2: Hàm thực hiện Thu âm Tab và Truyền dữ liệu qua WebSocket ===
@@ -179,6 +201,9 @@ async function captureTabAudio(streamId: string) {
             captureTime: performance.now() / 1000,
             sampleRate: context.sampleRate,
             videoTimeAtCapture: videoTimeAtCapture, // 👈 Đính kèm mốc thời gian video chuẩn
+            // 👈 Danh tính video đang phát (Issue 5.20). `null` khi chưa biết —
+            // sidecar chấp nhận, nhưng cache sẽ rơi vào namespace chung.
+            sourceId: activeSourceId,
             frames: chunk.length,
           }),
         );

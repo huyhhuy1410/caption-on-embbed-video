@@ -88,6 +88,11 @@ chrome.runtime.onMessage.addListener((message) => {
       // `dispose()` lúc tắt đã gỡ nút và xoá target, nên phải gắn lại ở đây —
       // không thì nút CC fullscreen chỉ mọc lại khi tình cờ có mutation DOM.
       fullscreen.setTarget(activeVideo, overlay);
+      // ⚠️ Bắt nguồn ngay lúc BẬT, không đợi `reconcile()` đổi video: offscreen
+      // mới khởi tạo nên `activeSourceId` của nó đang null, và các chunk đầu
+      // sẽ rơi vào namespace chung. `reconcile()` chỉ gọi khi video ĐỔI, mà
+      // lúc vừa bật thì `activeVideo` thường đã đúng sẵn (Issue 5.20).
+      notifySourceSwitch(activeVideo);
       updateOverlayNow();
       startOverlayLoop();
 
@@ -206,6 +211,44 @@ document.addEventListener(
 // === BƯỚC 3: Xác định activeVideo theo thứ tự ưu tiên ===
 // Lưu ý: querySelectorAll("video") không tìm được video nằm trong Shadow DOM.
 // Tạm chấp nhận cho phạm vi MVP, cần xử lý đệ quy shadowRoot (open) ở phiên bản sau.
+
+/**
+ * Mã định danh video, ổn định suốt phiên — dùng làm khoá cache (Issue 5.20).
+ *
+ * ⚠️ Phải là chuỗi, không phải tham chiếu element: `reconcile()` chạy lại rất
+ * nhiều (mutation DOM) và tạo element mới thì tham chiếu đổi mọi lần, còn
+ * danh tính thì không. Mỗi video một `WeakMap` riêng ⇒ đổi `src` hoặc SPA thay
+ * element vẫn ra CÙNG mã, nên cache của video đó còn dùng được.
+ */
+const sourceIds = new WeakMap<HTMLVideoElement, string>();
+let sourceIdCounter = 0;
+function sourceIdFor(video: HTMLVideoElement): string {
+  let id = sourceIds.get(video);
+  if (id === undefined) {
+    sourceIdCounter += 1;
+    id = `v${sourceIdCounter}`;
+    sourceIds.set(video, id);
+  }
+  return id;
+}
+
+/**
+ * Báo cho backend biết nguồn âm thanh vừa đổi.
+ *
+ * ⚠️ Bắn cho MỌI lần đổi, kể cả lúc caption đang TẮT: backend còn giữ cache
+ * của video trước, và nếu không báo thì lúc user bật lại caption trên video mới,
+ * seek vẫn nhận lời của video cũ.
+ */
+function notifySourceSwitch(video: HTMLVideoElement): void {
+  void chrome.runtime
+    .sendMessage({ type: "source-switch", sourceId: sourceIdFor(video) })
+    .catch((error: unknown) => {
+      // Service worker chưa sẵn sàng thì bỏ qua: chunk audio kế tiếp vẫn mang
+      // sourceId nên cache vẫn tách được, chỉ mất độ trễ của lần reset đệm.
+      console.warn("Caption AI: could not announce source switch", error);
+    });
+}
+
 function reconcile() {
   // Phiên CC fullscreen có thể đã hỏng mà không sinh fullscreenchange nào.
   fullscreen.recoverIfBroken();
@@ -240,6 +283,11 @@ function reconcile() {
     // videoStart là mốc thời gian riêng của từng video, nên từ vựng giữ lại sẽ
     // khớp nhầm với video mới và hiện phụ đề của bài trước.
     overlay.clear();
+
+    // Bộ đệm audio bên sidecar còn chứa tiếng của video TRƯỚC; backend phải
+    // xoá nó, nếu không window đầu của video mới là tiếng cũ gắn mốc thời gian
+    // mới (Issue 5.20).
+    if (activeVideo) notifySourceSwitch(activeVideo);
   }
 
   // Không đổi target khi đang ở CC fullscreen: wrapper và nút đang gắn với
