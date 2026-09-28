@@ -4,9 +4,29 @@ import { Injectable } from '@nestjs/common';
  * Trần số request dịch trong cửa sổ trượt một phút.
  *
  * Gemini free tier cho 15 request/phút (`quotaValue: 15` trong chính response
- * 429). Đây là con số DUY NHẤT phải giữ.
+ * 429). Đây là giá trị MẶC ĐỊNH và phải giữ nguyên khi dùng `AI_PROVIDER=gemini`.
+ *
+ * ⚠️ Với provider KHÁC (CommandCode) con số này không phải trần thật của hạ tầng
+ * — tài liệu CommandCode không công bố RPM. Nhưng bộ đếm này không phải để
+ * phòng thủ provider, mà để giữ ĐỦ NHỊP: hệ thống sinh ~15–25 nhóm caption mỗi
+ * phút, và mỗi lượt drain là MỘT request ⇒ con số này quyết định caption có kịp
+ * theo video hay không. Nâng lên sẽ giữ được nhịp dịch với provider chịu được
+ * thêm, nên cho phép ghi đè bằng env `AI_MAX_RPM`.
+ *
+ * ⚠️ Nếu nâng quá trần thật của provider thì hậu quả KHÔNG phải mất bản dịch:
+ * provider trả 429 ⇒ `ProviderUnavailableError(retryable = false)` ⇒ gateway
+ * tự pause toàn bộ theo `retryAfterMs`. Tức là bộ đếm hơi thừa chỉ tốn một
+ * vòng 429, còn thấp hơn thật thì caption trễ. Vì vậy hợp lý là hơi cao.
  */
-export const TRANSLATE_MAX_PER_WINDOW = 15;
+export const TRANSLATE_MAX_PER_WINDOW = readMaxRpm();
+
+/** Đọc `AI_MAX_RPM`; rơi về 15 khi thiếu / rác / không phải số dương. */
+function readMaxRpm(): number {
+  const raw = process.env.AI_MAX_RPM;
+  if (!raw) return 15;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 15;
+}
 
 /** Độ dài cửa sổ quota — quota của Gemini là PER MINUTE. */
 export const TRANSLATE_WINDOW_MS = 60_000;
