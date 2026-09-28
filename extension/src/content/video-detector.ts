@@ -255,6 +255,39 @@ document.addEventListener(
   { capture: true },
 );
 
+// 2.3. Buffering: `paused` vẫn `false` nên handler `"pause"` ở trên không bắt
+// được (FR-2.4). `waiting` = hết dữ liệu, `stalled` = mạng chậm.
+//
+// ⚠️ DỪNG OVERLAY, KHÔNG CẮT CAPTURE: `tabCapture` bắt audio CẢ TAB, nên lúc
+// video này buffer thì tab vẫn có thể phát tiếng từ video khác. Cắt audio ở
+// đây sẽ giết phụ đề của các video sau — đó là quyết định kiến trúc (EC-5),
+// không phải sót sót.
+//
+// ⚠️ KHÔNG dùng `currentTime` để đo "đứng yên": đó là so sánh với chính mốc
+// vừa cập nhật ở frame trước, nên vòng rAF tự tắt ngay frame đầu (Issue 5.28).
+// `readyState` là trạng thái thật của media pipeline, không suy ra gì cả.
+for (const eventName of ["waiting", "stalled"] as const) {
+  document.addEventListener(
+    eventName,
+    (e) => {
+      if (e.target !== activeVideo) return;
+      console.info(`Caption AI: ${eventName} — freeze overlay loop`);
+      stopOverlayLoop();
+      updateOverlayNow();
+    },
+    { capture: true },
+  );
+}
+document.addEventListener(
+  "playing",
+  (e) => {
+    if (e.target !== activeVideo) return;
+    updateOverlayNow();
+    startOverlayLoop();
+  },
+  { capture: true },
+);
+
 // === BƯỚC 3: Xác định activeVideo theo thứ tự ưu tiên ===
 // Lưu ý: querySelectorAll("video") không tìm được video nằm trong Shadow DOM.
 // Tạm chấp nhận cho phạm vi MVP, cần xử lý đệ quy shadowRoot (open) ở phiên bản sau.
