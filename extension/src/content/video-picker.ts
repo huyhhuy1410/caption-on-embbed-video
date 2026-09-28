@@ -22,6 +22,9 @@ export class VideoPicker {
   /** Danh sách video đã dựng, giữ để `markActive` tra ngược. */
   private videosRef: HTMLVideoElement[] = [];
 
+  /** Video đang được user ghim, `null` = đang chạy heuristic. */
+  private picked: HTMLVideoElement | null = null;
+
   constructor(
     private readonly anchor: ShadowHost,
     private readonly onPick: (video: HTMLVideoElement) => void,
@@ -98,7 +101,10 @@ button[aria-current="true"] {
    * `onPick` được gọi kèm chính element video, không phải chỉ số: chỉ số đổi
    * mỗi lần `reconcile()` quét lại DOM, còn element thì bám đúng video.
    */
-  setVideos(videos: HTMLVideoElement[], active: HTMLVideoElement | null): void {
+  setVideos(videos: HTMLVideoElement[]): void {
+    // Giữ `picked` đồng bộ: nếu video đã ghim bị SPA gỡ khỏi DOM thì thôi
+    // ghim, vì `reconcile()` cũng rơi về heuristic theo đúng cách đó.
+    if (this.picked && !videos.includes(this.picked)) this.picked = null;
     // 0 hoặc 1 video thì không có gì để chọn — ẩn hẳn cho khỏi che.
     if (videos.length < 2) {
       this.clear();
@@ -108,18 +114,15 @@ button[aria-current="true"] {
     const ids = videos.map((v, i) => `${indexOf(v)}:${i}`);
     if (ids.join() !== this.renderedIds.join()) {
       this.renderedIds = ids;
-      this.render(videos, active);
+      this.render(videos);
     } else {
-      // Danh sách không đổi, chỉ cần cập nhật video nào đang được chọn.
-      this.markActive(active);
+      // Danh sách không đổi, chỉ cần cập nhật video nào đang được ghim.
+      this.markActive();
     }
     this.host.style.display = "block";
   }
 
-  private render(
-    videos: HTMLVideoElement[],
-    active: HTMLVideoElement | null,
-  ): void {
+  private render(videos: HTMLVideoElement[]): void {
     this.bar.textContent = "";
     this.videosRef = videos;
 
@@ -145,18 +148,22 @@ button[aria-current="true"] {
       button.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
+        // Bấm đúng video ĐÃ ghim thì không gọi — xem Issue 5.27. Không cần
+        // callback để làm gì: `onPick` chỉ gán lại giá trị đang có.
+        if (video === this.picked) return;
+        this.picked = video;
         this.onPick(video);
       });
       this.bar.appendChild(button);
     }
-    this.markActive(active);
+    this.markActive();
   }
 
-  private markActive(active: HTMLVideoElement | null): void {
+  private markActive(): void {
     for (const node of Array.from(this.bar.querySelectorAll("button"))) {
       const index = Number(node.getAttribute("data-index"));
       const video = Number.isInteger(index) ? this.videoAt(index) : null;
-      if (video === active) {
+      if (video === this.picked) {
         node.setAttribute("aria-current", "true");
       } else {
         node.removeAttribute("aria-current");

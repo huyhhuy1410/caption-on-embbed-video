@@ -13,8 +13,16 @@ const fullscreen = new CaptionFullscreen();
 let userPickedVideo: HTMLVideoElement | null = null;
 
 const picker = new VideoPicker(overlay.element, (video) => {
-  // Bấm lại video đang chọn thì bỏ chọn, quay về heuristic tự động.
-  userPickedVideo = userPickedVideo === video ? null : video;
+  // ⚠️ Cố ý KHÔNG toggle: bấm lại đúng video đã ghim thì giữ nguyên.
+  //
+  // Đã thử làm toggle (bấm lần 2 để bỏ ghim) và nó **không có tác dụng gì**:
+  // heuristic ưu tiên "video đang phát" nên bỏ ghim xong `reconcile()` chọn lại
+  // đúng video vừa bỏ ⇒ `activeVideo` không đổi, overlay không dọn, caption
+  // đứng y ở đó (Issue 5.27). Nút "bỏ ghim" mà không đổi được gì thì tệ hơn
+  // là không có nút.
+  //
+  // Đổi sang video khác vẫn bấm bình thường, nên đường thoát vẫn còn.
+  userPickedVideo = video;
   reconcile();
 });
 
@@ -350,12 +358,11 @@ function reconcile() {
 
   // Picker đứng ngoài overlay (xem `video-picker.ts`) nên vẫn hiện được khi
   // overlay bị ẩn — đúng lúc user cần chọn video khác nhất.
-  // ⚠️ Truyền `picked` (lựa chọn của user), KHÔNG phải `activeVideo` (kết quả
-  // của heuristic). Lý do: heuristic ưu tiên "video đang phát", nên khi user
-  // BẤM LẠI để bỏ chọn, `activeVideo` lập tức trở về đúng video đang phát ⇒
-  // vòng `aria-current` bật lại và caption neo y như cũ, tức bỏ chọn không
-  // có tác dụng gì (Issue 5.26).
-  picker.setVideos(videos, picked);
+  // Picker tự theo dõi video nào đang được ghim (xem `VideoPicker.picked`) —
+  // đồng bộ từ chính lần bấm của user, không suy ra từ `activeVideo`. Suy ra
+  // từ `activeVideo` thì vòng `aria-current` bật lại ngay khi user bỏ ghim, vì
+  // heuristic ưu tiên "video đang phát" và chọn đúng video vừa bỏ (Issue 5.27).
+  picker.setVideos(videos);
 
   // Vẽ ngay: vòng rAF chỉ chạy khi video đang phát, nên video mới lúc pause sẽ
   // không được vẽ lần nào cho tới khi user bấm play.
