@@ -9,17 +9,41 @@ from faster_whisper import WhisperModel
 
 # === BƯỚC 1: Cấu hình hằng số cho Xử lý Bộ đệm Cửa sổ trượt (Sliding Window Buffering) ===
 SAMPLE_RATE = 16000                     # Tần số lấy mẫu âm thanh: 16,000 Hz (16k mẫu/giây)
-WINDOW_SIZE = 6 * SAMPLE_RATE          # Cửa sổ nhận diện 6 giây = 96,000 samples
+
+# Cửa sổ nhận diện: 4 giây (64,000 samples).
+#
+# ⚠️ ĐÃ HẠ TỪ 6s XUỐNG 4s (2026-09-28) — con số này do ĐO, không do suy ra.
+# Đo thật trên phiên test 63 lượt (`analyze_latency.py`):
+#   độ trễ ổn định 6.87s = 6.00s do window + 0.87s do chờ whisper.
+# ⇒ 87% độ trễ do độ dài window, chỉ 13% do máy. Đổi model (`tiny`→`small`)
+# chỉ tăng phần 13% ⇒ **tăng** độ trễ. Muốn giảm độ trễ thì phải giảm window.
+#   xem Issue 5.29
+#
+# ⚠️ Nhịp xuất hiện đo được là 5.0s, KHÔNG phải `WINDOW - OVERLAP = 4.5s` như
+# tính tay. Lệch 0.5s vì `VideoClockService.resolveAnchor` dồn thêm 1 chunk
+# (`CHUNK_SECONDS = 1.0`). Suy ra bằng công thức là sai — phải đo.
+#
+# ⚠️ Ràng buộc bất biến, cả ba đều phải giữ (kiểm tra ở `test_window_size.py`):
+#   - `> OVERLAP_SIZE` (1.5s): sau lượt này bộ đệm còn `[-OVERLAP_SIZE:]` và
+#     `compute_video_time` trừ đúng 1.5s cho nó. Nhỏ hơn thì phép trừ sai.
+#   - `> CATCHUP_WINDOW_SIZE` (3s): nếu bằng thì window "bắt kịp" mất tác dụng.
+#   - `≥ 2 × OVERLAP_SIZE`: dưới ngưỡng này phần overlap chiếm quá nhiều tỉ lệ,
+#     hai lượt liên tiếp trùng lặp nhiều mà không thu được ngữ cảnh nào mới.
+WINDOW_SIZE = 4 * SAMPLE_RATE
+
 OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giây = 24,000 samples
+
 # Window "bắt kịp" cho lượt transcribe ĐẦU TIÊN sau reset/đầu stream (Issue 5.22).
 #
 # ⚠️ Video vẫn chạy realtime trong lúc ASR xử lý, nên nếu window đầu cũng đòi
 # đủ 6s thì caption chỉ xuất hiện khi video đã đi qua ~6s — đúng cái khoảng
 # trống thấy được ngay sau khi tua. Window nhỏ cho caption xuất hiện sớm hơn.
 #
-# ⚠️ Phải LỚN HƠN `OVERLAP_SIZE`: sau lượt này bộ đệm còn `[-OVERLAP_SIZE:]`
-# và `compute_video_time` trừ đúng 1.5s cho nó. Nhỏ hơn thì phép trừ đó sai.
+# ⚠️ Phải LỚN HƯỚN `OVERLAP_SIZE`: xem lý do ở `WINDOW_SIZE`.
 CATCHUP_WINDOW_SIZE = 3 * SAMPLE_RATE
+
+# ⚠️ Watchdog: phải lớn hơn `WINDOW_SIZE`, nếu không thì nó cắt bộ đệm đúng lúc
+# window đang chờ đủ dữ liệu ⇒ transcribe lại cả đoạn, liên tục không ngừng.
 MAX_BUFFER_SIZE = 12 * SAMPLE_RATE     # Giới hạn bộ đệm tối đa 12 giây (Watchdog chống tràn RAM)
 MAX_WORDS_PER_CAPTION = 8
 

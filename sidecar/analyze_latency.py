@@ -108,6 +108,18 @@ def main():
     summarize("nhịp ổn định", [r for r in rows if r["kind"] == "steady"])
     summarize("sau khi tua (catchup)", [r for r in rows if r["kind"] == "catchup"])
 
+    # Cảnh báo bất biến window. Không cảnh báo ở tầng hằng số vì
+    # `test_window_size.py` đã chặn; ở đây để dữ liệu đo lộ ra vấn đề ngay
+    # cả khi ai đó chỉnh cấu hình rồi đo mà quên chạy test.
+    windows = {r["windowSec"] for r in rows}
+    for w in sorted(windows):
+        if w <= 3.0:  # 2 x OVERLAP_SIZE
+            print(f"\n⚠️ CẢNH BÁO: window {w}s <= 2 x OVERLAP(1.5s).")
+            print("  Phần overlap chiếm quá nhiều tỉ lệ, hai lượt liên tiếp")
+            print("  trùng lặp nhiều mà không thu được ngữ cảnh nào mới.")
+            print("  Có thể chấp nhận nếu độ trễ rất quan trọng, nhưng cần")
+            print("  đánh giá độ chính xác bằng tai — không có test tự động nào bắt.")
+
     sources = sorted({r["source"] for r in rows})
     print(f"\nnguồn: {', '.join(str(s) for s in sources)}")
 
