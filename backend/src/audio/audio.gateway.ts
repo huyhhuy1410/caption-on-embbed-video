@@ -379,21 +379,26 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             // ⇒ phụ đề đúng ngay lúc tua rồi lệch ở đoạn ngay sau (Issue 5.21).
             this.sidecarService.sendReset();
 
-            const from = seekTime;
-            const to = seekTime + 3;
-            // Lọc theo nguồn đang chạy: `from`/`to` là mốc RIÊNG của video này,
+            // Lọc theo nguồn đang chạy: mốc thời gian là của RIÊNG video này,
             // nên không lọc thì trả luôn lời của video khác (Issue 5.20).
             const sourceId = this.activeSourceId;
-            const replayWords = this.transcriptService.getRange(
+
+            // ⚠️ Lấy TOÀN BỘ phần đã xem phía sau mốc tua, không chỉ 3 giây
+            // (Issue 5.25). Cũ chỉ trả `[seekTime, seekTime+3]` nên sau 3 giây
+            // hệ thống không biết "đã xem tới đâu" và rơi về nhịp transcribe
+            // 4.5–6s — người dùng thấy replay được một đoạn rồi đoạn sau phải
+            // chờ, dù dữ liệu đã nằm sẵn trong cache.
+            const replayWords = this.transcriptService.getRangeFrom(
               sourceId,
-              from,
-              to,
+              seekTime,
             );
-            // Kèm bản dịch đã cache để VI hiện ngay, không gọi AI lại (FR-7.5).
-            const replayTranslations = this.transcriptService.getTranslations(
+
+            // Bản dịch cũng lấy hết phía sau: `captionStart` của các nhóm sau
+            // mốc tua đều hợp lệ, và thiếu chúng thì dòng VI rỗng ở đúng những
+            // đoạn tiếp theo (FR-7.5).
+            const replayTranslations = this.transcriptService.getTranslationsFrom(
               sourceId,
-              from,
-              to,
+              seekTime,
             );
             console.info('Seek received:', seekTime);
             console.info('Replay words:', replayWords.length);

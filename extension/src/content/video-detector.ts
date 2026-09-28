@@ -350,7 +350,12 @@ function reconcile() {
 
   // Picker đứng ngoài overlay (xem `video-picker.ts`) nên vẫn hiện được khi
   // overlay bị ẩn — đúng lúc user cần chọn video khác nhất.
-  picker.setVideos(videos, activeVideo);
+  // ⚠️ Truyền `picked` (lựa chọn của user), KHÔNG phải `activeVideo` (kết quả
+  // của heuristic). Lý do: heuristic ưu tiên "video đang phát", nên khi user
+  // BẤM LẠI để bỏ chọn, `activeVideo` lập tức trở về đúng video đang phát ⇒
+  // vòng `aria-current` bật lại và caption neo y như cũ, tức bỏ chọn không
+  // có tác dụng gì (Issue 5.26).
+  picker.setVideos(videos, picked);
 
   // Vẽ ngay: vòng rAF chỉ chạy khi video đang phát, nên video mới lúc pause sẽ
   // không được vẽ lần nào cho tới khi user bấm play.
