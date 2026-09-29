@@ -62,7 +62,27 @@ CATCHUP_WINDOW_SIZE = 2 * SAMPLE_RATE
 # ⚠️ Watchdog: phải lớn hơn `WINDOW_SIZE`, nếu không thì nó cắt bộ đệm đúng lúc
 # window đang chờ đủ dữ liệu ⇒ transcribe lại cả đoạn, liên tục không ngừng.
 MAX_BUFFER_SIZE = 12 * SAMPLE_RATE     # Giới hạn bộ đệm tối đa 12 giây (Watchdog chống tràn RAM)
-MAX_WORDS_PER_CAPTION = 8
+# Số từ tối đa trước khi bắt đầu nhóm caption mới.
+#
+# ⚠️ ĐÃ TĂNG 8 → 16 (2026-09-29, Issue 5.31). Nghi phạm của triệu chứng "câu dài
+# bị cụt đầu" (Parker, 2026-09-29).
+#
+# ⚠️ VÌ SAO 8 LÀM CỤT ĐẦU — và vì sao đó là lỗi của TAY SỬA này, không phải của
+# window: `caption_start` reset khi đủ `MAX_WORDS_PER_CAPTION` **hoặc** gặp dấu
+# câu. Cắt ở dấu câu là đúng. Nhưng cắt ở ngưỡng số từ thì **cắt giữa một câu**:
+# nhóm trước mang nửa đầu câu, nhóm sau mang nửa cuối. Style A chỉ hiện MỘT
+# nhóm (FR-4.1) ⇒ nửa cuối hiện lên mà không có đầu ⇒ **cụt đầu**. Đây là lỗi
+# tương tác giữa ngưỡng số từ và kiểu hiển thị, không phải lỗi của ASR.
+#
+# ⚠️ `MAX_WORDS_PER_CAPTION` chỉ là TRẦN an toàn, không phải cách chia câu bình
+# thường: `tiny` hay trả segment kết thúc bằng dấu câu, nên nhánh `text.endswith`
+# chạy trước con số này hầu hết thời gian. Tăng lên 16 để câu dài có cơ hội
+# đi tới dấu câu thay vì bị cắt bởi số từ.
+#
+# ⚠️ Đánh đổi: nhóm dài hơn ⇒ dòng caption cao hơn ⇒ che nhiều video hơn. Đó là
+# lý do cần Style B (giữ N câu) thay vì chỉ tăng mãi con số này — xem
+# `docs/plan.md` M7.5.
+MAX_WORDS_PER_CAPTION = 16
 
 # Khai báo biến toàn cục lưu trữ mô hình Whisper AI
 model: WhisperModel | None = None
@@ -352,6 +372,33 @@ def parse_metadata(raw_message: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+# === Helper: Chia từ thành nhóm caption (tách khỏi vòng lặp để test được) ===
+def assign_caption_groups(words: list[dict[str, Any]], max_words: int) -> None:
+    """Gán `captionStart` cho từng từ, mỗi nhóm dùng chung một mốc.
+
+    ⚠️ Tách thành hàm thuần theo bài học Issue 4.20: logic nằm trong hai vòng
+    lặp lồng nhau của `transcribe_chunk` thì không test được, mà đây lại là
+    nhánh quyết định câu nào bị Style A cắt.
+
+    ⚠️ `captionStart` của một nhóm là video time của TỪ ĐẦU nhóm đó. Vì vậy nếu
+    nhóm bị cắt giữa chừng (bởi `max_words` chứ không phải dấu câu) thì Style A
+    hiện nửa cuối câu mà không có đầu ⇒ **cụt đầu** (Issue 5.31).
+
+    ⚠️ Gán `captionStart` TRƯỚC khi kiểm tra điều kiện reset — từ cuối nhóm vẫn
+    phải mang mốc của nhóm đó. Gán sau sẽ làm từ cuối nhận `None`.
+    """
+    caption_start: float | None = None
+    count = 0
+    for word in words:
+        if caption_start is None:
+            caption_start = word["videoStart"]
+        word["captionStart"] = caption_start
+        count += 1
+        if count >= max_words or word["w"].strip().endswith((".", "?", "!")):
+            caption_start = None
+            count = 0
+
+
 # === BƯỚC 7: Hàm Thực thi Whisper AI & Tính mốc thời gian Video chuẩn ===
 async def transcribe_chunk(
     websocket: WebSocket,
@@ -375,21 +422,11 @@ async def transcribe_chunk(
     # kéo dài nhiều chunk nên source của các chunk sau có thể đã khác (Issue 5.20).
     source_id = str(anchor_source_id or "") or None
     words: list[dict[str, Any]] = []
-    caption_start: float | None = None
-    caption_word_count = 0
 
     for segment in segments:
         for word in segment.words or []:
 
             text = word.word.strip()
-
-            # Video-clock key remains stable across overlap and replay.
-            if caption_start is None:
-                caption_start = compute_video_time(
-                    raw_video_time,
-                    word.start,
-                    is_first_chunk,
-                )
 
             words.append(
                 {
@@ -406,21 +443,13 @@ async def transcribe_chunk(
                         word.end,
                         is_first_chunk,
                     ),
-                    "captionStart": caption_start,
                     "c": word.probability,
                     "sourceId": source_id,
                 }
             )
 
-            caption_word_count += 1
-
-            # Bound each group so a long segment cannot cover the video.
-            if (
-                caption_word_count >= MAX_WORDS_PER_CAPTION
-                or text.endswith((".", "?", "!"))
-            ):
-                caption_start = None
-                caption_word_count = 0
+    # Chia nhóm caption SAU khi dựng xong danh sách từ — hàm thuần, test được.
+    assign_caption_groups(words, MAX_WORDS_PER_CAPTION)
 
 
     # 7.3. Trả về kết quả JSON chứa danh sách từ đã đồng bộ mốc thời gian Video
