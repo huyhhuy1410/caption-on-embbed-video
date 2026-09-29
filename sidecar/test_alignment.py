@@ -1,10 +1,22 @@
 # unit test
-from app.main import compute_video_time
+#
+# ⚠️ Kỳ vọng suy ra TỪ `OVERLAP_SIZE`, không viết cứng 1.5 (Issue 5.30).
+# Lý do: `compute_video_time` trừ đúng bằng độ dài gối đầu mà bộ đệm giữ
+# lại, tức `OVERLAP_SIZE`. Viết cứng ở test cũ làm cả test lẫn hàm cùng dựa
+# vào một con số không ai ràng buộc — đổi overlap là cả hai xanh trong khi
+# timestamp thực đã lệch. Suy ra từ hằng số thì đổi overlap vẫn tự nhất quán,
+# và `test_window_size.py` chặn phần còn lại (window > overlap).
+from app.main import OVERLAP_SIZE, SAMPLE_RATE, compute_video_time
+
+OVERLAP_SEC = OVERLAP_SIZE / SAMPLE_RATE
 
 CASES = [
-    (10.0,2.0,True,12.0),
-    (10.0,2.0,False,10.5),
-    (6.0,0.0,False,4.5),
+    # first chunk: buffer starts AT the anchor, nothing was carried in, so no
+    # subtraction.
+    (10.0, 2.0, True, 12.0),
+    # later chunk: subtract the overlap tail.
+    (10.0, 2.0, False, 10.0 - OVERLAP_SEC + 2.0),
+    (6.0, 0.0, False, 6.0 - OVERLAP_SEC + 0.0),
 ]
 
 failed = 0

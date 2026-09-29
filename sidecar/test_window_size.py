@@ -34,11 +34,11 @@ check("catchup faster than standard", CATCHUP_WINDOW_SIZE < WINDOW_SIZE, True)
 #    the subtraction is meaningless and timestamps drift.
 check("catchup larger than overlap", CATCHUP_WINDOW_SIZE > OVERLAP_SIZE, True)
 
-# 4. Steady-state step between later windows. Was 4.5s at WINDOW=6s (Issue
-#    5.29); now 2.5s at WINDOW=4s. NOTE this is only the arithmetic step — the
-#    MEASURED cadence was 5.0s at 4.5s step, because resolveAnchor adds one
-#    CHUNK_SECONDS. Do not treat this number as the real cadence.
-check("steady-state step", (WINDOW_SIZE - OVERLAP_SIZE) / SAMPLE_RATE, 2.5)
+# 4. Steady-state step between later windows. The arithmetic step is 1.5s at
+#    WINDOW=3s, but the MEASURED cadence is 2.0s: audio arrives in 1s chunks
+#    (CHUNK_SECONDS), so the real step rounds UP to the next whole chunk.
+#    Do not treat the arithmetic number as the real cadence (gotcha #50).
+check("steady-state step (arithmetic)", (WINDOW_SIZE - OVERLAP_SIZE) / SAMPLE_RATE, 1.5)
 
 # 5. WINDOW must be LARGER than OVERLAP: same reason as #3 — after a turn the
 #    buffer keeps [-OVERLAP_SIZE:] and compute_video_time subtracts exactly

@@ -10,26 +10,37 @@ from faster_whisper import WhisperModel
 # === BƯỚC 1: Cấu hình hằng số cho Xử lý Bộ đệm Cửa sổ trượt (Sliding Window Buffering) ===
 SAMPLE_RATE = 16000                     # Tần số lấy mẫu âm thanh: 16,000 Hz (16k mẫu/giây)
 
-# Cửa sổ nhận diện: 4 giây (64,000 samples).
+# Cửa sổ nhận diện: 3 giây (48,000 samples).
 #
-# ⚠️ ĐÃ HẠ TỪ 6s XUỐNG 4s (2026-09-28) — con số này do ĐO, không do suy ra.
-# Đo thật trên phiên test 63 lượt (`analyze_latency.py`):
-#   độ trễ ổn định 6.87s = 6.00s do window + 0.87s do chờ whisper.
-# ⇒ 87% độ trễ do độ dài window, chỉ 13% do máy. Đổi model (`tiny`→`small`)
-# chỉ tăng phần 13% ⇒ **tăng** độ trễ. Muốn giảm độ trễ thì phải giảm window.
-#   xem Issue 5.29
+# ⚠️ ĐÃ HẠ 6s → 4s → 3s (2026-09-28/29). Mọi con số do ĐO (`analyze_latency.py`),
+# không suy ra. Công thức đã kiểm chứng qua 3 cấu hình độc lập:
+#     độ trễ = WINDOW_SIZE + thời gian chờ whisper
+# **Không có phần `OVERLAP_SIZE` nào trong công thức** — tăng overlap không
+# giảm độ trễ, chỉ làm whisper gọi thường xuyên hơn. Muốn nhanh thì chỉ có
+# đường hạ `WINDOW_SIZE` này. Xem Issue 5.29.
 #
-# ⚠️ Nhịp xuất hiện đo được là 5.0s, KHÔNG phải `WINDOW - OVERLAP = 4.5s` như
-# tính tay. Lệch 0.5s vì `VideoClockService.resolveAnchor` dồn thêm 1 chunk
-# (`CHUNK_SECONDS = 1.0`). Suy ra bằng công thức là sai — phải đo.
+#   WINDOW | lag đo | whisper | WINDOW + whisper
+#      6s  | 6.87s  | 0.87s   | 6.87 ✓
+#      4s  | 4.83s  | 0.83s   | 4.83 ✓
+#
+# ⚠️ VÌ SAO 3s, không dừng ở 4s: ở 4s, một câu ngắn 2 giây nói xong rồi phụ
+# đề mới tới — người đọc mất dòng (Parker, 2026-09-29). Con số 4.83s **nằm
+# trong dải spec 5–12s**, nhưng dải đó nói về thời gian chứ không nói về việc
+# có đọc kịt hay không. Ở đây không kịt ⇒ phải hạ tiếp.
+#
+# ⚠️ Nhịp xuất hiện đo được KHÔNG phải `WINDOW - OVERLAP`, mà là
+# `ceil((WINDOW - OVERLAP) / CHUNK_SECONDS) * CHUNK_SECONDS` — audio đến theo
+# chunk 1s nên phải làm tròn lên. Đo: 4.5s→5.0s, 2.5s→3.0s, 1.5s→2.0s.
+# Suy ra bằng công thức thiếu bước làm tròn là sai (gotcha #50).
 #
 # ⚠️ Ràng buộc bất biến, cả ba đều phải giữ (kiểm tra ở `test_window_size.py`):
 #   - `> OVERLAP_SIZE` (1.5s): sau lượt này bộ đệm còn `[-OVERLAP_SIZE:]` và
-#     `compute_video_time` trừ đúng 1.5s cho nó. Nhỏ hơn thì phép trừ sai.
-#   - `> CATCHUP_WINDOW_SIZE` (3s): nếu bằng thì window "bắt kịp" mất tác dụng.
+#     `compute_video_time` trừ đúng bằng độ dài gối đó. Nhỏ hơn thì phép trừ sai.
+#   - `> CATCHUP_WINDOW_SIZE` (2s): nếu bằng thì window "bắt kịp" mất tác dụng.
 #   - `≥ 2 × OVERLAP_SIZE`: dưới ngưỡng này phần overlap chiếm quá nhiều tỉ lệ,
 #     hai lượt liên tiếp trùng lặp nhiều mà không thu được ngữ cảnh nào mới.
-WINDOW_SIZE = 4 * SAMPLE_RATE
+#     2.5s sẽ vi phạm (2.5 < 3) nên đó là sàn cứng của kiến trúc hiện tại.
+WINDOW_SIZE = 3 * SAMPLE_RATE
 
 OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giây = 24,000 samples
 
@@ -39,8 +50,14 @@ OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giâ
 # đủ 6s thì caption chỉ xuất hiện khi video đã đi qua ~6s — đúng cái khoảng
 # trống thấy được ngay sau khi tua. Window nhỏ cho caption xuất hiện sớm hơn.
 #
-# ⚠️ Phải LỚN HƯỚN `OVERLAP_SIZE`: xem lý do ở `WINDOW_SIZE`.
-CATCHUP_WINDOW_SIZE = 3 * SAMPLE_RATE
+# ⚠️ Phải nằm TRONG khoảng `(OVERLAP_SIZE, WINDOW_SIZE)`:
+#   - `> OVERLAP_SIZE`: bộ đệm giữ lại `[-OVERLAP_SIZE:]` làm gối đầu; nếu
+#     window bằng hoặc nhỏ hơn thì phần giữ lại chính là trọn window đã
+#     transcribe, phép trừ của `compute_video_time` mất nghĩa ⇒ timestamp lệch.
+#   - `< WINDOW_SIZE`: bằng thì window "bắt kịp" không nhỏ hơn window thường
+#     nên không mua được gì, chỉ mất ngữ cảnh cho whisper.
+# 2s là giá trị lớn nhất mà vẫn nằm trong khoảng (1.5s, 3s).
+CATCHUP_WINDOW_SIZE = 2 * SAMPLE_RATE
 
 # ⚠️ Watchdog: phải lớn hơn `WINDOW_SIZE`, nếu không thì nó cắt bộ đệm đúng lúc
 # window đang chờ đủ dữ liệu ⇒ transcribe lại cả đoạn, liên tục không ngừng.
@@ -306,8 +323,15 @@ def resolve_window_size(is_first_chunk: bool) -> int:
 
 # === Helper: Hàm thuần tính mốc thời gian video cho một từ (tách khỏi whisper để test được) ===
 def compute_video_time(raw_video_time: float, word_time: float, is_first_chunk: bool) -> float:
-    base_video_time = raw_video_time - (1.5 if not is_first_chunk else 0.0)
-    return round(base_video_time + word_time, 2)
+    # ⚠️ Trừ ĐÚNG bằng `OVERLAP_SIZE`, KHÔNG hardcode 1.5 (Issue 5.30).
+    #
+    # Sau mỗi lượt, bộ đệm giữ lại `[-OVERLAP_SIZE:]` làm gối đầu cho window
+    # sau, nên mốc phải lùi đúng bằng độ dài gối đó. Trước đây con số 1.5
+    # viết cứng, **trùng với `OVERLAP_SIZE` do may mắn**: đổi `OVERLAP_SIZE`
+    # thì mọi timestamp lệch, mà `test_window_size.py` vẫn xanh vì bất biến
+    # "window > overlap" không hề nhìn vào chỗ trừ này.
+    overlap_sec = 0.0 if is_first_chunk else OVERLAP_SIZE / SAMPLE_RATE
+    return round(raw_video_time - overlap_sec + word_time, 2)
 
 # === BƯỚC 5: Helper Chuyển đổi Bytes PCM16 -> NumPy Float32 (-1.0 đến 1.0) ===
 def bytes_to_float32(audio_bytes: bytes) -> np.ndarray:
