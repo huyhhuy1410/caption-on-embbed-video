@@ -19,18 +19,42 @@ export interface SentenceTranslation {
   vi: string;
 }
 
+/** Màu của hai dòng chữ. Bạn chọn trong bảng màu (FR-4.9). */
+export interface CaptionColors {
+  en: string;
+  vi: string;
+}
+
 /**
- * Số câu đã hiện được giữ lại phía trên câu hiện tại (FR-4.8).
+ * Mặc định: EN trắng, VI xám.
  *
- * ⚠️ Vì sao cần: Style A thay câu trước NGAY lúc câu sau bắt đầu (FR-4.1).
- * Với độ trễ đo được ~4.07s, một câu ngắn 2 giây đã nói xong và biến mất
- * trước khi chữ tới ⇒ người đọc mất dòng. Giữ lại vài câu đã hiện là cách
- * chữa *mất dòng* mà không cần chạm vào pipeline.
- *
- * ⚠️ Đánh đổi: mỗi câu thêm chiều cao, che nhiều video hơn. Khi M7.5 hạ độ trễ
- * xuống <2s thì con số này nên giảm dần về 0.
+ * ⚠️ VI xám chìm hơn trắng một cách có chủ đích: dòng EN là thứ người đọc
+ * theo dõi, dòng VI là phụ trợ. Trước đây VI dùng `#ffd84d` (vàng) — đậm hơn
+ * EN, kéo mắt người xem sang phần không phải phần cần theo.
  */
-const DEFAULT_PAST_LINES = 3;
+const DEFAULT_COLORS: CaptionColors = { en: "#ffffff", vi: "#9e9e9e" };
+
+/** Bảng màu cho `input[type=color]`. */
+const PRESET_COLORS: Record<string, CaptionColors> = {
+  mặc_định: { en: "#ffffff", vi: "#9e9e9e" },
+  cao_độ_tương_phản: { en: "#ffffff", vi: "#e0e0e0" },
+  dịu: { en: "#f5f5f5", vi: "#757575" },
+  ấm: { en: "#fff8e1", vi: "#bcaaa4" },
+  mát: { en: "#e3f2fd", vi: "#90a4ae" },
+};
+
+/**
+ * Khoảng cách giữa panel và mép video (px), và bề rộng panel.
+ *
+ * ⚠️ Panel đặt BÊN CẠNH video chứ không nằm trên video: 3 câu + bản dịch
+ * chiếm gần hết màn hình khi nằm trong (Parker, 2026-09-29). Bên cạnh thì
+ * video không bị che, và bản dịch vẫn đọc được.
+ */
+const PANEL_GAP_PX = 12;
+const PANEL_WIDTH_PX = 320;
+
+/** Bề rộng tối đa khung sau khi user tự kéo (px). */
+const DRAGGED_MAX_WIDTH_PX = 560;
 
 /**
  * Giữ tối thiểu phần này của khung (px) nằm trong viewport khi kéo.
@@ -41,48 +65,37 @@ const DEFAULT_PAST_LINES = 3;
  */
 const KEEP_VISIBLE_PX = 48;
 
-/** Bề rộng tối đa của khung sau khi user tự kéo (px). */
-const DRAGGED_MAX_WIDTH_PX = 560;
+/**
+ * Câu đã hiện được giữ lại bao nhiêu (FR-4.8).
+ *
+ * ⚠️ Style A thay câu trước NGAY lúc câu sau bắt đầu. Với độ trễ đo được
+ * ~4.07s, câu ngắn 2s đã nói xong trước khi chữ tới ⇒ mất dòng. Giữ vài câu
+ * là cách chữa mất dòng mà không cần đụng pipeline.
+ */
+const DEFAULT_PAST_LINES = 8;
 
 /** Một dòng caption đã dựng trong DOM. */
 interface RenderedLine {
-  /** `captionStart` của nhóm — khoá bản dịch và khoá tra từ khi bấm. */
   key: number;
   en: HTMLDivElement;
   vi: HTMLDivElement;
   spans: HTMLSpanElement[];
-  /** Lệch trong `words` của từ đầu nhóm — dùng cho `pickAt` khi bấm từ. */
   start: number;
-  /** Lệch trong `words` của từ cuối nhóm. */
   end: number;
 }
 
 export class CaptionOverlay {
   private host: HTMLDivElement;
   private shadow: ShadowRoot;
-  /** Chứa các dòng caption; tách riêng để dựng lại mà không đụng drag handle. */
   private lineHost: HTMLDivElement;
   private dragHandle: HTMLDivElement;
+  private colorBar: HTMLDivElement;
+  private followButton: HTMLButtonElement;
   private words: CaptionWord[] = [];
   private wordSpans: HTMLSpanElement[] = [];
-
-  /** Bản dịch theo `captionStart`. Bản dịch về muộn hơn words nên giữ riêng. */
   private translations = new Map<number, string>();
-
-  /** Gửi từ user bấm ra ngoài. Xem `onWordPick`. */
   private wordPick: ((pick: WordPick) => void) | null = null;
-
-  /**
-   * User đã tự kéo overlay chưa — quyết định `position()` còn neo theo
-   * video hay giữ nguyên chỗ user đặt (FR-4.4 "user-movable").
-   *
-   * ⚠️ Trước khi có cờ này, `position()` ghi đè vị trí mỗi lần scroll/resize
-   * nên kéo xong là bị kéo về neo video. Giữ cờ thành sticky: đổi video vẫn
-   * neo lại (đúng ý user — vị trí là lựa chọn, nội dung mới là dữ liệu).
-   */
   private userPositioned = false;
-
-  /** Kéo đang diễn ra: mốc bắt đầu. `null` khi không kéo. */
   private drag: {
     pointerId: number;
     startX: number;
@@ -90,130 +103,132 @@ export class CaptionOverlay {
     originLeft: number;
     originTop: number;
   } | null = null;
-
-  /** Số câu giữ lại phía trên câu hiện tại (FR-4.8). `0` = Style A thuần. */
   private pastLineCount = DEFAULT_PAST_LINES;
-
-  /** Các dòng đang có trong DOM, cũ → mới. */
+  private colors: CaptionColors = { ...DEFAULT_COLORS };
   private renderedLines: RenderedLine[] = [];
+  private linesKey = "";
+  private lastVideoTime = 0;
 
   /**
-   * Khoá của bộ dòng đang hiển thị — chuỗi `captionStart` nối bằng dấu phẩy.
+   * Đang cuộn tay hay tự cuộn theo câu đang phát.
    *
-   * ⚠️ Chỉ dựng lại DOM khi khoá này ĐỔI. `update()` chạy 60 lần/giây, dựng
-   * lại mỗi lần thì rẻ tiền rất nhanh.
+   * ⚠️ `update()` chạy 60 lần/giây. Mặc định cuộn theo câu đang phát; khi người
+   * cuộn tay thì dừng lại và hiện nút "theo lại" để quay về auto.
    */
-  private linesKey = "";
+  private autoScroll = true;
 
-  /** `videoTime` của lần `update()` gần nhất — dùng để dựng lại khi đổi cấu
-   * hình khi video đang pause (không có vòng rAF để gọi lại). */
-  private lastVideoTime = 0;
+  /**
+   * Sự kiện `scroll` tiếp theo là do CHÍNH overlay đặt, không phải người.
+   *
+   * ⚠️ Cờ này chỉ đúng cho MỘT sự kiện. Gán `scrollTop` khi giá trị đã bằng
+   * nhau thì trình duyệt **không** phát sự kiện, còn cờ thì vẫn còn ⇒ lần cuộn
+   * tay kế tiếp sẽ bị nuốt mất. Vì vậy `scrollToCurrent` chỉ đặt cờ khi giá
+   * trị thực sự đổi.
+   */
+  private selfScroll = false;
 
   constructor() {
     this.host = document.createElement("div");
     this.shadow = this.host.attachShadow({ mode: "open" });
     this.lineHost = document.createElement("div");
     this.dragHandle = document.createElement("div");
+    this.colorBar = document.createElement("div");
+    this.followButton = document.createElement("button");
     this.dragHandle.className = "drag-handle";
+
     const style = document.createElement("style");
     style.textContent = `
 :host {
   position: fixed;
   z-index: 99999999;
+  /* Không bắt chuột: phần còn lại của trang (kể cả controls/tua của video)
+     phải bấm được. Chỉ các vùng con tự bật pointer-events. */
   pointer-events: none;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 4px;
   font-family: system-ui, sans-serif;
   box-sizing: border-box;
-  max-width: ${DRAGGED_MAX_WIDTH_PX}px;
 }
-/* Vùng kéo: thanh riêng ở mép trên, KHÔNG nằm trên dòng caption.
-   Nếu kéo bằng dòng caption thì đụng bề mặt click-từ (FR-6.1) — click và
-   bấm-giữ không tách được. Ở đây mới bật pointer-events vì :host tắt. */
 .drag-handle {
   pointer-events: auto;
   cursor: move;
-  width: 100%;
-  min-width: 120px;
-  height: 14px;
-  border-radius: 6px 6px 0 0;
-  background: rgba(0, 0, 0, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  height: 12px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.14);
+  flex: 0 0 auto;
   touch-action: none;
 }
-.drag-handle::after {
-  content: "";
-  width: 40px;
-  height: 3px;
-  border-radius: 2px;
-  background: rgba(255, 255, 255, 0.5);
-}
 .drag-handle:hover {
-  background: rgba(0, 0, 0, 0.65);
+  background: rgba(255, 255, 255, 0.28);
 }
-.drag-handle:hover::after {
-  background: rgba(255, 255, 255, 0.8);
-}
-/* Khối chứa các dòng caption. Tách riêng khỏi drag handle để dựng lại danh
-   sách dòng không xoá nhầm vùng kéo. */
-.lines {
+.panel {
+  pointer-events: auto;
   display: flex;
   flex-direction: column;
-  align-items: center;
+  background: rgba(0, 0, 0, 0.78);
+  border-radius: 8px;
+  padding: 8px;
   gap: 6px;
-  width: 100%;
+  width: ${PANEL_WIDTH_PX}px;
+  max-width: 90vw;
+  max-height: 70vh;
+  min-height: 120px;
+}
+/* Vùng cuộn. overflow-y bật thanh cuộn khi nội dung dài hơn khung —
+   đó là "đọc lại" (Parker yêu cầu 2026-09-29). */
+.lines {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.35) transparent;
+}
+.lines::-webkit-scrollbar {
+  width: 6px;
+}
+.lines::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.35);
+  border-radius: 3px;
 }
 .line {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  max-width: 100%;
+  gap: 1px;
+  flex: 0 0 auto;
 }
 .line-en {
-  background: rgba(0, 0, 0, 0.75);
-  color: #fff;
-  font-size: 20px;
+  color: var(--en);
+  font-size: 15px;
   font-weight: 600;
-  padding: 6px 14px;
-  border-radius: 6px;
-  text-align: center;
   line-height: 1.35;
-  /* Chỉ dòng EN nhận chuột — nó là bề mặt click-any-word (FR-6.1). Giữ
-     :host ở pointer-events:none để phần còn lại của overlay vẫn không chắn
-     thao tác lên video (controls, tua, chuột phải). */
-  pointer-events: auto;
+  text-align: left;
   cursor: pointer;
-  /* Cao hơn :host để mọi phần tử con (span) cũng nhận chuột, không chỉ nền
-     của div — pointer-events không tự kế thừa xuống. */
-  z-index: 1;
 }
 .line-vi {
-  background: rgba(0, 0, 0, 0.6);
-  color: #ffd84d;
-  font-size: 15px;
-  padding: 4px 12px;
-  border-radius: 6px;
-  text-align: center;
+  color: var(--vi);
+  font-size: 12.5px;
+  line-height: 1.3;
+  text-align: left;
 }
-/* Câu đã hiện (FR-4.8): mờ đi và nhỏ lại để dòng hiện tại nổi hẳn, nhưng vẫn
-   bấm được — đây chính là bề mặt đọc lại. */
 .line-past {
-  opacity: 0.6;
+  opacity: 0.55;
 }
 .line-past .line-en {
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 500;
-  padding: 3px 10px;
-  background: rgba(0, 0, 0, 0.6);
 }
 .line-past .line-vi {
-  font-size: 13px;
-  padding: 2px 8px;
+  font-size: 11.5px;
+}
+.line-active {
+  opacity: 1;
+}
+.line-active .line-en {
+  font-size: 15px;
 }
 .word-picked {
   color: #ffd84d;
@@ -222,20 +237,119 @@ export class CaptionOverlay {
 .word-active {
   color: #4fc3f7;
 }
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  padding-top: 5px;
+}
+.bar > * {
+  pointer-events: auto;
+}
+button {
+  font: inherit;
+  font-size: 11px;
+  color: #ddd;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+button:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+/* Nút "theo lại" chỉ hiện khi đang cuộn tay — mặc định auto-scroll thì vô
+   nghĩa, và một nút thừa chỉ gây rối. */
+button.follow {
+  margin-left: auto;
+  background: rgba(79, 195, 247, 0.22);
+  border-color: #4fc3f7;
+  color: #fff;
+}
+/* input[type=color] mặc định có viền dày của UA — bỏ đi cho gọn. */
+input[type="color"] {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 3px;
+  background: none;
+  cursor: pointer;
+}
 `;
+
+    this.host.style.setProperty("--en", this.colors.en);
+    this.host.style.setProperty("--vi", this.colors.vi);
+
+    const panel = document.createElement("div");
+    panel.className = "panel";
+
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    const enColor = this.makeColorInput("EN", this.colors.en, (v) =>
+      this.setColors({ en: v }),
+    );
+    const viColor = this.makeColorInput("VI", this.colors.vi, (v) =>
+      this.setColors({ vi: v }),
+    );
+    this.followButton.className = "follow";
+    this.followButton.textContent = "theo lại";
+    this.followButton.hidden = true;
+    this.followButton.addEventListener("click", () => {
+      this.autoScroll = true;
+      this.followButton.hidden = true;
+      this.scrollToCurrent();
+    });
+    bar.append(enColor, viColor, this.followButton);
+
+    panel.appendChild(this.lineHost);
+    panel.appendChild(bar);
+    this.lineHost.className = "lines";
 
     this.shadow.appendChild(style);
     this.shadow.appendChild(this.dragHandle);
-    this.shadow.appendChild(this.lineHost);
+    this.shadow.appendChild(panel);
 
-    // Drag dùng pointer events (một listener cho cả chuột/touch/cả ngón vừa
-    // chạm vừa kéo) + `setPointerCapture` để chuột chạy ra ngoài khung vẫn
-    // kéo được — không cần listener trên `window`.
+    this.lineHost.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const line = Number(target.getAttribute("data-line"));
+      const index = Number(target.getAttribute("data-index"));
+      if (!Number.isInteger(line) || !Number.isInteger(index)) return;
+      const pick = this.pickAt(line, index);
+      if (pick) this.wordPick?.(pick);
+    });
+
+    this.lineHost.addEventListener("scroll", () => this.onScroll());
+
+    this.installDrag();
+
+    document.body.appendChild(this.host);
+    this.hide();
+  }
+
+  private makeColorInput(
+    label: string,
+    value: string,
+    onChange: (hex: string) => void,
+  ): HTMLInputElement {
+    const input = document.createElement("input");
+    input.type = "color";
+    input.value = value;
+    input.title = `Màu ${label}`;
+    input.setAttribute("aria-label", `Màu chữ ${label}`);
+    input.addEventListener("input", () => onChange(input.value));
+    return input;
+  }
+
+  private installDrag(): void {
     this.dragHandle.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-
       const rect = this.host.getBoundingClientRect();
       this.drag = {
         pointerId: event.pointerId,
@@ -257,12 +371,6 @@ export class CaptionOverlay {
       );
     });
 
-    // `lostpointercapture` là đường duy nhất bắt được việc chuột bị thả
-    // ngoài cửa sổ trình duyệt — `pointerup` không nổ trong trường hợp đó.
-    //
-    // ⚠️ Vì `addEventListener` trên HTMLElement nhận `EventListener`, TS suy
-    // kiểu tham số là `Event` ⇒ không có `pointerId`. Khai báo rõ kiểu trong
-    // vòng lặp để TypeScript ép callback về đúng kiểu ho event.
     const release = (event: PointerEvent): void => {
       const drag = this.drag;
       if (!drag || drag.pointerId !== event.pointerId) return;
@@ -272,62 +380,60 @@ export class CaptionOverlay {
     this.dragHandle.addEventListener("pointerup", release);
     this.dragHandle.addEventListener("pointercancel", release);
     this.dragHandle.addEventListener("lostpointercapture", release);
-
-    // Dùng event delegation trên khối dòng thay vì gắn listener vào từng span:
-    // `buildLines()` dựng lại span mỗi khi bộ dòng đổi, gắn listener từng span
-    // nghĩa là phải gắn lại mỗi lần — và span cũ giữ listener thành rò bộ nhớ.
-    //
-    // ⚠️ Bắt trên `lineHost` chứ không trên một dòng: Style B có N+1 dòng, và
-    // `data-line` cho biết span thuộc dòng nào. Bắt trên từng dòng sẽ phải gắn
-    // lại listener mỗi lần dựng dòng.
-    this.lineHost.addEventListener("click", (event) => {
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      const line = Number(target.getAttribute("data-line"));
-      const index = Number(target.getAttribute("data-index"));
-      if (!Number.isInteger(line) || !Number.isInteger(index)) return;
-      const pick = this.pickAt(line, index);
-      if (pick) this.wordPick?.(pick);
-    });
-
-    document.body.appendChild(this.host);
-    this.hide();
   }
 
   /**
-   * Lấy từ + câu chứa nó từ span `index` của dòng `lineIndex`.
+   * Cuộn tay ⇒ tắt auto-scroll và hiện nút "theo lại".
    *
-   * ⚠️ Bắt buộc phải truyền `lineIndex` (FR-4.8). Trước Style B, dòng hiện tại
-   * là `lastLineKey` — duy nhất — nên tra bằng `findIndex` trên `lastLineKey` là
-   * đủ. Giữ nhiều dòng thì con số đó **không còn định danh được dòng nào**;
-   * tra nhầm thì click-từ giải thích sai câu (FR-6.3 cần ngữ cảnh đúng).
+   * ⚠️ PHẢI phân biệt "cuộn do tôi đặt" với "cuộn của người". Bản thân việc
+   * gán `scrollTop` cũng phát ra sự kiện `scroll`, nên bắt thẳng sẽ khiến
+   * auto-scroll tự tắt ngay sau câu đầu tiên — tức tính năng chết ngay lúc bật.
+   *
+   * ⚠️ Vì sao KHÔNG so `scrollTop` với một "mốc" đã lưu: tôi đã thử, và nó
+   * sai. Mốc cũ không khớp vị trí mới sau khi câu kế tiếp cuộn panel đi, nên
+   * phép so trả về "lệch" và tắt chính nó. Cờ `selfScroll` đánh dấu đúng thời
+   * điểm, không suy đoán.
    */
-  private pickAt(lineIndex: number, index: number): WordPick | null {
-    const line = this.renderedLines[lineIndex];
-    if (!line) return null;
-    const word = this.words[line.start + index];
-    if (!word || line.start + index > line.end) return null;
-
-    // Câu = mọi từ cùng `captionStart`. Rút gọn khoảng trắng vì `join(" ")`.
-    const context = this.words
-      .filter((w) => w.captionStart === word.captionStart)
-      .map((w) => w.w)
-      .join(" ")
-      .trim();
-    return { word: word.w, context };
+  private onScroll(): void {
+    if (this.selfScroll) {
+      // Sự kiện do chính `scrollToCurrent` gây ra — bỏ qua.
+      this.selfScroll = false;
+      return;
+    }
+    if (!this.autoScroll) return;
+    this.autoScroll = false;
+    this.followButton.hidden = false;
   }
 
-  /** Đăng ký callback khi user bấm một từ. Xem `WordPick`. */
-  setWordPickHandler(handler: (pick: WordPick) => void): void {
-    this.wordPick = handler;
+  /** Cuộn tay chủ động (dùng khi gọi từ test hoặc khi cần ép). */
+  scrollBy(delta: number): void {
+    this.lineHost.scrollTop += delta;
+    this.onScroll();
   }
 
-  /**
-   * Số câu giữ lại phía trên câu hiện tại (FR-4.8). `0` = Style A thuần.
-   *
-   * Dựng lại ngay vì video có thể đang pause — không có vòng rAF để gọi lại
-   * `update()`.
-   */
+  private scrollToCurrent(): void {
+    const current = this.renderedLines[this.renderedLines.length - 1];
+    if (!current) return;
+    const target = current.en.offsetTop;
+    // Chỉ đặt cờ khi vị trí thực sự đổi — xem giải thích ở `selfScroll`.
+    if (Math.abs(this.lineHost.scrollTop - target) < 1) return;
+    this.selfScroll = true;
+    this.lineHost.scrollTop = target;
+  }
+
+  setColors(next: Partial<CaptionColors>): void {
+    this.colors = { ...this.colors, ...next };
+    this.host.style.setProperty("--en", this.colors.en);
+    this.host.style.setProperty("--vi", this.colors.vi);
+    const inputs = this.shadow.querySelectorAll<HTMLInputElement>('input[type="color"]');
+    if (inputs[0]) inputs[0].value = this.colors.en;
+    if (inputs[1]) inputs[1].value = this.colors.vi;
+  }
+
+  getColors(): CaptionColors {
+    return { ...this.colors };
+  }
+
   setPastLineCount(count: number): void {
     const next = Math.max(0, Math.floor(count));
     if (next === this.pastLineCount) return;
@@ -340,13 +446,27 @@ export class CaptionOverlay {
     return this.pastLineCount;
   }
 
+  setWordPickHandler(handler: (pick: WordPick) => void): void {
+    this.wordPick = handler;
+  }
+
+  private pickAt(lineIndex: number, index: number): WordPick | null {
+    const line = this.renderedLines[lineIndex];
+    if (!line) return null;
+    const word = this.words[line.start + index];
+    if (!word || line.start + index > line.end) return null;
+    const context = this.words
+      .filter((w) => w.captionStart === word.captionStart)
+      .map((w) => w.w)
+      .join(" ")
+      .trim();
+    return { word: word.w, context };
+  }
+
   setWords(words: CaptionWord[]): void {
     this.words = this.words.concat(words);
     this.words.sort((a, b) => a.videoStart - b.videoStart);
 
-    // Sidecar dùng sliding window overlap 1.5s ⇒ vùng chồng bị transcribe
-    // 2 lần và gửi 2 lần. Sau khi sort, các bản trùng nằm LIỀN KỀ nhau,
-    // nên chỉ cần so với từ vừa được giữ lại.
     const deduped: CaptionWord[] = [];
     for (const word of this.words) {
       const last = deduped[deduped.length - 1];
@@ -360,30 +480,23 @@ export class CaptionOverlay {
       deduped.push(word);
     }
     this.words = deduped;
-
-    // `words` vừa bị dựng lại nên mọi lệch trong `renderedLines` đã hỏng.
-    // Xoá khoá để `update()` dựng DOM lại ở frame kế.
     this.linesKey = "";
   }
 
-  /** Lệch đầu / cuối của nhóm `captionStart` chứa `index`. */
   private groupBounds(index: number): { start: number; end: number } {
     const key = this.words[index].captionStart;
     let start = index;
     while (start > 0 && this.words[start - 1].captionStart === key) start--;
     let end = index;
-    while (end < this.words.length - 1 && this.words[end + 1].captionStart === key) {
+    while (
+      end < this.words.length - 1 &&
+      this.words[end + 1].captionStart === key
+    ) {
       end++;
     }
     return { start, end };
   }
 
-  /**
-   * Bộ dòng cần hiển thị: N câu đã hiện + câu hiện tại, cũ → mới (FR-4.8).
-   *
-   * Đi ngược từ nhóm hiện tại, mỗi lần lấy nguyên một nhóm rồi lùi tiếp. Dừng
-   * khi đã đủ N câu trước.
-   */
   private visibleBounds(currentIndex: number): { start: number; end: number }[] {
     const current = this.groupBounds(currentIndex);
     const bounds = [current];
@@ -407,8 +520,6 @@ export class CaptionOverlay {
       }
     }
 
-    // Chưa có từ nào, hoặc video ở vùng CHƯA transcribe (trước từ đầu tiên)
-    // ⇒ không dòng nào để hiện, chờ ASR.
     if (currentIndex === -1) {
       this.renderLines([], currentIndex);
       return;
@@ -417,29 +528,27 @@ export class CaptionOverlay {
     this.renderLines(this.visibleBounds(currentIndex), currentIndex);
   }
 
-  /**
-   * Dựng bộ dòng hiển thị, hoặc chỉ cập nhật từ đang sáng nếu bộ dòng không đổi.
-   *
-   * `update()` chạy mỗi frame rAF, nên phần đắt (dựng span) chỉ chạy khi
-   * `linesKey` đổi; phần nhẹ (đổi class của từ đang sáng) chạy mỗi frame.
-   */
   private renderLines(
     bounds: { start: number; end: number }[],
     activeIndex: number,
   ): void {
     const key = bounds.map((b) => this.words[b.start].captionStart).join(",");
-    if (key !== this.linesKey) {
+    const changed = key !== this.linesKey;
+    if (changed) {
       this.linesKey = key;
       this.buildLines(bounds);
     }
 
-    // Từ đang sáng chỉ nằm ở dòng CUỐI. Câu đã hiện không có từ "đang nói".
     const current = this.renderedLines[this.renderedLines.length - 1];
     if (!current) return;
     const activeOffset = activeIndex - current.start;
     for (const span of current.spans) {
       const index = Number(span.dataset.index);
       span.className = index === activeOffset ? "word-active" : "";
+    }
+
+    if (changed && this.autoScroll) {
+      this.scrollToCurrent();
     }
   }
 
@@ -453,7 +562,7 @@ export class CaptionOverlay {
       const key = this.words[group.start].captionStart;
 
       const wrapper = document.createElement("div");
-      wrapper.className = isCurrent ? "line" : "line line-past";
+      wrapper.className = isCurrent ? "line line-active" : "line line-past";
 
       const en = document.createElement("div");
       en.className = "line-en";
@@ -461,7 +570,6 @@ export class CaptionOverlay {
       for (let i = group.start; i <= group.end; i++) {
         const span = document.createElement("span");
         span.textContent = this.words[i].w + " ";
-        // Hai khoá: dòng nào, và lệch trong nhóm — `pickAt` cần cả hai.
         span.dataset.line = String(lineIndex);
         span.dataset.index = String(i - group.start);
         en.appendChild(span);
@@ -471,9 +579,9 @@ export class CaptionOverlay {
 
       const vi = document.createElement("div");
       vi.className = "line-vi";
-      // Chưa có bản dịch thì để trống — `applyVi` điền khi nó về. `hidden` để
-      // không chừa một ô nền đen rỗng dưới câu chưa được dịch.
-      vi.hidden = !this.translations.has(key);
+      const viText = this.translations.get(key) ?? "";
+      vi.textContent = viText;
+      vi.hidden = viText === "";
       wrapper.appendChild(vi);
 
       this.lineHost.appendChild(wrapper);
@@ -487,20 +595,9 @@ export class CaptionOverlay {
       };
       this.renderedLines.push(rendered);
       if (isCurrent) this.wordSpans = spans;
-
-      const viText = this.translations.get(key) ?? "";
-      vi.textContent = viText;
-      vi.hidden = viText === "";
     });
   }
 
-  /**
-   * Ghi dòng VI cho một dòng đã dựng.
-   *
-   * `update()` chạy mỗi frame rAF nên chỉ được chạm DOM khi giá trị ĐỔI.
-   * So sánh trực tiếp với `textContent` thay vì giữ một `lastViKey` như trước:
-   * giờ có N+1 dòng, một mốc đơn không đủ để biết dòng nào đã cập nhật.
-   */
   private applyVi(key: number, force: boolean): void {
     const text = this.translations.get(key) ?? "";
     for (const line of this.renderedLines) {
@@ -511,13 +608,11 @@ export class CaptionOverlay {
     }
   }
 
-  /** Bản dịch vừa về cho một nhóm. Điền ngay nếu dòng đó đang hiện. */
   setTranslation(captionStart: number, vi: string): void {
     this.translations.set(captionStart, vi);
     this.applyVi(captionStart, true);
   }
 
-  /** Bản dịch từ cache khi replay — nạp hàng loạt. */
   setTranslations(list: SentenceTranslation[]): void {
     for (const item of list) {
       this.translations.set(item.captionStart, item.vi);
@@ -528,44 +623,41 @@ export class CaptionOverlay {
   }
 
   /**
-   * Neo overlay theo vị trí video (FR-4.4).
+   * Neo panel BÊN CẠNH video, không nằm trong video (Parker, 2026-09-29).
    *
-   * ⚠️ Sau khi user kéo, KHÔNG neo nữa — nếu neo thì mỗi lần scroll/resize
-   * sẽ kéo overlay về chỗ cũ, tức là tính năng kéo trở về vô dụng sau vài
-   * giây. Giữ `width` theo video nhưng để `left/top` user đặt.
+   * ⚠️ Chọn bên phải, và nếu không đủ chỗ thì bên trái — panel rộng 320px
+   * trong viewport hẹp sẽ tràn ra ngoài màn hình nếu cứ neo bên phải.
    */
   position(rect: DOMRect, force = false): void {
     if (this.userPositioned && !force && this.drag === null) {
-      this.host.style.width = `${rect.width}px`;
-      this.host.style.maxWidth = `${DRAGGED_MAX_WIDTH_PX}px`;
       return;
     }
-    this.host.style.left = `${rect.left}px`;
-    this.host.style.width = `${rect.width}px`;
+
+    const width = PANEL_WIDTH_PX;
+    const gap = PANEL_GAP_PX;
+    const viewportWidth = window.innerWidth;
+
+    let left: number;
+    if (rect.right + gap + width <= viewportWidth - KEEP_VISIBLE_PX) {
+      left = rect.right + gap;
+    } else if (rect.left - gap - width >= KEEP_VISIBLE_PX) {
+      left = rect.left - gap - width;
+    } else {
+      // Không bên nào đủ chỗ ⇒ đè lên mép phải video, vẫn hơn là tràn màn hình.
+      left = Math.max(KEEP_VISIBLE_PX, Math.min(rect.right - width, viewportWidth - width - KEEP_VISIBLE_PX));
+    }
+
+    const height = Math.min(window.innerHeight - 24, rect.height || window.innerHeight * 0.7);
+    this.host.style.left = `${Math.round(left)}px`;
+    this.host.style.top = `${Math.round(rect.top)}px`;
+    this.host.style.height = `${Math.round(height)}px`;
     this.host.style.maxWidth = `${DRAGGED_MAX_WIDTH_PX}px`;
-    this.host.style.bottom = `${window.innerHeight - rect.bottom + 12}px`;
-    this.host.style.top = "auto";
   }
 
-  /**
-   * Bỏ vị trí user đã kéo, quay về neo theo video.
-   *
-   * ⚠️ Bắt buộc khi vào/ra CC fullscreen: overlay được dời vào wrapper 100%×100%,
-   * còn `left`/`top` đang lưu theo **viewport của trang**. Giữ nguyên thì
-   * overlay nằm ở toạ độ cũ trong hệ toạ độ mới ⇒ lệch chỗ. Gọi `position()`
-   * với `force` để ghi đè, đồng thời xoá cờ cho các lần `position()` sau.
-   */
   resetToVideoAnchor(): void {
     this.userPositioned = false;
   }
 
-  /**
-   * Đặt overlay theo toạ độ viewport, giữ tối thiểu một mảnh trong màn hình.
-   *
-   * Dùng `left`+`top` chứ không phải `bottom`: `bottom` đang được neo theo
-   * video, và màn hình co lại (F11, xoay tablet) sẽ làm `bottom` cũ giữ
-   * overlay ở mép dưới mà ta không kiểm soát được.
-   */
   private moveTo(left: number, top: number): void {
     const host = this.host;
     const rect = host.getBoundingClientRect();
@@ -581,25 +673,19 @@ export class CaptionOverlay {
       window.innerHeight - KEEP_VISIBLE_PX,
     );
 
-    // `bottom` phải bỏ trước, không thì `top` + `bottom` cùng lúc thì
-    // trình duyệt coi `top` là `auto` và overlay nhảy theo chiều cao window.
-    host.style.bottom = "auto";
     host.style.left = `${Math.round(clampedLeft)}px`;
     host.style.top = `${Math.round(clampedTop)}px`;
-
     this.userPositioned = true;
   }
+
   show(): void {
     this.host.style.display = "flex";
   }
+
   hide(): void {
     this.host.style.display = "none";
   }
 
-  /**
-   * `words` là mảng tích luỹ và videoStart là mốc thời gian riêng của từng
-   * video — đổi video mà không xoá thì phụ đề bài cũ sẽ hiện lên bài mới.
-   */
   clear(): void {
     this.words = [];
     this.translations.clear();
