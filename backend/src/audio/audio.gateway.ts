@@ -99,6 +99,14 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly rateLimiter: TranslationRateLimiter,
   ) {
     // 1.1. Đăng ký callback lắng nghe kết quả Subtitle trả về từ Python Sidecar
+    this.sidecarService.setOpenHandler(() => {
+      // Sidecar giữ state theo từng WS connection; reconnect = buffer/source
+      // sạch. Gửi lại nguồn HIỆN TẠI để window đầu sau reload vào đúng namespace.
+      if (this.activeSourceId !== null) {
+        this.sidecarService.sendSourceSwitch(this.activeSourceId);
+      }
+    });
+
     this.sidecarService.setMessageHandler((data) => {
       console.info('Message from sidecar:', data);
 

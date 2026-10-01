@@ -1,88 +1,176 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import { WebSocket } from 'ws';
 
+const SIDECAR_URL = 'ws://127.0.0.1:9000/ws';
+const RECONNECT_BASE_MS = 250;
+const RECONNECT_MAX_MS = 5_000;
+
 @Injectable()
-export class SidecarService implements OnModuleDestroy {
-  // 1. Mở kết nối WebSocket riêng nối từ NestJS Backend sang Python Sidecar (Cổng 9000)
-  private readonly socket = new WebSocket('ws://127.0.0.1:9000/ws');
-
-  // 2. Biến lưu trữ hàm callback khi có tin nhắn từ Python Sidecar trả về
+export class SidecarService implements OnModuleInit, OnModuleDestroy {
+  private socket?: WebSocket;
   private onMessage?: (data: string) => void;
+  private onOpen?: () => void;
+  private disposed = false;
+  private reconnectAttempt = 0;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
 
-  // === BƯỚC 1: Constructor - Quản lý sự kiện socket với Python Sidecar ===
-  constructor() {
-    this.socket.on('open', () => {
+  /**
+   * Control state không được rơi trong lúc sidecar reload.
+   *
+   * Audio/chunk metadata là realtime: cũ là vô dụng nên drop. Reset và đổi
+   * nguồn là control one-shot: rơi chúng sẽ mở lại Issue 5.20/5.21, nên chỉ
+   * giữ một reset và sourceId mới nhất.
+   */
+  private pendingReset = false;
+  private pendingSourceId?: string;
+
+  onModuleInit(): void {
+    this.connect();
+  }
+
+  private connect(): void {
+    if (this.disposed) return;
+    if (
+      this.socket &&
+      (this.socket.readyState === WebSocket.OPEN ||
+        this.socket.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    const socket = new WebSocket(SIDECAR_URL);
+    this.socket = socket;
+
+    socket.on('open', () => {
+      // Socket cũ có thể mở muộn sau khi một socket mới đã thay nó.
+      if (socket !== this.socket || this.disposed) {
+        socket.close();
+        return;
+      }
+      this.reconnectAttempt = 0;
       console.info('Connected to Whisper sidecar');
+
+      // Gateway biết activeSourceId thật tại thời điểm reconnect. Callback chạy
+      // TRƯỚC flush để ghi đè pending source cũ bằng nguồn hiện tại.
+      this.onOpen?.();
+      this.flushPendingControls();
     });
 
-    // 1.1. Lắng nghe tin nhắn Subtitle JSON từ Python Sidecar trả về
-    this.socket.on('message', (data) => {
+    socket.on('message', (data) => {
+      if (socket !== this.socket || this.disposed) return;
       const message = data.toString();
       console.info('Message from sidecar:', message);
-
-      // 1.2. Kích hoạt gọi hàm callback (nếu AudioGateway đã đăng ký qua setMessageHandler)
       this.onMessage?.(message);
     });
 
-    this.socket.on('error', (error) => {
+    socket.on('error', (error) => {
+      // `ws` luôn phát close sau error. Không schedule ở đây, nếu không một lỗi
+      // tạo hai timer reconnect.
       console.error('Sidecar error:', error.message);
     });
 
-    this.socket.on('close', () => {
+    socket.on('close', () => {
+      if (socket !== this.socket) return;
+      this.socket = undefined;
+      if (this.disposed) return;
       console.info('Disconnected from sidecar');
+      this.scheduleReconnect();
     });
   }
 
-  // === BƯỚC 2: Hàm gửi gói âm thanh PCM (Binary) sang Python Sidecar ===
-  sendAudio(audio: Buffer) {
-    if (this.socket.readyState !== WebSocket.OPEN) {
-      console.warn('Sidecar WebSocket is not ready');
-      return;
+  private scheduleReconnect(): void {
+    if (this.disposed || this.reconnectTimer !== undefined) return;
+    const delay = Math.min(
+      RECONNECT_BASE_MS * 2 ** this.reconnectAttempt,
+      RECONNECT_MAX_MS,
+    );
+    this.reconnectAttempt += 1;
+    console.info(`Reconnecting to Whisper sidecar in ${delay}ms`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.connect();
+    }, delay);
+  }
+
+  private sendNow(payload: Buffer | string): boolean {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(payload);
+      return true;
+    } catch (error: unknown) {
+      console.warn(
+        'Could not send to sidecar:',
+        error instanceof Error ? error.message : error,
+      );
+      return false;
     }
-    this.socket.send(audio);
   }
 
-  // === BƯỚC 3: Hàm gửi gói Metadata (JSON Text) sang Python Sidecar ===
-  sendMetadata(metadata: unknown) {
-    if (this.socket.readyState !== WebSocket.OPEN) {
-      console.warn('Sidecar WebSocket is not ready');
-      return;
+  /** Audio realtime không queue: khi reconnect thì audio cũ đã stale. */
+  sendAudio(audio: Buffer): boolean {
+    return this.sendNow(audio);
+  }
+
+  /** Metadata theo từng chunk cũng drop cùng audio của chính chunk đó. */
+  sendMetadata(metadata: unknown): boolean {
+    return this.sendNow(JSON.stringify(metadata));
+  }
+
+  sendReset(): void {
+    if (this.sendMetadata({ type: 'reset' })) {
+      this.pendingReset = false;
+    } else {
+      this.pendingReset = true;
     }
-    this.socket.send(JSON.stringify(metadata));
   }
 
-  // === BƯỚC 3b: Báo sidecar xoá bộ đệm audio (Issue 5.21) ===
-  /**
-   * Gọi khi user tua. Không có lệnh này thì sidecar vẫn giữ tới 6s tiếng của
-   * đoạn TRƯỚC khi tua, rồi dán mốc của đoạn SAU khi tua lên đó ⇒ cụm phụ đề
-   * ngay sau lúc tua bị lệch nội dung.
-   *
-   * Đi cùng đường với `sendMetadata` — cùng socket, cùng định dạng JSON — để
-   * sidecar chỉ cần thêm một nhánh `if` ngay chỗ nó vốn đã parse metadata.
-   */
-  sendReset() {
-    this.sendMetadata({ type: 'reset' });
+  sendSourceSwitch(sourceId: string): void {
+    if (this.sendMetadata({ type: 'source-switch', sourceId })) {
+      // Source hiện tại gửi thành công phải xoá pending source cũ; nếu giữ, flush
+      // sẽ gửi source cũ SAU source mới và đảo namespace ngược lại.
+      this.pendingSourceId = undefined;
+    } else {
+      // Chỉ nguồn mới nhất còn ý nghĩa; các nguồn cũ đã bị supersede.
+      this.pendingSourceId = sourceId;
+    }
   }
 
-  /**
-   * Báo sidecar: `activeVideo` đã đổi sang nguồn khác (Issue 5.20 / FR-1.3).
-   *
-   * ⚠️ `sourceId` phải đi kèm, không phải tuỳ chọn: sidecar dán nó lên từng từ,
-   * và backend dùng nó để tách cache. Báo đổi nguồn mà không kèm id thì sidecar
-   * xoá bộ đệm (đúng) nhưng từ về sau không gắn được nguồn ⇒ mọi bucket rơi
-   * vào namespace rỗng và replay vẫn lẫn.
-   */
-  sendSourceSwitch(sourceId: string) {
-    this.sendMetadata({ type: 'source-switch', sourceId });
+  private flushPendingControls(): void {
+    // Nguồn trước, reset sau: namespace/buffer thuộc nguồn nào phải được xác lập
+    // trước khi reset trạng thái của lượt tua trong nguồn đó.
+    if (this.pendingSourceId !== undefined) {
+      const sourceId = this.pendingSourceId;
+      if (this.sendMetadata({ type: 'source-switch', sourceId })) {
+        this.pendingSourceId = undefined;
+      }
+    }
+    if (this.pendingReset && this.sendMetadata({ type: 'reset' })) {
+      this.pendingReset = false;
+    }
   }
 
-  // === BƯỚC 4: Hàm Đăng ký Callback Handler từ bên ngoài (AudioGateway) ===
-  setMessageHandler(handler: (data: string) => void) {
-    this.onMessage = handler; // Lưu hàm handler vào biến private onMessage
+  setMessageHandler(handler: (data: string) => void): void {
+    this.onMessage = handler;
   }
 
-  // === BƯỚC 5: Giải phóng kết nối khi Module bị dọn dẹp ===
-  onModuleDestroy() {
-    this.socket.close();
+  /** Gọi ở mọi lần open, kể cả kết nối đầu — gateway tự guard source null. */
+  setOpenHandler(handler: () => void): void {
+    this.onOpen = handler;
+  }
+
+  onModuleDestroy(): void {
+    this.disposed = true;
+    if (this.reconnectTimer !== undefined) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    const socket = this.socket;
+    this.socket = undefined;
+    socket?.close();
   }
 }

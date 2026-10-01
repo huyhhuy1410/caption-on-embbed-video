@@ -5,6 +5,9 @@ import { WsAdapter } from '@nestjs/platform-ws';
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule);
+  // Ctrl+C / SIGTERM phải chạy `onModuleDestroy`: SidecarService cần huỷ timer
+  // reconnect trước khi đóng socket, nếu không process dev để lại timer/PID mồ côi.
+  app.enableShutdownHooks();
 
   // Cho phép request từ extension và các origin khác
   app.enableCors();

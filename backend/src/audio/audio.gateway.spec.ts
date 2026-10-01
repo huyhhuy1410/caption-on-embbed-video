@@ -59,6 +59,8 @@ describe('AudioGateway', () => {
   let translateBatch: jest.Mock;
   let sidecar: {
     setMessageHandler: jest.Mock;
+    setOpenHandler: jest.Mock;
+    sendSourceSwitch: jest.Mock;
     sendReset: jest.Mock;
     sendAudio: jest.Mock;
     sendMetadata: jest.Mock;
@@ -68,6 +70,8 @@ describe('AudioGateway', () => {
     translateBatch = jest.fn().mockResolvedValue([]);
     sidecar = {
       setMessageHandler: jest.fn(),
+      setOpenHandler: jest.fn(),
+      sendSourceSwitch: jest.fn(),
       sendReset: jest.fn(),
       sendAudio: jest.fn(),
       sendMetadata: jest.fn(),
@@ -93,6 +97,30 @@ describe('AudioGateway', () => {
 
   it('should be defined', () => {
     expect(gateway).toBeDefined();
+  });
+
+  describe('sidecar reconnect', () => {
+    it('re-sends only the current video source when the sidecar opens', () => {
+      const client = makeClient();
+      gateway.handleConnection(client as never);
+
+      sendToGateway(client, { type: 'source-switch', sourceId: 'v1' });
+      sendToGateway(client, { type: 'source-switch', sourceId: 'v2' });
+
+      expect(sidecar.setOpenHandler).toHaveBeenCalledTimes(1);
+      const onOpen = sidecar.setOpenHandler.mock.calls[0][0] as () => void;
+      sidecar.sendSourceSwitch.mockClear();
+      onOpen();
+
+      expect(sidecar.sendSourceSwitch).toHaveBeenCalledTimes(1);
+      expect(sidecar.sendSourceSwitch).toHaveBeenCalledWith('v2');
+    });
+
+    it('does not invent a source before any video is selected', () => {
+      const onOpen = sidecar.setOpenHandler.mock.calls[0][0] as () => void;
+      onOpen();
+      expect(sidecar.sendSourceSwitch).not.toHaveBeenCalled();
+    });
   });
 
   describe('seek', () => {
