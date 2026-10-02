@@ -37,3 +37,8 @@ yarn-error.log*
 # --- Test / coverage ---
 coverage/
 .tmp/
+
+# Local test assets: scratch pages and multi-MB sample video stay out of git.
+# `test/serve.py` is tracked on purpose — it is the Range-capable server.
+test/*
+!test/serve.py
