@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dev stack launcher: sidecar -> health gate -> backend -> Range test server.
+# Dev stack launcher: sidecar -> health gate -> backend.
 # Only kills process trees it started; a port owner it did not start is reported
 # and left alone.
 
@@ -9,7 +9,6 @@ shopt -s nullglob
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIDECAR_PORT="${SIDECAR_PORT:-9000}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
-TEST_PORT="${TEST_PORT:-5173}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-45}"
 SKIP_PORT_CHECK="${SKIP_PORT_CHECK:-0}"
 LOG_DIR="$ROOT/.tmp/logs"
@@ -44,11 +43,9 @@ resolve_python() {
 
 PY="$(resolve_python)" || fail "Python/sidecar venv not found. Create sidecar/.venv first."
 [[ -d "$ROOT/backend/node_modules" ]] || fail "backend/node_modules missing. Run: cd backend && npm install"
-[[ -f "$ROOT/test/serve.py" ]] || fail "test/serve.py missing"
 mkdir -p "$LOG_DIR"
 : > "$LOG_DIR/sidecar.log"
 : > "$LOG_DIR/backend.log"
-: > "$LOG_DIR/serve.log"
 
 # Single netstat snapshot per check: a `netstat | awk` pipeline per port forks
 # three times, and MSYS bash runs out of fork under repeated forking.
@@ -74,7 +71,6 @@ preflight_ports() {
   done <<EOF
 sidecar $SIDECAR_PORT
 backend $BACKEND_PORT
-test $TEST_PORT
 EOF
   (( occupied == 0 )) || fail "Stop the listed owner(s), or set SKIP_PORT_CHECK=1 if you know what you are doing."
 }
@@ -247,11 +243,7 @@ wait_for_health sidecar "http://127.0.0.1:${SIDECAR_PORT}/health" "$HEALTH_TIMEO
 start_child backend "$ROOT/backend" "$LOG_DIR/backend.log" \
   env PORT="$BACKEND_PORT" npm run start:dev
 
-start_child test-server "$ROOT/test" "$LOG_DIR/serve.log" \
-  "$PY" serve.py "$TEST_PORT"
-
-log "Test page: http://127.0.0.1:${TEST_PORT}/multi-video.html"
-log "Logs: ${LOG_DIR#$ROOT/}/{sidecar,backend,serve}.log   (DEV_QUIET=1 to silence the stream below)"
+log "Logs: ${LOG_DIR#$ROOT/}/{sidecar,backend}.log   (DEV_QUIET=1 to silence the stream below)"
 log "Extension edits still need: cd extension && npm run build, then Chrome Reload"
 log "Ctrl+C stops only this stack."
 
