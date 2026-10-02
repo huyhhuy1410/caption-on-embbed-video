@@ -216,8 +216,10 @@ describe('GeminiProvider', () => {
       expect(serverRetryDelayMs('{"retryDelay":"22s"}')).toBe(22000);
     });
 
-    it('returns 0 when the server gave no delay', () => {
-      expect(serverRetryDelayMs('{}')).toBe(0);
+    it('falls back to a full quota window when the server gave no delay', () => {
+      // 0 ở đây là `pauseUntil(now + 0)` = no-op ⇒ hàng đợi bắn lại ngay và
+      // đốt trọn một cửa sổ quota bằng các request chắc chắn 429 (Issue 5.36).
+      expect(serverRetryDelayMs('{}')).toBe(60_000);
     });
   });
 });

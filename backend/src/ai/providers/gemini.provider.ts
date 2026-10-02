@@ -36,6 +36,19 @@ export function retryDelayMs(attempt: number): number {
 }
 
 /**
+ * Chờ tối thiểu khi Gemini báo 429 mà KHÔNG kèm gợi ý thời gian.
+ *
+ * ⚠️ Không có hằng số này thì 429 rơi về `retryAfterMs = 0` ⇒
+ * `pauseUntil(now + 0)` là no-op ⇒ hàng đợi thử lại ngay lập tức ⇒ đốt trọn
+ * một cửa sổ quota bằng các request chắc chắn 429. Quota tính theo CỬA SỔ MỘT
+ * PHÚT, nên chờ hết cửa sổ là lựa chọn thận trọng đúng bản chất quota.
+ *
+ * ⚠️ Cố ý khai báo riêng thay vì import từ `commandcode.provider`: mỗi provider
+ * một file độc lập, đổi transport của một bên không được kéo theo bên kia.
+ */
+const QUOTA_FALLBACK_DELAY_MS = 60_000;
+
+/**
  * Thời gian server dặn chờ, đọc từ `retryDelay` trong body lỗi 429.
  *
  * ⚠️ KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
@@ -44,7 +57,7 @@ export function retryDelayMs(attempt: number): number {
  */
 export function serverRetryDelayMs(body: string): number {
   const match = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(body);
-  return match ? Number(match[1]) * 1000 : 0;
+  return match ? Number(match[1]) * 1000 : QUOTA_FALLBACK_DELAY_MS;
 }
 
 /** Stable JSON envelope Gemini returns for translate (via responseSchema). */
