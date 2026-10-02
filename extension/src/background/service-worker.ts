@@ -10,6 +10,52 @@ console.info("Caption AI: service worker loaded");
 const SESSION_KEY = "captionSession";
 type CaptionSession = { tabId: number };
 
+const BACKEND_URL = "http://127.0.0.1:8000";
+
+type ExplainResult =
+  | { ok: true; explanation: unknown }
+  | { ok: false; kind: "throttled"; retryAfterMs: number }
+  | { ok: false; kind: "unavailable" }
+  | { ok: false; kind: "error"; message: string };
+
+/**
+ * Content script không fetch được cross-origin, nên nó hỏi qua service worker.
+ * Trả `true` để giữ kênh message mở cho tới khi request xong — thiếu nó thì
+ * `sendResponse` sau `await` sẽ mất.
+ */
+async function requestExplanation(
+  word: string,
+  context: string,
+): Promise<ExplainResult> {
+  try {
+    const response = await fetch(`${BACKEND_URL}/explain-word`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word, context, lang: "vi" }),
+    });
+    if (response.status === 429) {
+      const body = (await response.json()) as { retryAfterMs?: number };
+      return {
+        ok: false,
+        kind: "throttled",
+        retryAfterMs:
+          typeof body.retryAfterMs === "number" ? body.retryAfterMs : 0,
+      };
+    }
+    if (response.status === 503) return { ok: false, kind: "unavailable" };
+    if (!response.ok) {
+      return { ok: false, kind: "error", message: `HTTP ${response.status}` };
+    }
+    return { ok: true, explanation: await response.json() };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      kind: "error",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function readSession(): Promise<CaptionSession | undefined> {
   const stored = await chrome.storage.session.get(SESSION_KEY);
   const value: unknown = stored[SESSION_KEY];
@@ -41,32 +87,8 @@ chrome.action.onClicked.addListener((tab) => {
   });
 });
 
-// Side panel MỞ bằng click chuột phải lên icon, KHÔNG dùng
-// `openPanelOnActionClick`: click trái đã là công tắc bật/tắt capture (và là
-// gesture duy nhất cấp `activeTab` — xem gotcha #3), bật option đó thì Chrome
-// nuốt click và không bật/tắt capture nữa.
-chrome.contextMenus.create({
-  id: "open-explain-panel",
-  title: "Giải nghĩa từ (Caption AI)",
-  contexts: ["action"],
-});
 
-// `contexts: ["action"]` cần quyền contextMenus, và `create` phải chạy ở
-// top-level của extension page (kể cả khi SW tỉnh dậy) — gọi trong listener
-// sẽ bị Chrome từ chối.
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId !== "open-explain-panel") return;
-  // ⚠️ `OnClickData` KHÔNG có `windowId` — window phải lấy từ tham số thứ hai
-  // (`tab`). `tab` là undefined ở ngữ cảnh không có trang (launcher, cửa sổ
-  // trình duyệt rỗng) ⇒ không có window để mở panel.
-  const windowId = tab?.windowId;
-  if (windowId === undefined) return;
-  void chrome.sidePanel.open({ windowId }).catch((error: unknown) => {
-    console.warn("Caption AI SW: could not open side panel", error);
-  });
-});
-
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "video-clock") {
     void chrome.runtime
       .sendMessage({
@@ -103,22 +125,17 @@ chrome.runtime.onMessage.addListener((message) => {
       });
   }
 
-  // Chuyển tiếp lời gọi "giải nghĩa từ" từ content script sang side panel.
-  // ⚠️ Chỉ relay TÍN HIỆU (ai cần giải nghĩa từ nào) — bản thân lời gọi
-  // `POST /explain-word` do side panel tự đi, vì nó là extension page đã có
-  // `host_permissions` tới 127.0.0.1:8000. Không để SW gọi thay: SW bị giết
-  // sau ~30s idle và phải giữ state qua `storage.session` (gotcha #21).
-  if (message?.type === "explain-request") {
-    void chrome.runtime
-      .sendMessage({
-        type: "explain-request",
-        word: message.word,
-        context: message.context,
-      })
+  if (message?.type === "explain-popup-request") {
+    void requestExplanation(String(message.word ?? ""), String(message.context ?? ""))
+      .then((result) => sendResponse(result))
       .catch((error: unknown) => {
-        // Xảy ra khi side panel CHƯA mở — không phải lỗi.
-        console.info("Caption AI SW: side panel chưa mở, bỏ qua explain", error);
+        sendResponse({
+          ok: false,
+          kind: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
       });
+    return true;
   }
 
   // Chuyển tiếp kết quả từ backend xuống content script của tab đang capture.

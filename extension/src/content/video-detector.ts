@@ -1,6 +1,7 @@
 import { CaptionFullscreen } from "./fullscreen";
 import { CaptionOverlay } from "./overlay";
 import { isVisible, VideoPicker } from "./video-picker";
+import { WordPopup } from "./word-popup";
 console.info("Caption AI: content script loaded", window.location.href);
 
 let captionEnabled = false;
@@ -8,6 +9,7 @@ let activeVideo: HTMLVideoElement | null = null;
 let overlayFrameId: number | null = null;
 const overlay = new CaptionOverlay();
 const fullscreen = new CaptionFullscreen();
+const wordPopup = new WordPopup();
 
 /** Video user CHỈ ĐỊNH qua picker — thắng heuristic của `reconcile()`. */
 let userPickedVideo: HTMLVideoElement | null = null;
@@ -20,20 +22,10 @@ const picker = new VideoPicker(overlay.element, (video) => {
   reconcile();
 });
 
-// Click vào một từ trên overlay → SW relay → side panel gọi /explain-word.
-// Không gọi thẳng từ content script: content script không được fetch tới
-// host ngoài (CORS), và side panel là nơi có chỗ hiển thị lời giải nghĩa.
+// Popup nằm trong content script, nhưng request đi qua service worker vì content
+// script không có quyền fetch cross-origin như extension page.
 overlay.setWordPickHandler((pick) => {
-  void chrome.runtime
-    .sendMessage({
-      type: "explain-request",
-      word: pick.word,
-      context: pick.context,
-    })
-    .catch((error: unknown) => {
-      // Side panel chưa mở là chuyện thường, không phải lỗi cần báo user.
-      console.info("Caption AI: explain request chưa tới side panel", error);
-    });
+  void wordPopup.show(pick);
 });
 
 function repositionOverlay() {
@@ -51,6 +43,11 @@ function repositionOverlay() {
     return;
   }
   overlay.position(activeVideo.getBoundingClientRect());
+}
+/** Giữ chip picker bám mép video đang chọn khi cuộn/zoom layout. */
+function repositionPicker(): void {
+  if (!activeVideo) return;
+  picker.position(activeVideo.getBoundingClientRect());
 }
 function updateOverlayFromVideo(): void {
   if (!captionEnabled || !activeVideo || activeVideo.paused) {
@@ -166,6 +163,7 @@ chrome.runtime.onMessage.addListener((message) => {
     captionEnabled = false;
     stopOverlayLoop();
     overlay.clear();
+    wordPopup.hide();
     fullscreen.dispose();
     // Tắt caption ⇒ ẩn overlay là đúng dù video có hình hay không.
     syncOverlayVisibility();
@@ -362,6 +360,7 @@ function reconcile() {
     // videoStart là mốc thời gian riêng của từng video, nên từ vựng giữ lại sẽ
     // khớp nhầm với video mới và hiện phụ đề của bài trước.
     overlay.clear();
+    wordPopup.hide();
 
     // Bộ đệm audio bên sidecar còn chứa tiếng của video TRƯỚC; backend phải
     // xoá nó, nếu không window đầu của video mới là tiếng cũ gắn mốc thời gian
@@ -384,6 +383,7 @@ function reconcile() {
   // từ `activeVideo` thì vòng `aria-current` bật lại ngay khi user bỏ ghim, vì
   // heuristic ưu tiên "video đang phát" và chọn đúng video vừa bỏ (Issue 5.27).
   picker.setVideos(videos);
+  picker.position((activeVideo ?? videos[0]).getBoundingClientRect());
 
   // Vẽ ngay: vòng rAF chỉ chạy khi video đang phát, nên video mới lúc pause sẽ
   // không được vẽ lần nào cho tới khi user bấm play.
@@ -417,12 +417,14 @@ window.addEventListener(
     // Không kiểm tra lại thì overlay kẹt ở trạng thái ẩn/sai chỗ (Issue 5.23).
     hideOverlayIfNowhereToShow();
     repositionOverlay();
+    repositionPicker();
   },
   { capture: true, passive: true },
 );
 window.addEventListener("resize", () => {
   hideOverlayIfNowhereToShow();
   repositionOverlay();
+  repositionPicker();
 }, { passive: true });
 function hasPossibleVideoNode(node: Node): boolean {
   return (
