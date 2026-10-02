@@ -214,23 +214,6 @@ export class CaptionFullscreen {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "cc-fullscreen-btn";
-    // :host đang pointer-events:none, nút phải tự bật lại.
-    button.style.cssText = `
-      align-self: flex-end;
-      pointer-events: auto;
-      margin-right: 4px;
-      padding: 3px 8px;
-      font: inherit;
-      font-size: 11px;
-      line-height: 1.2;
-      background: rgba(0, 0, 0, 0.7);
-      color: #fff;
-      border: 1px solid rgba(255, 255, 255, 0.35);
-      border-radius: 4px;
-      cursor: pointer;
-      white-space: nowrap;
-    `;
-
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -241,14 +224,21 @@ export class CaptionFullscreen {
       }
     });
 
-    shadow.appendChild(button);
+    overlay.mountToolbarButton(button);
     this.button = button;
     this.setButtonLabel();
   }
 
   private setButtonLabel(): void {
     if (!this.button) return;
-    this.button.textContent = this.isActive() ? "Thoát CC" : "CC fullscreen";
+    const active = this.isActive();
+    this.button.textContent = "⛶";
+    this.button.title = active ? "Exit fullscreen" : "Caption fullscreen";
+    this.button.setAttribute(
+      "aria-label",
+      active ? "Exit caption fullscreen" : "Enter caption fullscreen",
+    );
+    this.button.setAttribute("aria-pressed", String(active));
   }
 
   private exit(): void {
