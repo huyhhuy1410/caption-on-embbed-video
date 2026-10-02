@@ -350,6 +350,21 @@ def assign_caption_groups(words: list[dict[str, Any]], max_words: int) -> None:
             count = 0
 
 
+def should_emit_words(words: list[dict[str, Any]], is_first_chunk: bool) -> bool:
+    """Có gửi batch `words` rỗng đi tiếp không (Issue 5.40).
+
+    Window rỗng chiếm đa số batch khi trang có đoạn im lặng. Gửi đi tốn ba
+    tầng vô ích, và ở phía extension `setWords([])` vẫn dựng lại toàn bộ lịch
+    sử caption — chi phí tỉ lệ với số dòng đã xem.
+
+    Window ĐẦU vẫn gửi dù rỗng: đó là window duy nhất có ý nghĩa cho language
+    detection (FR-8). Muốn biết nguồn tiếng gì thì phải nghe được tiếng, và
+    `languageProbability` của các window rỗng về sau là nhiễu — đo được
+    0.2577, tức "không chắc" chứ không phải "tiếng Anh".
+    """
+    return bool(words) or is_first_chunk
+
+
 async def transcribe_chunk(
     websocket: WebSocket,
     audio: np.ndarray,
@@ -401,6 +416,9 @@ async def transcribe_chunk(
     # Chia nhóm caption SAU khi dựng xong danh sách từ — hàm thuần, test được.
     assign_caption_groups(words, MAX_WORDS_PER_CAPTION)
 
+    # Window rỗng thì KHÔNG gửi — xem `should_emit_words` (Issue 5.40).
+    if not should_emit_words(words, is_first_chunk):
+        return
 
     # Trả về danh sách từ đã đồng bộ mốc video.
     await websocket.send_json(
