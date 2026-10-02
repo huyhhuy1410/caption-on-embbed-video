@@ -72,7 +72,7 @@ export class TranslationRateLimiter {
   msUntilRoom(now: number = Date.now()): number {
     // ⚠️ Cooldown phải được kiểm TRA TRƯỚC khi xét cửa sổ trượt. Trả sớm "còn
     // chỗ" khi cửa sổ chưa đầy thì bỏ qua cooldown ⇒ `pauseUntil()` trở thành
-    // một dòng code chết và đường khác vẫn đốt quota. Đã xảy ra (Issue 5.16).
+    // một dòng code chết và đường khác vẫn đốt quota. Đã xảy ra.
     const byCooldown = Math.max(0, this.cooldownUntil - now);
     if (byCooldown > 0) return byCooldown;
 

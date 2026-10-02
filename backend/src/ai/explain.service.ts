@@ -13,7 +13,7 @@ export interface ExplainInput {
 // ⚠️ KHÔNG chạm TranslationRateLimiter ở đây — quota là việc của TẦNG GỌI
 // (ExplainController), đúng như TranslateController giữ việc đó cho translate.
 // Ghi ở tầng service là chỗ dễ đếm trùng, xem chú thích trong
-// translation-rate-limiter.service.ts (Issue 5.16).
+// translation-rate-limiter.service.ts.
 @Injectable()
 export class ExplainService {
   constructor(

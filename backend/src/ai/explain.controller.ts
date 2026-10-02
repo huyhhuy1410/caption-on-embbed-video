@@ -21,7 +21,7 @@ export class ExplainController {
   async explainWord(@Body() body: ExplainWordDto) {
     // ⚠️ Endpoint này dùng CHUNG Gemini instance (và CHUNG quota 15 req/phút) với
     // /translate và đường caption, nên phải đi qua cùng bộ đếm — xem
-    // TranslationRateLimiter (Issue 5.16). Ghi ở TẦNG GỌI, không ở ExplainService,
+    // TranslationRateLimiter. Ghi ở TẦNG GỌI, không ở ExplainService,
     // để không đếm trùng. Hết chỗ thì trả 429 ngay (HTTP, client tự thử lại),
     // không xếp hàng chờ.
     const waitMs = this.rateLimiter.tryAcquire();
@@ -44,7 +44,7 @@ export class ExplainController {
       if (error instanceof ProviderUnavailableError) {
         if (!error.retryable) {
           // Hết quota ⇒ trạng thái của CẢ PROJECT. Đẩy cooldown vào bộ đếm
-          // dùng chung để /translate và đường caption cũng dừng theo (Issue 5.16).
+          // dùng chung để /translate và đường caption cũng dừng theo.
           this.rateLimiter.pauseUntil(Date.now() + error.retryAfterMs);
           throw new HttpException(
             {

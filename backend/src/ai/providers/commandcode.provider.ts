@@ -38,7 +38,7 @@ const RETRYABLE_STATUS = new Set([503]);
  *
  * ⚠️ KHÔNG retry ở bất kỳ đâu — xem `ProviderUnavailableError`. Hết quota là
  * trạng thái của CẢ PROJECT trong cửa sổ một phút, thử lại trong cùng phút chỉ
- * tổ đốt thêm quota mà chắc chắn vẫn 429 (Issue 5.12).
+ * chỉ đốt thêm quota mà chắc chắn vẫn 429.
  */
 const QUOTA_STATUS = 429;
 
@@ -49,7 +49,7 @@ const MAX_RETRY_DELAY_MS = 8_000;
  *
  * ⚠️ Không có con số này thì 429 rơi về `retryAfterMs = 0` ⇒
  * `pauseUntil(now + 0)` là no-op ⇒ hàng đợi thử lại ngay lập tức ⇒ đốt quota
- * liên tục. Đó đúng là cái bão request đã xảy ra ở Issue 5.12. Quota của hệ
+ * liên tục. Quota của hệ
  * thống này tính theo CỬA SỔ MỘT PHÚT (`TRANSLATE_WINDOW_MS`), nên phải chờ
  * hết cửa sổ là lựa chọn thận trọng đúng bản chất quota.
  */
@@ -82,14 +82,14 @@ export function retryDelayMs(attempt: number): number {
  * an toàn — xem `QUOTA_FALLBACK_DELAY_MS`.
  */
 export function serverRetryDelayMs(body: string, headers?: Headers): number {
-  // 1. Body: {"retryDelay":"31s"} (kiểu Gemini) hoặc {"retry_after": 31}
+  // Body: {"retryDelay":"31s"} (kiểu Gemini) hoặc {"retry_after": 31}
   const delayField =
     /"(?:retryDelay|retry_after|retryDelayMs)"\s*:\s*"?(\d+(?:\.\d+)?)"?/.exec(
       body,
     );
   if (delayField) return Number(delayField[1]) * 1000;
 
-  // 2. Header chuẩn HTTP: số giây, hoặc ngày HTTP tuyệt đối.
+  // Header chuẩn HTTP: số giây, hoặc ngày HTTP tuyệt đối.
   const header = headers?.get('retry-after');
   if (header) {
     const seconds = Number(header);
@@ -99,7 +99,7 @@ export function serverRetryDelayMs(body: string, headers?: Headers): number {
     if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
   }
 
-  // 3. Không có gợi ý nào ⇒ chờ hết cửa sổ quota một phút.
+  // Không có gợi ý nào ⇒ chờ hết cửa sổ quota một phút.
   return QUOTA_FALLBACK_DELAY_MS;
 }
 

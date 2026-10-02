@@ -18,7 +18,7 @@ type ProviderName = (typeof PROVIDER_NAMES)[number];
 /**
  * Chọn provider AI theo môi trường.
  *
- * Provider MẶC ĐỊNH là `commandcode` (Parker chọn 2026-09-28). `gemini` vẫn
+ * Provider mặc định là `commandcode`; `gemini` vẫn
  * còn nguyên để quay lui: đổi `AI_PROVIDER=gemini` là chạy lại đúng đường cũ.
  *
  * ⚠️ Phải fallback chứ không để provider ném lỗi ở đây: constructor của chúng

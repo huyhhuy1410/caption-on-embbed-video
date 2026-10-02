@@ -21,7 +21,7 @@ export class TranslateController {
     // ⚠️ Endpoint này dùng CHUNG trần quota với đường caption (WebSocket), nên
     // phải hỏi bộ đếm dùng chung trước khi gọi provider — xem
     // TranslationRateLimiter. Không kiểm tra ở đây thì một caller HTTP có thể
-    // đẩy tổng số request vượt trần mà gateway không hề biết (Issue 5.14).
+    // đẩy tổng số request vượt trần mà gateway không hề biết.
     //
     // Trả 429 ngay thay vì xếp hàng chờ: đây là HTTP, client tự quyết định thử
     // lại; giữ connection treo tới 60s thì tệ hơn nhiều.

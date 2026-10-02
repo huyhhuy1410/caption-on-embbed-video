@@ -164,11 +164,9 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
     to: string,
     from: string,
   ): Promise<Translation> {
-    // 1. Build a prompt: "translate this English sentence to Vietnamese... only JSON"
-    const prompt = `Translate the following ${from} sentence to ${to} and return only the translation, nothing else.
+        const prompt = `Translate the following ${from} sentence to ${to} and return only the translation, nothing else.
     Sentence: ${sentence}`;
-    // 2. Call this.callGemini<GeminiTranslateResult>(prompt, { type:'object', ... })
-    const result = await this.callGemini<GeminiTranslateResult>(prompt, {
+        const result = await this.callGemini<GeminiTranslateResult>(prompt, {
       type: 'object',
       properties: {
         translation: { type: 'string' },
@@ -176,8 +174,7 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
       required: ['translation'],
     });
 
-    // 3. Return { text: result.translation, from, to }
-    return { text: result.translation, from, to };
+        return { text: result.translation, from, to };
   }
 
   /**
