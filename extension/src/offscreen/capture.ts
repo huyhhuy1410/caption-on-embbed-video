@@ -1,4 +1,4 @@
-// Biến lưu mốc thời gian video.currentTime mới nhất được gửi từ Content script qua Service worker
+// Mốc video.currentTime mới nhất, gửi từ content script qua service worker.
 let videoTimeAtCapture = 0;
 
 /**
@@ -11,11 +11,8 @@ let videoTimeAtCapture = 0;
 let activeSourceId: string | null = null;
 
 /**
- * Tài nguyên của phiên capture, giữ ở module scope để còn TẮT được.
- *
- * ⚠️ Trước đây các biến này nằm trong `captureTabAudio` nên không có đường
- * teardown: tắt caption là socket, AudioContext, `setInterval` RMS và media
- * track đều sống tiếp cho tới khi reload extension.
+ * Module scope để `stopTabAudio()` gọi được; nằm trong `captureTabAudio` thì
+ * không có đường teardown, và tắt caption sẽ bỏ lại socket/AudioContext/track.
  */
 let backendWebSocket: WebSocket | undefined;
 let audioContext: AudioContext | undefined;
@@ -23,17 +20,14 @@ let capturedStream: MediaStream | undefined;
 let audioSource: MediaStreamAudioSourceNode | undefined;
 let rmsIntervalId: ReturnType<typeof setInterval> | undefined;
 
-// === BƯỚC 1: Lắng nghe tin nhắn từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
-  // 1.1. Lắng nghe lệnh khởi tạo thu âm Tab Audio từ Service Worker
   if (message?.type === "start-audio-capture") {
     void captureTabAudio(message.streamId);
   }
-  // 1.2. Dọn sạch khi user tắt caption
   if (message?.type === "stop-audio-capture") {
     void stopTabAudio();
   }
-  // 1.3. Lắng nghe mốc thời gian video.currentTime cập nhật từ Content script
+  // Mốc video.currentTime mới nhất từ content script.
   // Chỉ lưu mốc video mới nhất, không relay ngược lại.
   if (message?.type === "video-clock") {
     videoTimeAtCapture = message.videoTime;
@@ -98,12 +92,11 @@ async function stopTabAudio(): Promise<void> {
   activeSourceId = null;
 }
 
-// === BƯỚC 2: Hàm thực hiện Thu âm Tab và Truyền dữ liệu qua WebSocket ===
 async function captureTabAudio(streamId: string) {
   // Bật lại khi phiên cũ chưa dọn (hiếm) ⇒ dọn trước, tránh hai socket cùng sống.
   await stopTabAudio();
 
-  // 2.1. Lấy luồng âm thanh MediaStream của Tab trình duyệt từ streamId
+  // Lấy luồng âm thanh của tab từ streamId.
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       mandatory: {
@@ -120,14 +113,13 @@ async function captureTabAudio(streamId: string) {
     console.warn("Caption AI offscreen: tab audio track ended by browser/user");
   });
 
-  // 2.2. Khởi tạo AudioContext với tần số lấy mẫu chuẩn 16,000 Hz
   const context = new AudioContext({
     sampleRate: 16000,
   });
   audioContext = context;
   console.info("Sample rate:", context.sampleRate);
 
-  // 2.3. Khởi tạo kết nối WebSocket tới Backend NestJS (Cổng 8000)
+  // WebSocket tới backend (cổng 8000).
   const socket = new WebSocket("ws://127.0.0.1:8000");
   backendWebSocket = socket;
 
@@ -145,7 +137,7 @@ async function captureTabAudio(streamId: string) {
     );
   });
 
-  // 2.4. Lắng nghe kết quả Subtitle trả về từ Backend NestJS
+  // Kết quả trả về từ backend.
   socket.addEventListener("message", (event) => {
     console.info("Words from backend:", event.data);
     try {
@@ -168,7 +160,6 @@ async function captureTabAudio(streamId: string) {
     }
   });
 
-  // 2.5. Nạp module AudioWorklet xử lý PCM nhị phân
   await context.audioWorklet.addModule(
     chrome.runtime.getURL("dist/recorder-worklet.js"),
   );
@@ -178,7 +169,6 @@ async function captureTabAudio(streamId: string) {
   let chunkCount = 0;
   let sequence = 0;
 
-  // 2.6. Lắng nghe từng gói mẫu sóng âm Float32 từ AudioWorklet
   worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
     // Ép dải số thực [-1.0, 1.0] sang số nguyên PCM 16-bit
     for (const sample of event.data) {
@@ -193,8 +183,7 @@ async function captureTabAudio(streamId: string) {
 
       if (socket.readyState === WebSocket.OPEN) {
         sequence++;
-        // 2.7. Gửi gói tin METADATA JSON trước
-        socket.send(
+              socket.send(
           JSON.stringify({
             type: "audio",
             seq: sequence,
@@ -208,21 +197,19 @@ async function captureTabAudio(streamId: string) {
           }),
         );
 
-        // 2.8. Gửi gói tin PCM AUDIO BINARY ngay sau đó
-        socket.send(chunk.buffer);
+              socket.send(chunk.buffer);
         console.info("Sent PCM chunk:", chunkCount);
       }
     }
   };
 
-  // 2.9. Nối luồng âm thanh từ Tab vào AudioWorklet và đầu ra Loa
   const source = context.createMediaStreamSource(stream);
   audioSource = source;
   source.connect(worklet);
   // Audio phải được route lại ra loa, nếu không user mất tiếng khi capture.
   source.connect(context.destination);
 
-  // 2.10. Giám sát mức âm lượng (RMS) để kiểm tra luồng thu âm có âm thanh hay không
+  // Đo RMS để phát hiện luồng thu âm câm.
   const analyser = context.createAnalyser();
   source.connect(analyser);
   const data = new Uint8Array(analyser.fftSize);

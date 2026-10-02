@@ -3,10 +3,9 @@ let capturedTabId: number | undefined;
 console.info("Caption AI: service worker loaded");
 
 /**
- * Trạng thái phiên phải nằm trong `chrome.storage.session`, không phải biến
- * in-memory: MV3 giết service worker sau ~30s idle, biến mất theo. Khi đó
- * `capturedTabId` về `undefined` và lần bấm sau sẽ BẬT capture thứ hai thay vì
- * tắt — đúng cái bug mà storage tránh được.
+ * MV3 giết service worker sau ~30s idle, nên state phiên phải nằm trong
+ * `chrome.storage.session`: giữ trong biến thì `capturedTabId` mất và lần bấm
+ * sau BẬT capture thứ hai thay vì tắt.
  */
 const SESSION_KEY = "captionSession";
 type CaptionSession = { tabId: number };
@@ -24,7 +23,6 @@ async function readSession(): Promise<CaptionSession | undefined> {
   return undefined;
 }
 
-// === BƯỚC 1: Icon toolbar là công tắc — bật nếu chưa chạy, tắt nếu đang chạy ===
 // Chrome chỉ cấp `activeTab` khi user bấm icon, nên đây là gesture surface duy
 // nhất để bật; và cũng là chỗ tự nhiên nhất để tắt.
 chrome.action.onClicked.addListener((tab) => {
@@ -43,7 +41,6 @@ chrome.action.onClicked.addListener((tab) => {
   });
 });
 
-// === BƯỚC 2: Lắng nghe tin nhắn từ Content Script hoặc các trang nội bộ ===
 // Side panel MỞ bằng click chuột phải lên icon, KHÔNG dùng
 // `openPanelOnActionClick`: click trái đã là công tắc bật/tắt capture (và là
 // gesture duy nhất cấp `activeTab` — xem gotcha #3), bật option đó thì Chrome
@@ -70,7 +67,6 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((message) => {
-  // 2.1. Nhận mốc video.currentTime và chuyển tiếp (relay) sang cho Offscreen Document
   if (message?.type === "video-clock") {
     void chrome.runtime
       .sendMessage({
@@ -107,7 +103,7 @@ chrome.runtime.onMessage.addListener((message) => {
       });
   }
 
-  // 2.3. Chuyển tiếp lời gọi "giải nghĩa từ" từ content script sang side panel.
+  // Chuyển tiếp lời gọi "giải nghĩa từ" từ content script sang side panel.
   // ⚠️ Chỉ relay TÍN HIỆU (ai cần giải nghĩa từ nào) — bản thân lời gọi
   // `POST /explain-word` do side panel tự đi, vì nó là extension page đã có
   // `host_permissions` tới 127.0.0.1:8000. Không để SW gọi thay: SW bị giết
@@ -125,7 +121,7 @@ chrome.runtime.onMessage.addListener((message) => {
       });
   }
 
-  // 2.2. Chuyển tiếp kết quả từ backend xuống content script của tab đang capture.
+  // Chuyển tiếp kết quả từ backend xuống content script của tab đang capture.
   // ⚠️ Phải chuyển NGUYÊN message, không dựng lại object `{type, words}` như
   // trước — cách đó làm rơi mọi field khác mà backend gửi kèm.
   if (
@@ -146,9 +142,7 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
-// === BƯỚC 3: Hàm thực hiện lấy Stream ID của Tab và kích hoạt Offscreen ===
 async function startCapture(tabId: number): Promise<void> {
-  // 3.1. Bọc API Callback chrome.tabCapture thành Promise để await lấy streamId
   const streamId = await new Promise<string>((resolve, reject) => {
     chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
       const error = chrome.runtime.lastError;
@@ -165,11 +159,9 @@ async function startCapture(tabId: number): Promise<void> {
     streamId,
   });
 
-  // 3.2. Đảm bảo Offscreen Document đã được khởi tạo
   await ensureOffscreenDocument();
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
 
-  // 3.3. Gửi tin nhắn chứa streamId cho Offscreen Document bắt đầu ghi âm
   console.info("Caption AI SW: dispatching start-audio-capture to offscreen");
   chrome.runtime.sendMessage({
     type: "start-audio-capture",
@@ -210,7 +202,6 @@ async function stopCapture(tabId: number): Promise<void> {
     });
 }
 
-// === BƯỚC 4: Khởi tạo Offscreen Document (tài liệu chạy ẩn) ===
 async function ensureOffscreenDocument() {
   const contexts = await chrome.runtime.getContexts({});
   const exists = contexts.some(

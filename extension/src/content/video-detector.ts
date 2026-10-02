@@ -13,15 +13,9 @@ const fullscreen = new CaptionFullscreen();
 let userPickedVideo: HTMLVideoElement | null = null;
 
 const picker = new VideoPicker(overlay.element, (video) => {
-  // ⚠️ Cố ý KHÔNG toggle: bấm lại đúng video đã ghim thì giữ nguyên.
-  //
-  // Đã thử làm toggle (bấm lần 2 để bỏ ghim) và nó **không có tác dụng gì**:
-  // heuristic ưu tiên "video đang phát" nên bỏ ghim xong `reconcile()` chọn lại
-  // đúng video vừa bỏ ⇒ `activeVideo` không đổi, overlay không dọn, caption
-  // đứng y ở đó (Issue 5.27). Nút "bỏ ghim" mà không đổi được gì thì tệ hơn
-  // là không có nút.
-  //
-  // Đổi sang video khác vẫn bấm bình thường, nên đường thoát vẫn còn.
+  // Cố ý không toggle: `reconcile()` ưu tiên "video đang phát" nên bỏ ghim xong
+  // nó chọn lại đúng video vừa bỏ, khiến thao tác không đổi được gì. Đổi sang
+  // video khác vẫn bấm bình thường nên đường thoát vẫn còn.
   userPickedVideo = video;
   reconcile();
 });
@@ -122,7 +116,6 @@ function hideOverlayIfNowhereToShow(): void {
   }
 }
 
-// === BƯỚC 1: Lắng nghe tín hiệu kích hoạt caption từ Service Worker ===
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "capturing") {
     captionEnabled = true;
@@ -180,8 +173,8 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
-// === BƯỚC 2: Bắt sự kiện media qua Event Delegation (Capture phase) ===
-// 2.1. Đồng bộ tiến trình video (currentTime) sang Service Worker
+// Media event qua event delegation (capture phase).
+// Đồng bộ tiến trình video sang Service Worker.
 document.addEventListener(
   "timeupdate",
   (e) => {
@@ -201,7 +194,7 @@ document.addEventListener(
   { capture: true },
 );
 
-// 2.2. Gửi tín hiệu tua (seek) để backend reset bộ đệm audio/caption
+// Báo backend tua để nó reset bộ đệm audio/caption.
 document.addEventListener(
   "seeked",
   (e) => {
@@ -218,13 +211,9 @@ document.addEventListener(
 
     // Hỏi lại cache của backend cho vùng vừa tua tới (FR-7.2, FR-7.5).
     //
-    // ⚠️ Lời gọi này từng bị xoá ở `aa5eca4` khi viết lại handler `seeked` cho
-    // rAF, và việc xoá đó KHÔNG lộ ra khi test: overlay tích luỹ `words` trong
-    // RAM, nên tua về vùng ĐÃ XEM thì chữ vẫn hiện ngay — trông y hệt replay
-    // thật. Nhưng sau `overlay.clear()` (đổi video, SPA đổi route) thì cache
-    // backend là nguồn duy nhất còn dữ liệu; không có message này, cả chuỗi
-    // SW → offscreen → backend không bao giờ chạy, và nhánh `type === 'seek'`
-    // trong `audio.gateway.ts` thành code không tới được (Issue 5.19).
+    // Lời gọi này là thứ duy nhất kích hoạt replay từ cache backend. Sau
+    // `overlay.clear()` (đổi video, SPA đổi route) thì cache backend là nguồn
+    // duy nhất còn dữ liệu, nên đừng "dọn" nó đi khi refactor.
     const message = {
       type: "seek",
       seekTimeAtCapture: activeVideo.currentTime,
@@ -288,7 +277,6 @@ document.addEventListener(
   { capture: true },
 );
 
-// === BƯỚC 3: Xác định activeVideo theo thứ tự ưu tiên ===
 // Lưu ý: querySelectorAll("video") không tìm được video nằm trong Shadow DOM.
 // Tạm chấp nhận cho phạm vi MVP, cần xử lý đệ quy shadowRoot (open) ở phiên bản sau.
 
@@ -336,7 +324,7 @@ function reconcile() {
   const videos = Array.from(document.querySelectorAll("video"));
   let nextVideo: HTMLVideoElement | null = null;
 
-  // 0. User chỉ định qua picker thì thắng — đây là ý nghĩa của FR-1.3
+  // User chỉ định qua picker thì thắng heuristic.
   // ("the user can pick which one"). Chỉ dùng khi video đó vẫn còn trong DOM;
   // SPA gỡ đi thì rơi về heuristic bên dưới thay vì treo picker ở video ma.
   const picked =
@@ -409,11 +397,8 @@ function reconcile() {
   }
 }
 
-// === BƯỚC 4: Kích hoạt reconcile theo vòng đời DOM và sự kiện phát ===
-// 4.1. Quét video khi khởi động script
 reconcile();
 
-// 4.2. Chuyển activeVideo ngay khi có video bắt đầu phát
 document.addEventListener(
   "play",
   (e) => {
@@ -439,7 +424,6 @@ window.addEventListener("resize", () => {
   hideOverlayIfNowhereToShow();
   repositionOverlay();
 }, { passive: true });
-// 4.3. Theo dõi DOM để cập nhật khi có video được thêm/xoá
 function hasPossibleVideoNode(node: Node): boolean {
   return (
     node.nodeType === Node.ELEMENT_NODE &&

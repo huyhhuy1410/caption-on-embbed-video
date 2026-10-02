@@ -7,111 +7,65 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 
-# === BƯỚC 1: Cấu hình hằng số cho Xử lý Bộ đệm Cửa sổ trượt (Sliding Window Buffering) ===
 SAMPLE_RATE = 16000                     # Tần số lấy mẫu âm thanh: 16,000 Hz (16k mẫu/giây)
 
 # Cửa sổ nhận diện: 3 giây (48,000 samples).
 #
-# ⚠️ ĐÃ HẠ 6s → 4s → 3s (2026-09-28/29). Mọi con số do ĐO (`analyze_latency.py`),
-# không suy ra. Công thức đã kiểm chứng qua 3 cấu hình độc lập:
-#     độ trễ = WINDOW_SIZE + thời gian chờ whisper
-# **Không có phần `OVERLAP_SIZE` nào trong công thức** — tăng overlap không
-# giảm độ trễ, chỉ làm whisper gọi thường xuyên hơn. Muốn nhanh thì chỉ có
-# đường hạ `WINDOW_SIZE` này. Xem Issue 5.29.
+# Độ trễ = `WINDOW_SIZE` + thời gian chờ whisper. KHÔNG có số hạng `OVERLAP_SIZE`
+# trong công thức: tăng overlap chỉ làm whisper gọi thường xuyên hơn, không làm
+# chữ hiện sớm hơn. Muốn giảm độ trễ thì chỉ hạ `WINDOW_SIZE`.
 #
-#   WINDOW | lag đo | whisper | WINDOW + whisper
-#      6s  | 6.87s  | 0.87s   | 6.87 ✓
-#      4s  | 4.83s  | 0.83s   | 4.83 ✓
+# Nhịp xuất hiện không phải `WINDOW - OVERLAP` mà là bản làm tròn lên theo chunk
+# 1 giây: `ceil((WINDOW - OVERLAP) / 1s) * 1s`.
 #
-# ⚠️ VÌ SAO 3s, không dừng ở 4s: ở 4s, một câu ngắn 2 giây nói xong rồi phụ
-# đề mới tới — người đọc mất dòng (Parker, 2026-09-29). Con số 4.83s **nằm
-# trong dải spec 5–12s**, nhưng dải đó nói về thời gian chứ không nói về việc
-# có đọc kịt hay không. Ở đây không kịt ⇒ phải hạ tiếp.
-#
-# ⚠️ Nhịp xuất hiện đo được KHÔNG phải `WINDOW - OVERLAP`, mà là
-# `ceil((WINDOW - OVERLAP) / CHUNK_SECONDS) * CHUNK_SECONDS` — audio đến theo
-# chunk 1s nên phải làm tròn lên. Đo: 4.5s→5.0s, 2.5s→3.0s, 1.5s→2.0s.
-# Suy ra bằng công thức thiếu bước làm tròn là sai (gotcha #50).
-#
-# ⚠️ Ràng buộc bất biến, cả ba đều phải giữ (kiểm tra ở `test_window_size.py`):
-#   - `> OVERLAP_SIZE` (1.5s): sau lượt này bộ đệm còn `[-OVERLAP_SIZE:]` và
-#     `compute_video_time` trừ đúng bằng độ dài gối đó. Nhỏ hơn thì phép trừ sai.
-#   - `> CATCHUP_WINDOW_SIZE` (2s): nếu bằng thì window "bắt kịp" mất tác dụng.
-#   - `≥ 2 × OVERLAP_SIZE`: dưới ngưỡng này phần overlap chiếm quá nhiều tỉ lệ,
-#     hai lượt liên tiếp trùng lặp nhiều mà không thu được ngữ cảnh nào mới.
-#     2.5s sẽ vi phạm (2.5 < 3) nên đó là sàn cứng của kiến trúc hiện tại.
+# Các bất biến của `WINDOW_SIZE` do `test_window_size.py` chốt.
 WINDOW_SIZE = 3 * SAMPLE_RATE
 
 OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giây = 24,000 samples
 
-# Window "bắt kịp" cho lượt transcribe ĐẦU TIÊN sau reset/đầu stream (Issue 5.22).
+# Window "bắt kịp" cho lượt transcribe ĐẦU TIÊN sau reset/đầu stream: video vẫn
+# chạy trong lúc ASR xử lý, nên window đầu đòi đủ `WINDOW_SIZE` thì caption chỉ
+# hiện sau khi video đã đi qua ngần đó.
 #
-# ⚠️ Video vẫn chạy realtime trong lúc ASR xử lý, nên nếu window đầu cũng đòi
-# đủ 6s thì caption chỉ xuất hiện khi video đã đi qua ~6s — đúng cái khoảng
-# trống thấy được ngay sau khi tua. Window nhỏ cho caption xuất hiện sớm hơn.
-#
-# ⚠️ Phải nằm TRONG khoảng `(OVERLAP_SIZE, WINDOW_SIZE)`:
-#   - `> OVERLAP_SIZE`: bộ đệm giữ lại `[-OVERLAP_SIZE:]` làm gối đầu; nếu
-#     window bằng hoặc nhỏ hơn thì phần giữ lại chính là trọn window đã
-#     transcribe, phép trừ của `compute_video_time` mất nghĩa ⇒ timestamp lệch.
-#   - `< WINDOW_SIZE`: bằng thì window "bắt kịp" không nhỏ hơn window thường
-#     nên không mua được gì, chỉ mất ngữ cảnh cho whisper.
-# 2s là giá trị lớn nhất mà vẫn nằm trong khoảng (1.5s, 3s).
+# Phải lớn hơn `OVERLAP_SIZE`: sau lượt này bộ đệm còn `[-OVERLAP_SIZE:]` làm gối
+# đầu, nên `compute_video_time` trừ đúng bằng độ dài đó. Bằng hoặc nhỏ hơn thì
+# phần giữ lại chính là trọn window đã transcribe và phép trừ mất nghĩa.
 CATCHUP_WINDOW_SIZE = 2 * SAMPLE_RATE
 
 # ⚠️ Watchdog: phải lớn hơn `WINDOW_SIZE`, nếu không thì nó cắt bộ đệm đúng lúc
 # window đang chờ đủ dữ liệu ⇒ transcribe lại cả đoạn, liên tục không ngừng.
 MAX_BUFFER_SIZE = 12 * SAMPLE_RATE     # Giới hạn bộ đệm tối đa 12 giây (Watchdog chống tràn RAM)
-# Số từ tối đa trước khi bắt đầu nhóm caption mới.
+# Số từ tối đa trong một nhóm caption trước khi buộc mở nhóm mới.
 #
-# ⚠️ ĐÃ TĂNG 8 → 16 (2026-09-29, Issue 5.31). Nghi phạm của triệu chứng "câu dài
-# bị cụt đầu" (Parker, 2026-09-29).
-#
-# ⚠️ VÌ SAO 8 LÀM CỤT ĐẦU — và vì sao đó là lỗi của TAY SỬA này, không phải của
-# window: `caption_start` reset khi đủ `MAX_WORDS_PER_CAPTION` **hoặc** gặp dấu
-# câu. Cắt ở dấu câu là đúng. Nhưng cắt ở ngưỡng số từ thì **cắt giữa một câu**:
-# nhóm trước mang nửa đầu câu, nhóm sau mang nửa cuối. Style A chỉ hiện MỘT
-# nhóm (FR-4.1) ⇒ nửa cuối hiện lên mà không có đầu ⇒ **cụt đầu**. Đây là lỗi
-# tương tác giữa ngưỡng số từ và kiểu hiển thị, không phải lỗi của ASR.
-#
-# ⚠️ `MAX_WORDS_PER_CAPTION` chỉ là TRẦN an toàn, không phải cách chia câu bình
-# thường: `tiny` hay trả segment kết thúc bằng dấu câu, nên nhánh `text.endswith`
-# chạy trước con số này hầu hết thời gian. Tăng lên 16 để câu dài có cơ hội
-# đi tới dấu câu thay vì bị cắt bởi số từ.
-#
-# ⚠️ Đánh đổi: nhóm dài hơn ⇒ dòng caption cao hơn ⇒ che nhiều video hơn. Đó là
-# lý do cần Style B (giữ N câu) thay vì chỉ tăng mãi con số này — xem
-# `docs/plan.md` M7.5.
+# Đây là TRẦN an toàn, không phải cách chia câu bình thường: `tiny` thường trả
+# segment kết thúc bằng dấu câu nên nhánh `text.endswith` thắng hầu hết thời
+# gian. Cắt theo số từ sẽ cắt giữa câu, nên trần phải rộng để câu dài có cơ hội
+# đi tới dấu câu.
 MAX_WORDS_PER_CAPTION = 16
 
-# Khai báo biến toàn cục lưu trữ mô hình Whisper AI
 model: WhisperModel | None = None
 
 
-# === BƯỚC 2: Quản lý Vòng đời Ứng dụng (FastAPI Lifespan) ===
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global model
-    # Nạp mô hình Whisper AI "tiny" vào RAM khi Server vừa khởi động
+    # Nạp model một lần lúc khởi động.
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
     yield
-    # Giải phóng mô hình khi Server đóng
     model = None
 
 
 app = FastAPI(title="Caption AI Sidecar", lifespan=lifespan)
 
 
-# === BƯỚC 3: Endpoint Health Check ===
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "caption-ai-sidecar"}
 
 
-# === BƯỚC 4: Endpoint WebSocket Nhận Luồng Audio & Trả Phụ Đề Real-time ===
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    # 4.1. Bộ đệm âm thanh tích lũy các chunk từ Extension gửi sang
+    # Bộ đệm âm thanh tích luỹ các chunk từ extension.
     audio_buffer = np.array([], dtype=np.float32)
     
     await websocket.accept()
@@ -127,20 +81,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         while True:
             message = await websocket.receive()
 
-            # 4.2. Xử lý Gói tin Text (Metadata JSON từ Extension)
+            # Metadata JSON từ extension.
             if message.get("text") is not None:
                 pending_metadata = parse_metadata(message["text"])
 
                 # Lệnh reset từ backend: user vừa tua (Issue 5.21).
                 #
-                # ⚠️ Bộ đệm đang giữ tới 6s tiếng của đoạn TRƯỚC khi tua, còn
+                # Bộ đệm đang giữ audio của đoạn TRƯỚC khi tua, còn
                 # `window_anchor` thì sắp bị ghim bằng mốc của đoạn SAU khi tua.
                 # Để nguyên thì window kế tiếp là [tiếng cũ] + [tiếng mới] nhưng
                 # bị dán mốc mới ⇒ phụ đề đúng ngay lúc tua rồi lệch ở đoạn ngay
                 # sau, và tự khỏi sau đúng một chu kỳ.
                 #
                 # `is_first_chunk = True` vì bộ đệm rỗng nghĩa là window kế tiếp
-                # bắt đầu ĐÚNG tại anchor, không còn 1.5s gối đầu để trừ đi.
+                # bắt đầu ĐÚNG tại anchor, không còn gối đầu để trừ đi.
                 if is_reset_command(pending_metadata):
                     audio_buffer = np.array([], dtype=np.float32)
                     window_anchor = None
@@ -151,7 +105,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
                 # Backend báo ĐỔI NGUỒN: activeVideo đổi sang video khác
                 # (Issue 5.20 / FR-1.3). Giữ nguyên bộ đệm ở đây là lỗi: nó còn
-                # tới 6s tiếng của video CŨ, sẽ bị dán mốc thời gian của video MỚI
+                # audio của video CŨ, sẽ bị dán mốc thời gian của video MỚI
                 # ⇒ nội dung video cũ hiện lên video mới, đúng triệu chứng đã gặp.
                 #
                 # Xoá y hệt nhánh reset vì đây cùng là "dữ liệu cũ sống sót qua
@@ -189,12 +143,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     is_first_chunk = True
                     continue
 
-                # Ghim metadata của chunk đầu tiên làm Anchor cho Window 6s này
+                # Ghim metadata của chunk đầu tiên làm Anchor cho window này
                 if window_anchor is None:
                     window_anchor = pending_metadata
                 continue
 
-            # 4.3. Xử lý Gói tin Binary (Audio PCM Bytes)
+            # Audio PCM nhị phân.
             audio_bytes = message.get("bytes")
             if audio_bytes is None:
                 continue
@@ -203,16 +157,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "error", "message": "Model is not loaded"})
                 continue
 
-            # 4.4. Đổi audio bytes nhị phân sang mảng Float32 và nối vào bộ đệm
             chunk_audio = bytes_to_float32(audio_bytes)
             audio_buffer = np.concatenate((audio_buffer, chunk_audio))
             
-            # 4.5. Watchdog Protection: Nếu bộ đệm bị dồn quá 12s, cắt bỏ dữ liệu cũ bị trễ
+            # Watchdog: cắt dữ liệu cũ nếu bộ đệm dồn quá MAX_BUFFER_SIZE.
             if len(audio_buffer) > MAX_BUFFER_SIZE:
                 audio_buffer = audio_buffer[-OVERLAP_SIZE:]
                 print("Watchdog: dropped stale audio", flush=True)
 
-            # 4.6. Đủ audio cho một window -> Chạy Whisper AI
+            # Đủ audio cho một window thì chạy Whisper.
             #
             # ⚠️ Cỡ window KHÔNG cố định: lượt đầu sau reset dùng window nhỏ
             # để bắt kịp — xem `resolve_window_size` (Issue 5.22).
@@ -257,7 +210,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
 
-# === Helper: Ghi log độ trễ để đo thật (2026-09-28) ===
+# === Helper: Ghi log độ trễ để đo thật ===
 def log_latency(
     anchor: dict[str, Any] | None,
     window_size: int,
@@ -332,7 +285,7 @@ def resolve_window_size(is_first_chunk: bool) -> int:
 
     `is_first_chunk=True` nghĩa là bộ đệm bắt đầu ĐÚNG tại anchor (không có gì
     để trừ 1.5s) — đúng hai thời điểm user đang chờ caption xuất hiện: đầu
-    stream, và ngay sau khi tua. Chờ đủ 6s ở đó tạo khoảng trống nhìn thấy được
+    stream, và ngay sau khi tua. Chờ đủ window ở đó tạo khoảng trống nhìn thấy được
     (Issue 5.22).
 
     Tách thành hàm thuần theo bài học Issue 4.20 — nhánh này nằm trong vòng lặp
@@ -353,14 +306,12 @@ def compute_video_time(raw_video_time: float, word_time: float, is_first_chunk: 
     overlap_sec = 0.0 if is_first_chunk else OVERLAP_SIZE / SAMPLE_RATE
     return round(raw_video_time - overlap_sec + word_time, 2)
 
-# === BƯỚC 5: Helper Chuyển đổi Bytes PCM16 -> NumPy Float32 (-1.0 đến 1.0) ===
 def bytes_to_float32(audio_bytes: bytes) -> np.ndarray:
     samples = array("h")  # "h" đại diện cho signed short 16-bit
     samples.frombytes(audio_bytes)
     return np.asarray(samples, dtype=np.float32) / 32768.0
 
 
-# === BƯỚC 6: Helper Parse JSON Metadata ===
 def parse_metadata(raw_message: str) -> dict[str, Any] | None:
     import json
 
@@ -378,11 +329,11 @@ def assign_caption_groups(words: list[dict[str, Any]], max_words: int) -> None:
 
     ⚠️ Tách thành hàm thuần theo bài học Issue 4.20: logic nằm trong hai vòng
     lặp lồng nhau của `transcribe_chunk` thì không test được, mà đây lại là
-    nhánh quyết định câu nào bị Style A cắt.
+    nhánh quyết định chỗ nào bị cắt giữa câu.
 
     ⚠️ `captionStart` của một nhóm là video time của TỪ ĐẦU nhóm đó. Vì vậy nếu
-    nhóm bị cắt giữa chừng (bởi `max_words` chứ không phải dấu câu) thì Style A
-    hiện nửa cuối câu mà không có đầu ⇒ **cụt đầu** (Issue 5.31).
+    nhóm bị cắt giữa chừng (bởi `max_words` chứ không phải dấu câu) sẽ tách câu
+    thành hai nhóm.
 
     ⚠️ Gán `captionStart` TRƯỚC khi kiểm tra điều kiện reset — từ cuối nhóm vẫn
     phải mang mốc của nhóm đó. Gán sau sẽ làm từ cuối nhận `None`.
@@ -399,7 +350,6 @@ def assign_caption_groups(words: list[dict[str, Any]], max_words: int) -> None:
             count = 0
 
 
-# === BƯỚC 7: Hàm Thực thi Whisper AI & Tính mốc thời gian Video chuẩn ===
 async def transcribe_chunk(
     websocket: WebSocket,
     audio: np.ndarray,
@@ -407,7 +357,7 @@ async def transcribe_chunk(
     is_first_chunk: bool,
     anchor_source_id: str | None = None,
 ) -> None:
-    # 7.1. Chạy Whisper AI nhận dạng giọng nói kèm mốc thời gian từng từ
+    # Nhận dạng kèm mốc thời gian từng từ.
     segments, info = model.transcribe(
         audio,
         beam_size=1,
@@ -415,7 +365,7 @@ async def transcribe_chunk(
         vad_filter=True,
     )
 
-    # 7.2. Lấy mốc thời gian Video tại thời điểm bắt đầu Window (Anchor)
+    # Mốc video tại thời điểm bắt đầu window.
     raw_video_time = metadata.get("videoTimeAtCapture", 0.0) if metadata else 0.0
     # Danh tính nguồn của WINDOW này — dán lên từng từ để backend tách cache.
     # Lấy từ anchor của chính window, không phải metadata chunk cuối: window
@@ -452,7 +402,7 @@ async def transcribe_chunk(
     assign_caption_groups(words, MAX_WORDS_PER_CAPTION)
 
 
-    # 7.3. Trả về kết quả JSON chứa danh sách từ đã đồng bộ mốc thời gian Video
+    # Trả về danh sách từ đã đồng bộ mốc video.
     await websocket.send_json(
         {
             "type": "words",
