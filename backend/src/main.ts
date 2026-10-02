@@ -5,14 +5,12 @@ import { WsAdapter } from '@nestjs/platform-ws';
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule);
-  // Ctrl+C / SIGTERM phải chạy `onModuleDestroy`: SidecarService cần huỷ timer
-  // reconnect trước khi đóng socket, nếu không process dev để lại timer/PID mồ côi.
+  // Không có hook này thì Ctrl+C bỏ qua `onModuleDestroy` và SidecarService
+  // để lại timer reconnect mồ côi.
   app.enableShutdownHooks();
 
-  // Cho phép request từ extension và các origin khác
   app.enableCors();
 
-  // Tự động validate DTO payload và loại bỏ các trường không khai báo
   app.useGlobalPipes(
     new ValidationPipe({
       transform: true,
@@ -21,7 +19,6 @@ async function bootstrap() {
     }),
   );
 
-  // Sử dụng thư viện 'ws' làm adapter WebSocket thay vì socket.io mặc định
   app.useWebSocketAdapter(new WsAdapter(app));
 
   const port = process.env.PORT ?? 8000;

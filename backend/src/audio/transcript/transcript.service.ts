@@ -27,14 +27,6 @@ type Bucket = {
   anchorTime: number;
 };
 
-/**
- * Khoá cache = (nguồn, giây) — `videoStart` là mốc RIÊNG của từng video nên
- * không dùng làm khoá đơn thuần: video B tua tới 0:30 sẽ đè lên bucket của
- * video A đã xem tới 0:30, và replay sau đó trả lời của video A (Issue 5.20).
- *
- * Nguồn rỗng đóng gói thành chuỗi riêng, KHÔNG gộp vào một khoá chung — lý do
- * xem `Word.sourceId`.
- */
 /** Khoảng video-time hai bản của cùng một từ được coi là trùng (giây). */
 const DEDUP_WINDOW_SEC = 0.5;
 
@@ -69,6 +61,12 @@ function normalizeSource(sourceId: string | null | undefined): string | null {
   return sourceId ?? null;
 }
 
+/**
+ * Khoá cache = (nguồn, giây). `videoStart` là mốc RIÊNG của từng video nên không
+ * dùng làm khoá đơn thuần: hai video cùng tua tới 0:30 sẽ đè lên nhau và replay
+ * trả lời của video trước. Nguồn rỗng gói thành chuỗi riêng, không gộp — xem
+ * `Word.sourceId`.
+ */
 function bucketKey(
   sourceId: string | null | undefined,
   videoStart: number,
@@ -105,11 +103,9 @@ export class TranscriptService {
   private static readonly TTL_MS = 30 * 60 * 1000;
   private static readonly MAX_BUCKETS = 300;
 
-  //1. Cấu trúc cache: map<nguồn|giây, list<Word>> — xem `bucketKey`.
   private readonly cache = new Map<string, Bucket>();
 
-  //1b. Cache bản dịch, keyed theo captionStart. Tách map riêng vì vòng đời
-  // khác words: words đến liên tục, bản dịch đến muộn (sau call AI).
+  // Tách map riêng khỏi `cache`: words đến liên tục, bản dịch đến muộn (sau call AI).
   private readonly translations = new Map<string, TranslationBucket>();
   addWords(words: Word[]) {
     if (words.length === 0) return;
@@ -172,12 +168,12 @@ export class TranscriptService {
     );
     this.evict();
   }
-  // 2. Truy xuất danh sách từ trong khoảng [fromSec, toSec] của ĐÚNG nguồn này
-  // (phục vụ tính năng Seek Replay — FR-7.2).
-  //
-  // ⚠️ `sourceId` là tham số BẮT BUỘC về đúng ngữ nghĩa, không phải tuỳ chọn:
-  // không lọc theo nguồn thì `getRange` trả lời của mọi video cùng nằm trong
-  // khoảng giây đó, tức là tua video B về 0:30 sẽ nhận lời của video A (Issue 5.20).
+  /**
+   * Từ trong `[fromSec, toSec]` của ĐÚNG nguồn này.
+   *
+   * `sourceId` bắt buộc: không lọc theo nguồn thì hai video cùng nằm trong một
+   * khoảng giây sẽ trả lẫn lời của nhau.
+   */
   getRange(sourceId: string | null | undefined, fromSec: number, toSec: number) {
     let result: Word[] = [];
     const now = Date.now();
@@ -186,7 +182,6 @@ export class TranscriptService {
         this.cache.delete(key);
       }
     }
-    // 2.1. Lấy tất cả các bucket có khoảng thời gian giao thoa với [fromSec, toSec]
     for (const bucket of this.cache.values()) {
       if (normalizeSource(bucket.words[0]?.sourceId) !== normalizeSource(sourceId)) {
         continue;
@@ -199,30 +194,21 @@ export class TranscriptService {
       }
     }
 
-    // 2.2. Sắp xếp các từ theo thứ tự xuất hiện trên video
     result.sort((a, b) => a.videoStart - b.videoStart);
-
-    // 2.3. Khử trùng lặp (dedup) các từ bị nhận diện lặp giữa các audio window trượt
-    // 2.4. Lọc chính xác các từ nằm trong khoảng cần tìm
     return dedupWords(result).filter(
       (word) => word.videoStart >= fromSec && word.videoStart <= toSec,
     );
   }
 
   /**
-   * Tất cả từ ĐÃ XEM của nguồn này, từ mốc `fromSec` trở đi — dùng cho replay
-   * sau khi tua (FR-7.2, Issue 5.25).
+   * Từ đã xem từ `fromSec` trở đi — dùng cho replay sau khi tua.
    *
-   * ⚠️ Vì sao không dùng `getRange(vid, seekTime, seekTime + 3)`:
-   * cách đó chỉ trả về 3 giây, nên sau 3 giây hệ thống không biết "phía sau đã
-   * xem hết" và rơi về nhịp transcribe 4.5–6s bình thường — đúng triệu chứng
-   * "replay được một đoạn rồi đoạn sau phải chờ". Lượt gọi này trả về TOÀN BỘ
-   * phần đã xem phía sau, nên sau replay phụ đề chạy liền, không phải chờ.
+   * Cố ý không chặn trên: trần TTL/LRU đã giới hạn tổng số bucket, còn giới hạn
+   * cửa sổ thì sau mốc đó hệ thống không biết đã xem tới đâu và rơi về nhịp
+   * transcribe thường (~2s), tức replay được một đoạn rồi đoạn sau phải chờ.
    *
-   * ⚠️ Cố ý KHÔNG chặn trên: mọi từ đã xem phía sau mốc tua đều hợp lệ, và
-   * trần TTL/LRU sẵn giới hạn tổng số bucket. Một video dài 2 giờ mà đã xem
-   * hết thì message to, nhưng nó chỉ xảy ra đúng một lần mỗi lần tua, và đổi
-   * lại bằng số bạn phải chờ 4.5–6s cho TỪNG đoạn còn lại.
+   * ⚠️ Điều kiện `bucket.anchorTime < fromSec` bỏ qua CẢ bucket, nên bucket trải
+   * qua mốc tua sẽ mất phần sau mốc — xem issue đã ghi cho giới hạn này.
    */
   getRangeFrom(
     sourceId: string | null | undefined,
@@ -230,7 +216,6 @@ export class TranscriptService {
   ): Word[] {
     const now = Date.now();
 
-    // Cùng bước dọn TTL như `getRange`.
     for (const [key, bucket] of this.cache) {
       if (now - bucket.lastAccess > TranscriptService.TTL_MS) {
         this.cache.delete(key);
@@ -269,8 +254,6 @@ export class TranscriptService {
     }
   }
 
-  // === Bản dịch ===
-
   /** Bản dịch đã cache cho nhóm này của đúng nguồn, nếu có. */
   getTranslation(
     sourceId: string | null | undefined,
@@ -287,11 +270,7 @@ export class TranscriptService {
     this.evictTranslations();
   }
 
-  /**
-   * Bản dịch của các nhóm nằm trong `[fromSec, toSec]`, sort theo mốc video.
-   * Dùng cho replay: seek về đoạn đã xem thì VI hiện ngay, không gọi AI
-   * (FR-7.2, FR-7.5).
-   */
+  /** Bản dịch của các nhóm trong `[fromSec, toSec]`, sort theo mốc video. */
   getTranslations(
     sourceId: string | null | undefined,
     fromSec: number,
@@ -317,10 +296,7 @@ export class TranscriptService {
     return result.sort((a, b) => a.captionStart - b.captionStart);
   }
 
-  /**
-   * Bản dịch của mọi nhóm ĐÃ XEM từ mốc `fromSec` trở đi — đi kèm
-   * `getRangeFrom` khi replay (FR-7.5, Issue 5.25).
-   */
+  /** Bản dịch của mọi nhóm đã xem từ `fromSec` trở đi — đi kèm `getRangeFrom`. */
   getTranslationsFrom(
     sourceId: string | null | undefined,
     fromSec: number,

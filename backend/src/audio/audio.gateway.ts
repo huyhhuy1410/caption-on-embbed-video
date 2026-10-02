@@ -90,7 +90,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    */
   private drainNotBefore = 0;
 
-  // === BƯỚC 1: Constructor - Thiết lập kết nối hai chiều với Sidecar Service ===
   constructor(
     private readonly sidecarService: SidecarService,
     private readonly transcriptService: TranscriptService,
@@ -109,8 +108,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     this.sidecarService.setMessageHandler((data) => {
       console.info('Message from sidecar:', data);
-
-      // 1.2. Nếu Extension đang mở kết nối, bắn thẳng kết quả JSON về cho Extension!
 
       const message = data.toString();
       try {
@@ -151,7 +148,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         group.captionStart,
       );
       // ⚠️ So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
-      // ranh giới window 6s: lần đầu chỉ thấy nửa câu, lần sau mới đủ. Nếu chỉ
+      // ranh giới window: lần đầu chỉ thấy nửa câu, lần sau mới đủ. Nếu chỉ
       // kiểm tra khoá thì bản dịch NỬA CÂU đã cache sẽ chặn luôn bản đầy đủ.
       if (cached && cached.text === group.text) continue;
 
@@ -187,7 +184,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (this.drainTimer !== undefined || this.draining) return;
 
     // Còn chỗ trong cửa sổ thì bắn ngay. Đây là chủ ý: caption về theo từng đợt
-    // ~4.5s, nên gộp được nhóm nào thì dòng VI hiện sớm được nhóm đó — chờ thêm
+    // ~2s, nên gộp được nhóm nào thì dòng VI hiện sớm được nhóm đó — chờ thêm
     // chỉ làm bản dịch đến muộn mà không giúp gì cho quota.
     // `msUntilRoom()` đã bao gồm cả cooldown toàn cục — xem
     // TranslationRateLimiter.pauseUntil. Lấy max với `drainNotBefore` để
@@ -341,69 +338,54 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
-  // === BƯỚC 2: Sự kiện khi Extension Chrome mở kết nối WebSocket (Cổng 8000) ===
   handleConnection(client: WebSocket) {
     console.info('Extension connected to audio WebSocket');
-    this.extensionClient = client; // Lưu tham chiếu client vào cấp Class
+    this.extensionClient = client;
 
     client.on('error', (err) => {
       console.error('Extension audio WebSocket error:', err);
     });
 
-    // 2.1. Lắng nghe từng gói tin từ Extension gửi lên
     client.on('message', (data: RawData, isBinary: boolean) => {
-      // Nhánh A: Nếu là dữ liệu Nhị phân (PCM Audio Bytes)
       if (isBinary) {
-        console.info('Received PCM bytes:', rawDataLength(data));
         const buffer = toBuffer(data);
-        this.sidecarService.sendAudio(buffer); // Forward mảng byte cho Sidecar Python
+        this.sidecarService.sendAudio(buffer);
         return;
       }
 
-      // Nhánh B: Nếu là dữ liệu Chữ (JSON Metadata)
       try {
         const parsed: unknown = JSON.parse(data.toString());
-        console.info('Received message:', parsed);
         if (isRecord(parsed) && parsed.type === 'source-switch') {
           const sourceId = (parsed as { sourceId?: string }).sourceId;
           if (typeof sourceId === 'string' && sourceId) {
             this.activeSourceId = sourceId;
             this.videoClockService.reset();
-            // Xoá bộ đệm audio cũ bên sidecar — nội dung video trước không được
-            // sống sót qua thời điểm đổi nguồn (gotcha #38).
+            // Nội dung video trước không được sống sót qua mốc đổi nguồn.
             this.sidecarService.sendSourceSwitch(sourceId);
-            console.info('Backend: source switch', sourceId);
           }
         } else if (isRecord(parsed) && parsed.type === 'seek') {
           const seekTime = (parsed as { seekTimeAtCapture?: number })
             .seekTimeAtCapture;
-          console.info('Backend: seek received', parsed);
           if (seekTime !== undefined) {
             this.videoClockService.reset();
 
-            // ⚠️ Phải báo XUỐNG sidecar nữa, không chỉ reset clock ở đây.
-            // Sidecar đang giữ tới 6s tiếng của đoạn TRƯỚC khi tua; để nguyên
-            // thì window kế tiếp trộn tiếng cũ với tiếng mới nhưng dán mốc mới
-            // ⇒ phụ đề đúng ngay lúc tua rồi lệch ở đoạn ngay sau (Issue 5.21).
+            // Reset clock ở backend là chưa đủ: sidecar còn giữ ~3s audio của
+            // đoạn trước mốc tua, để nguyên thì window kế tiếp trộn tiếng cũ với
+            // tiếng mới nhưng dán mốc mới ⇒ phụ đề đúng lúc tua rồi lệch ngay sau.
             this.sidecarService.sendReset();
 
-            // Lọc theo nguồn đang chạy: mốc thời gian là của RIÊNG video này,
-            // nên không lọc thì trả luôn lời của video khác (Issue 5.20).
+            // Mốc thời gian là của RIÊNG video này, nên phải lọc theo nguồn.
             const sourceId = this.activeSourceId;
 
-            // ⚠️ Lấy TOÀN BỘ phần đã xem phía sau mốc tua, không chỉ 3 giây
-            // (Issue 5.25). Cũ chỉ trả `[seekTime, seekTime+3]` nên sau 3 giây
-            // hệ thống không biết "đã xem tới đâu" và rơi về nhịp transcribe
-            // 4.5–6s — người dùng thấy replay được một đoạn rồi đoạn sau phải
-            // chờ, dù dữ liệu đã nằm sẵn trong cache.
+            // Lấy hết phần đã xem phía sau, không giới hạn cửa sổ: giới hạn thì
+            // sau mốc đó hệ thống không biết đã xem tới đâu và rơi về nhịp
+            // transcribe thường, dù dữ liệu nằm sẵn trong cache.
             const replayWords = this.transcriptService.getRangeFrom(
               sourceId,
               seekTime,
             );
 
-            // Bản dịch cũng lấy hết phía sau: `captionStart` của các nhóm sau
-            // mốc tua đều hợp lệ, và thiếu chúng thì dòng VI rỗng ở đúng những
-            // đoạn tiếp theo (FR-7.5).
+            // Bản dịch đi kèm, thiếu chúng thì dòng VI rỗng ở đúng các đoạn tiếp theo.
             const replayTranslations = this.transcriptService.getTranslationsFrom(
               sourceId,
               seekTime,
@@ -437,19 +419,16 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  // === BƯỚC 3: Sự kiện khi Extension ngắt kết nối ===
   handleDisconnect() {
     console.info('Extension disconnected from audio WebSocket');
-    this.extensionClient = undefined; // Dọn dẹp biến tham chiếu
+    this.extensionClient = undefined;
   }
 }
 
-// === BƯỚC 4: Helper gom từ thành caption group (theo `captionStart` của sidecar) ===
 /**
- * Sidecar chốt nhóm caption bằng `captionStart` (gặp dấu kết câu hoặc đủ 8 từ).
- * Backend gom lại theo chính khoá đó — không cần sidecar phát thêm event
- * `sentence`, vì extension vốn đã tự gom nhóm để dựng dòng EN; nó chỉ thiếu
- * bản dịch.
+ * Sidecar chốt nhóm caption bằng `captionStart` (gặp dấu kết câu hoặc đủ 16 từ).
+ * Backend gom lại theo chính khoá đó — extension đã tự gom nhóm để dựng dòng EN,
+ * nó chỉ thiếu bản dịch.
  */
 function collectCaptionGroups(words: unknown): CaptionGroup[] {
   if (!Array.isArray(words)) return [];
@@ -476,27 +455,18 @@ function collectCaptionGroups(words: unknown): CaptionGroup[] {
   return result.sort((a, b) => a.captionStart - b.captionStart);
 }
 
-// === BƯỚC 5: Helper chuyển đổi dữ liệu thô RawData thành Node.js Buffer ===
 function toBuffer(data: RawData): Buffer {
   if (Array.isArray(data)) {
     return Buffer.concat(data);
   }
 
   if (data instanceof ArrayBuffer) {
-    return Buffer.from(new Uint8Array(data)); // Đọc ArrayBuffer bằng kính Uint8Array
+    return Buffer.from(new Uint8Array(data));
   }
 
   return Buffer.from(data);
 }
 
-// === BƯỚC 5: Helper tính độ dài dung lượng (Byte length) của RawData ===
-function rawDataLength(data: RawData): number {
-  if (typeof data === 'string') return Buffer.byteLength(data);
-  if (Array.isArray(data)) {
-    return data.reduce((total, chunk) => total + chunk.byteLength, 0);
-  }
-  return data.byteLength;
-}
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }

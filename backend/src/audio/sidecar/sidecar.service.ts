@@ -19,11 +19,8 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
 
   /**
-   * Control state không được rơi trong lúc sidecar reload.
-   *
-   * Audio/chunk metadata là realtime: cũ là vô dụng nên drop. Reset và đổi
-   * nguồn là control one-shot: rơi chúng sẽ mở lại Issue 5.20/5.21, nên chỉ
-   * giữ một reset và sourceId mới nhất.
+   * Control state không được rơi trong lúc mất kết nối: audio cũ là vô dụng nên
+   * drop, nhưng reset và đổi nguồn là one-shot nên chỉ giữ bản mới nhất.
    */
   private pendingReset = false;
   private pendingSourceId?: string;
@@ -54,8 +51,7 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
       this.reconnectAttempt = 0;
       console.info('Connected to Whisper sidecar');
 
-      // Gateway biết activeSourceId thật tại thời điểm reconnect. Callback chạy
-      // TRƯỚC flush để ghi đè pending source cũ bằng nguồn hiện tại.
+      // Callback chạy trước flush để nguồn hiện tại ghi đè pending source cũ.
       this.onOpen?.();
       this.flushPendingControls();
     });
@@ -135,7 +131,7 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
       // sẽ gửi source cũ SAU source mới và đảo namespace ngược lại.
       this.pendingSourceId = undefined;
     } else {
-      // Chỉ nguồn mới nhất còn ý nghĩa; các nguồn cũ đã bị supersede.
+      // Chỉ nguồn mới nhất còn ý nghĩa.
       this.pendingSourceId = sourceId;
     }
   }
