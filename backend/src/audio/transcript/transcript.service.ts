@@ -207,8 +207,11 @@ export class TranscriptService {
    * cửa sổ thì sau mốc đó hệ thống không biết đã xem tới đâu và rơi về nhịp
    * transcribe thường (~2s), tức replay được một đoạn rồi đoạn sau phải chờ.
    *
-   * ⚠️ Điều kiện `bucket.anchorTime < fromSec` bỏ qua CẢ bucket, nên bucket trải
-   * qua mốc tua sẽ mất phần sau mốc — xem issue đã ghi cho giới hạn này.
+   * ⚠️ Điều kiện lọc phải là CHỒNG LẤN (`bucketEnd >= fromSec`), không phải
+   * "bắt đầu sau mốc". Bucket khoá theo giây của từ ĐẦU và trải ~một window
+   * sidecar, nên nó có thể bắt đầu trước mốc tua rồi vươn qua sau: lọc theo
+   * `anchorTime` là mất sạch các từ trong khoảng `fromSec → bucketEnd`. Phép
+   * lọc cuối ở từng từ đã xử lý đúng phần đó (Issue 5.35).
    */
   getRangeFrom(
     sourceId: string | null | undefined,
@@ -226,8 +229,10 @@ export class TranscriptService {
     const result: Word[] = [];
     for (const bucket of this.cache.values()) {
       if (normalizeSource(bucket.words[0]?.sourceId) !== source) continue;
-      // Bucket bắt đầu SAU mốc tua thì không liên quan.
-      if (bucket.anchorTime < fromSec) continue;
+      // Bucket kết thúc trước mốc tua thì không liên quan.
+      const lastWord = bucket.words[bucket.words.length - 1];
+      const bucketEnd = lastWord?.videoEnd ?? bucket.anchorTime;
+      if (bucketEnd < fromSec) continue;
       bucket.lastAccess = now;
       result.push(...bucket.words);
     }

@@ -187,6 +187,26 @@ describe('TranscriptService', () => {
       ]);
     });
 
+    it('keeps the part of a bucket that STRADDLES the seek point', () => {
+      // Một bucket khoá theo giây của từ ĐẦU và trải ~một window sidecar, nên
+      // nó có thể bắt đầu trước mốc tua rồi vươn qua sau. Lọc theo
+      // `anchorTime` là mất sạch phần sau mốc (Issue 5.35).
+      //
+      // Ca cũ (`excludes ranges before the seek point`) không bắt được lỗi này:
+      // seek 25 rơi đúng biên bucket, không bucket nào trải qua mốc.
+      service.addWords(
+        [49, 49.6, 50.2, 50.8, 51.4, 52].map((t) => {
+          const word = makeWord(t, 'v1');
+          word.w = `w${t}`;
+          return word;
+        }),
+      );
+
+      expect(service.getRangeFrom('v1', 50).map((w) => w.videoStart)).toEqual([
+        50.2, 50.8, 51.4, 52,
+      ]);
+    });
+
     it('scopes to the source like getRange', () => {
       service.addWords([makeWord(30, 'v1')]);
       service.addWords([makeWord(30, 'v2')]);
