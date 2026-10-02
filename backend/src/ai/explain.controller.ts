@@ -6,7 +6,10 @@ import {
   Post,
 } from '@nestjs/common';
 import { ExplainService } from './explain.service';
-import { TranslationRateLimiter } from './translation-rate-limiter.service';
+import {
+  TranslationRateLimiter,
+  TRANSLATE_MAX_PER_WINDOW,
+} from './translation-rate-limiter.service';
 import { ProviderUnavailableError } from './errors';
 import { ExplainWordDto } from './dto/explain-word.dto';
 
@@ -30,8 +33,8 @@ export class ExplainController {
         {
           statusCode: HttpStatus.TOO_MANY_REQUESTS,
           message:
-            'Explain rate limit reached (15 requests per minute). ' +
-            `Retry in ${Math.ceil(waitMs / 1000)}s.`,
+            `Explain rate limit reached (${TRANSLATE_MAX_PER_WINDOW} ` +
+            `requests per minute). Retry in ${Math.ceil(waitMs / 1000)}s.`,
           retryAfterMs: waitMs,
         },
         HttpStatus.TOO_MANY_REQUESTS,

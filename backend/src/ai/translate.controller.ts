@@ -6,7 +6,10 @@ import {
   Post,
 } from '@nestjs/common';
 import { TranslateService } from './translate.service';
-import { TranslationRateLimiter } from './translation-rate-limiter.service';
+import {
+  TranslationRateLimiter,
+  TRANSLATE_MAX_PER_WINDOW,
+} from './translation-rate-limiter.service';
 import { ProviderUnavailableError } from './errors';
 import { TranslateDto } from './dto/translate.dto';
 
@@ -31,8 +34,8 @@ export class TranslateController {
         {
           statusCode: HttpStatus.TOO_MANY_REQUESTS,
           message:
-            'Translation rate limit reached (15 requests per minute). ' +
-            `Retry in ${Math.ceil(waitMs / 1000)}s.`,
+            `Translation rate limit reached (${TRANSLATE_MAX_PER_WINDOW} ` +
+            `requests per minute). Retry in ${Math.ceil(waitMs / 1000)}s.`,
           retryAfterMs: waitMs,
         },
         HttpStatus.TOO_MANY_REQUESTS,
