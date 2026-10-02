@@ -15,7 +15,7 @@ type GatewayInternals = {
 /**
  * Client giả cho WebSocket của extension.
  *
- * ⚠️ Phải giữ lại CẢ HAI chiều mới test được đường seek: gateway nhận vào qua
+ * Phải giữ lại CẢ HAI chiều mới test được đường seek: gateway nhận vào qua
  * `client.on('message')` và trả ra qua `client.send`. Một mock chỉ có `on()`
  * rỗng thì không bắn được message nào vào, và không đọc được `replay` bắn ra.
  */
@@ -125,7 +125,7 @@ describe('AudioGateway', () => {
 
   describe('seek', () => {
     it('tells the sidecar to drop its audio buffer', () => {
-      // ⚠️ Issue 5.21: sidecar giữ tới 6s tiếng của đoạn TRƯỚC khi tua. Reset
+      // Issue 5.21: sidecar giữ tới 6s tiếng của đoạn TRƯỚC khi tua. Reset
       // clock ở backend là chưa đủ — không báo xuống thì window kế tiếp trộn
       // tiếng cũ với tiếng mới nhưng dán mốc mới ⇒ phụ đề đúng ngay lúc tua
       // rồi lệch ở đoạn ngay sau.
@@ -188,7 +188,7 @@ describe('AudioGateway', () => {
     });
 
     it('never exceeds the per-minute request ceiling, even under a 503 storm', async () => {
-      // ⚠️ Đây là bug đã đo được: throttle theo KHOẢNG CÁCH giữa các lượt drain
+      // Đây là bug đã đo được: throttle theo KHOẢNG CÁCH giữa các lượt drain
       // cho ra 26 request/phút, vì mỗi drain tự thử lại 3 lần bên trong. Giờ
       // throttle đếm SỐ REQUEST trong cửa sổ 60s, và retry nằm ở gateway.
       translateBatch.mockRejectedValue(
@@ -210,7 +210,7 @@ describe('AudioGateway', () => {
 
       expect(callTimes.length).toBeGreaterThan(30);
 
-      // ⚠️ Bất biến thật: KHÔNG cửa sổ 60s nào chứa quá 15 request. Đây đúng
+      // Bất biến thật: KHÔNG cửa sổ 60s nào chứa quá 15 request. Đây đúng
       // là cách provider đếm quota, khác hẳn "tổng số chia cho số phút".
       for (const at of callTimes) {
         const inWindow = callTimes.filter((t) => t > at - 60_000 && t <= at);
@@ -305,7 +305,7 @@ describe('AudioGateway', () => {
     });
 
     it('does not count a 503 as an attempt, so a provider outage keeps the sentence', async () => {
-      // ⚠️ Issue 5.18: 503 là lỗi TẠM THỜI của provider, không tiêu quota. Trước
+      // Issue 5.18: 503 là lỗi TẠM THỜI của provider, không tiêu quota. Trước
       // đây nó đi chung nhánh "tính công rồi bỏ" với 400/500, nên một đợt Gemini
       // quá tải vài phút XOÁ VĨNH VIỄN bản dịch của cả đoạn — đúng cái "xoá sổ
       // bản dịch cả video" ở Issue 5.12.
@@ -333,7 +333,7 @@ describe('AudioGateway', () => {
     });
 
     it('backs off between 503 retries instead of hammering the provider', async () => {
-      // ⚠️ Không có nhánh 503 thì `scheduleDrain` hẹn 0ms (cửa sổ quota vẫn
+      // Không có nhánh 503 thì `scheduleDrain` hẹn 0ms (cửa sổ quota vẫn
       // còn chỗ sau 503) ⇒ 503 lặp liên tục, đốt lượt của chính các câu đang
       // chờ trong khi model đã chết.
       translateBatch.mockRejectedValue(

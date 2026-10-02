@@ -47,7 +47,7 @@ const DRAGGED_MAX_WIDTH_PX = 560;
 /**
  * Giữ tối thiểu phần này của khung (px) nằm trong viewport khi kéo.
  *
- * ⚠️ Không giới hạn hoàn toàn: overlay là `position: fixed` và extension
+ * Không giới hạn hoàn toàn: overlay là `position: fixed` và extension
  * **không có UI nào khác** để gọi lại nó — kéo tới mất hẳn thì chỉ còn cách
  * F5. Giữ một mảnh nhỏ ở mép là ranh giới giữa "kéo tuỳ ý" và "mất vĩnh viễn".
  */

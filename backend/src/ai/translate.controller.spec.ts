@@ -34,7 +34,7 @@ describe('TranslateController', () => {
     });
 
     expect(result).toEqual({ text: 'Xin chào' });
-    // ⚠️ Điểm mấu chốt của Issue 5.14: request HTTP PHẢI được ghi vào cùng bộ
+    // Điểm mấu chốt của Issue 5.14: request HTTP PHẢI được ghi vào cùng bộ
     // đếm mà gateway dùng, nếu không trần thật là tổng của hai bộ đếm rời nhau.
     expect(limiter.callsInWindow()).toBe(1);
   });
@@ -65,7 +65,7 @@ describe('TranslateController', () => {
   });
 
   it('pauses the shared limiter when the provider reports quota exhaustion', async () => {
-    // ⚠️ Đây là lỗ hổng mà review tìm ra: provider báo hết quota trên đường HTTP
+    // Đây là lỗ hổng mà review tìm ra: provider báo hết quota trên đường HTTP
     // trước đây không hề ngăn đường WebSocket tiếp tục đốt quota, và caller nhận
     // 500 thay vì 429.
     translate.mockRejectedValue(

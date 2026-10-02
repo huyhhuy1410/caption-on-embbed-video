@@ -106,7 +106,7 @@ describe('GeminiProvider', () => {
   });
 
   it('does NOT retry a 503 internally — defers the retry to the gateway', async () => {
-    // ⚠️ Đây là điều kiện để throttle của gateway đo ĐÚNG số request. Retry nội
+    // Đây là điều kiện để throttle của gateway đo ĐÚNG số request. Retry nội
     // bộ ở đây sẽ khiến một lượt drain bắn nhiều HTTP call mà throttle không
     // thấy (probe từng đo 26 request/phút so với trần 15).
     global.fetch = jest.fn().mockResolvedValue({

@@ -54,7 +54,7 @@ describe('CommandCodeProvider', () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('https://api.commandcode.ai/provider/v1/chat/completions');
     expect(url).not.toContain('test-key');
-    // ⚠️ Key phải nằm ở header: Gemini nhét key vào URL nên phải `throw` thay vì
+    // Key phải nằm ở header: Gemini nhét key vào URL nên phải `throw` thay vì
     // log body lỗi. Ở đây body lỗi được log ⇒ key không được lọt vào URL.
     expect(init.headers.Authorization).toBe('Bearer test-key');
   });
@@ -147,7 +147,7 @@ describe('CommandCodeProvider', () => {
         chatResponse('{"translations":[{"index":1,"translation":"A"}]}'),
       );
 
-      // ⚠️ Model trả thiếu câu 2. Im lặng ghép lệch sẽ gán "A" cho cả hai câu —
+      // Model trả thiếu câu 2. Im lặng ghép lệch sẽ gán "A" cho cả hai câu —
       // tệ hơn hẳn là không dịch gì.
       await expect(
         provider.translateBatch(['One', 'Two'], 'vi', 'en'),
@@ -232,7 +232,7 @@ describe('CommandCodeProvider', () => {
 
       await provider.translate('Hello', 'vi', 'en').catch(() => undefined);
 
-      // ⚠️ Retry nội bộ ở đây khiến MỘT lượt drain bắn nhiều HTTP call mà bộ đếm
+      // Retry nội bộ ở đây khiến MỘT lượt drain bắn nhiều HTTP call mà bộ đếm
       // quota của gateway không thấy (Issue 5.12). Thử lại thuộc về tầng gateway.
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
@@ -254,7 +254,7 @@ describe('serverRetryDelayMs', () => {
   });
 
   it('falls back to a full quota WINDOW when the body says nothing', () => {
-    // ⚠️ Không có nhánh này thì retryAfterMs = 0 ⇒ `pauseUntil(now + 0)` là
+    // Không có nhánh này thì retryAfterMs = 0 ⇒ `pauseUntil(now + 0)` là
     // no-op ⇒ hàng đợi bắn lại ngay ⇒ đốt quota liên tục (Issue 5.12).
     expect(serverRetryDelayMs('{"error":"rate_limit_error"}')).toBe(60_000);
   });

@@ -4,7 +4,7 @@ let videoTimeAtCapture = 0;
 /**
  * Danh tính video đang phát — ghim vào MỖI chunk audio (Issue 5.20).
  *
- * ⚠️ Phải là biến sống theo phiên chứ không chỉ gửi lúc đổi video: backend dùng
+ * Phải là biến sống theo phiên chứ không chỉ gửi lúc đổi video: backend dùng
  * nó để tách cache, mà cache nhận từ `words` về nhiều giây sau. Chunk audio
  * không mang danh tính thì sidecar không biết dán nguồn nào lên từ.
  */
@@ -142,7 +142,7 @@ async function captureTabAudio(streamId: string) {
     console.info("Words from backend:", event.data);
     try {
       const parsed = JSON.parse(event.data);
-      // ⚠️ Chuyển NGUYÊN message, không dựng lại object `{type, words}` như
+      // Chuyển NGUYÊN message, không dựng lại object `{type, words}` như
       // trước — cách đó làm rơi mọi field khác mà backend gửi kèm (`translations`
       // ở replay chẳng hạn). Offscreen KHÔNG có `chrome.tabs` ⇒ gửi về SW, SW
       // biết tab nào (Issue 5.1).
@@ -189,9 +189,10 @@ async function captureTabAudio(streamId: string) {
             seq: sequence,
             captureTime: performance.now() / 1000,
             sampleRate: context.sampleRate,
-            videoTimeAtCapture: videoTimeAtCapture, // 👈 Đính kèm mốc thời gian video chuẩn
-            // 👈 Danh tính video đang phát (Issue 5.20). `null` khi chưa biết —
-            // sidecar chấp nhận, nhưng cache sẽ rơi vào namespace chung.
+            videoTimeAtCapture,
+            // Dán nguồn vào MỌI chunk để sidecar tách cache theo video (Issue
+            // 5.20). `null` lúc chưa biết: sidecar vẫn nhận, cache rơi vào
+            // namespace chung cho tới khi có nguồn.
             sourceId: activeSourceId,
             frames: chunk.length,
           }),

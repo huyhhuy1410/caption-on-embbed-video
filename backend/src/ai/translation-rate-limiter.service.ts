@@ -6,14 +6,14 @@ import { Injectable } from '@nestjs/common';
  * Gemini free tier cho 15 request/phút (`quotaValue: 15` trong chính response
  * 429). Đây là giá trị MẶC ĐỊNH và phải giữ nguyên khi dùng `AI_PROVIDER=gemini`.
  *
- * ⚠️ Với provider KHÁC (CommandCode) con số này không phải trần thật của hạ tầng
+ * Với provider KHÁC (CommandCode) con số này không phải trần thật của hạ tầng
  * — tài liệu CommandCode không công bố RPM. Nhưng bộ đếm này không phải để
  * phòng thủ provider, mà để giữ ĐỦ NHỊP: hệ thống sinh ~15–25 nhóm caption mỗi
  * phút, và mỗi lượt drain là MỘT request ⇒ con số này quyết định caption có kịp
  * theo video hay không. Nâng lên sẽ giữ được nhịp dịch với provider chịu được
  * thêm, nên cho phép ghi đè bằng env `AI_MAX_RPM`.
  *
- * ⚠️ Nếu nâng quá trần thật của provider thì hậu quả KHÔNG phải mất bản dịch:
+ * Nếu nâng quá trần thật của provider thì hậu quả KHÔNG phải mất bản dịch:
  * provider trả 429 ⇒ `ProviderUnavailableError(retryable = false)` ⇒ gateway
  * tự pause toàn bộ theo `retryAfterMs`. Tức là bộ đếm hơi thừa chỉ tốn một
  * vòng 429, còn thấp hơn thật thì caption trễ. Vì vậy hợp lý là hơi cao.
@@ -34,14 +34,14 @@ export const TRANSLATE_WINDOW_MS = 60_000;
 /**
  * Bộ đếm quota dịch — nguồn sự thật DUY NHẤT về số request đã bắn.
  *
- * ⚠️ Vì sao phải là service dùng chung chứ không phải biến riêng của gateway:
+ * Vì sao phải là service dùng chung chứ không phải biến riêng của gateway:
  * quota thuộc về **project**, không thuộc về đường vào nào. Có hai đường gọi
  * provider — `AudioGateway` (caption, qua WebSocket) và `TranslateController`
  * (HTTP `/translate`) — nên nếu mỗi bên tự đếm thì trần thật là *tổng* của hai
  * bộ đếm, và mỗi bên đều tưởng mình đang trong trần. Đó đúng là lỗi mà Issue
  * 5.14 vừa fix, chỉ ở dạng khác.
  *
- * ⚠️ Chỉ ghi nhận ở TẦNG GỌI (gateway / controller), không nhồi vào
+ * Chỉ ghi nhận ở TẦNG GỌI (gateway / controller), không nhồi vào
  * `TranslateService`. Nhét vào tầng service là đếm hai lần cho đường caption,
  * vì gateway đã gọi `recordCall()` rồi mới gọi `translateBatch()`.
  */
@@ -53,7 +53,7 @@ export class TranslationRateLimiter {
   /**
    * Mốc thời gian được phép gọi lại sau khi provider báo hết quota.
    *
-   * ⚠️ Nằm ở ĐÂY chứ không ở gateway: hết quota là trạng thái của cả project, nên
+   * Nằm ở ĐÂY chứ không ở gateway: hết quota là trạng thái của cả project, nên
    * một đường phát hiện ra (HTTP hay WebSocket) thì đường kia cũng phải dừng. Để
    * riêng trong gateway thì request HTTP gặp 429 vẫn không ngăn được caption
    * tiếp tục đốt quota.
@@ -70,7 +70,7 @@ export class TranslationRateLimiter {
    * hơn, vì cửa sổ của provider trượt theo thời gian chứ không reset theo lượt.
    */
   msUntilRoom(now: number = Date.now()): number {
-    // ⚠️ Cooldown phải được kiểm TRA TRƯỚC khi xét cửa sổ trượt. Trả sớm "còn
+    // Cooldown phải được kiểm TRA TRƯỚC khi xét cửa sổ trượt. Trả sớm "còn
     // chỗ" khi cửa sổ chưa đầy thì bỏ qua cooldown ⇒ `pauseUntil()` trở thành
     // một dòng code chết và đường khác vẫn đốt quota. Đã xảy ra.
     const byCooldown = Math.max(0, this.cooldownUntil - now);
@@ -112,7 +112,7 @@ export class TranslationRateLimiter {
    * Xin một suất: còn chỗ thì ghi nhận luôn và trả 0; hết chỗ thì trả số ms
    * phải chờ.
    *
-   * ⚠️ Gộp kiểm-tra và ghi-nhận vào MỘT lời gọi là chủ ý. Tách thành
+   * Gộp kiểm-tra và ghi-nhận vào MỘT lời gọi là chủ ý. Tách thành
    * `msUntilRoom()` rồi `recordCall()` ở tầng gọi là mở khoảng hở: hai caller
    * cùng thấy "còn chỗ" trước khi ai kịp ghi, và cả hai cùng bắn. Hàm này chạy
    * đồng bộ từ đầu tới cuối nên không có `await` nào chen vào giữa.

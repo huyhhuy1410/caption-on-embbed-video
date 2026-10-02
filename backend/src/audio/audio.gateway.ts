@@ -17,7 +17,7 @@ type CaptionGroup = { captionStart: number; text: string };
 /**
  * Khoá hàng đợi dịch = (nguồn, captionStart).
  *
- * ⚠️ `captionStart` là mốc thời gian RIÊNG của từng video: video B bắt đầu
+ * `captionStart` là mốc thời gian RIÊNG của từng video: video B bắt đầu
  * câu đầu tiên ở 0:00 cũng hệt video A. Khoá bằng `captionStart` đơn thuần thì
  * câu của video A bị xem như đã thử (nên bỏ, không dịch lại) hoặc nhận nhầm bản
  * dịch của video B (Issue 5.20).
@@ -35,7 +35,7 @@ const MAX_TRANSLATE_ATTEMPTS = 3;
 /**
  * Trần thời gian giữ một câu trong hàng đợi khi provider quá tải (503).
  *
- * ⚠️ Vì sao 503 không dùng chung `MAX_TRANSLATE_ATTEMPTS`: 503 là lỗi tạm thời
+ * Vì sao 503 không dùng chung `MAX_TRANSLATE_ATTEMPTS`: 503 là lỗi tạm thời
  * của provider và **không tiêu quota**, nên giữ câu chờ là an toàn — trần quota
  * 15 req/phút do bộ đếm cửa sổ giữ, không phải do việc bỏ sau N lần. Trước đây
  * 503 đi chung nhánh "tính công rồi bỏ", nên một đợt Gemini quá tải vài phút
@@ -54,7 +54,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   /**
    * `sourceId` của video ĐANG CHẠY — khoá cache theo nguồn (Issue 5.20).
    *
-   * ⚠️ Đây là biến SỐNG SUỐT phiên, không phải biến đi kèm message: backend
+   * Đây là biến SỐNG SUỐT phiên, không phải biến đi kèm message: backend
    * nhận audio của mọi video trong tab (tabCapture), nên nó phải nhớ nguồn hiện
    * tại để gán cho `getRange`/`getTranslations` khi seek. Đổi video mà không
    * cập nhật biến này thì replay trả lời của video trước.
@@ -80,7 +80,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   /**
    * Không được thử lại trước mốc này sau một đợt 503.
    *
-   * ⚠️ Cần riêng vì `msUntilRoom()` chỉ biết QUOTA, không biết provider đang
+   * Cần riêng vì `msUntilRoom()` chỉ biết QUOTA, không biết provider đang
    * quá tải: sau 503 thì cửa sổ vẫn còn chỗ ⇒ timer nổ ngay lập tức ⇒ 503 lặp
    * liên tục, đốt hết lượt của các câu mới trong lúc model đang chết.
    *
@@ -133,7 +133,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    * Xếp các caption group chưa có bản dịch vào hàng đợi, rồi hẹn một lượt
    * drain.
    *
-   * ⚠️ Vì sao xếp hàng thay vì gọi ngay: dịch từng câu riêng tốn 1 request/câu.
+   * Vì sao xếp hàng thay vì gọi ngay: dịch từng câu riêng tốn 1 request/câu.
    * Nhịp sinh caption là ~15–25 nhóm/phút, mà Gemini free tier cho ~15
    * request/phút ⇒ vượt trần ngay trong điều kiện bình thường. Gộp nhiều câu
    * vào một request là cách duy nhất giảm số request mà không giảm số câu.
@@ -147,7 +147,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         this.activeSourceId,
         group.captionStart,
       );
-      // ⚠️ So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
+      // So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
       // ranh giới window: lần đầu chỉ thấy nửa câu, lần sau mới đủ. Nếu chỉ
       // kiểm tra khoá thì bản dịch NỬA CÂU đã cache sẽ chặn luôn bản đầy đủ.
       if (cached && cached.text === group.text) continue;
@@ -174,7 +174,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   /**
    * Hẹn lượt drain kế tiếp, chờ tới khi cửa sổ quota còn chỗ.
    *
-   * ⚠️ Guard `draining` là bắt buộc, không phải cho đẹp: `drainTimer` được xoá
+   * Guard `draining` là bắt buộc, không phải cho đẹp: `drainTimer` được xoá
    * lúc timer NỔ, không phải lúc drain XONG. Một drain có retry sẽ await hàng
    * giây, suốt thời gian đó `drainTimer` là `undefined` ⇒ không còn gì chặn việc
    * hẹn drain mới ⇒ nhiều request chạy chồng, cùng key, cùng bucket quota.
@@ -216,7 +216,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    * EN phải chạy bất kể.
    */
   private async drain(): Promise<void> {
-    // ⚠️ Kiểm lại quota NGAY TRƯỚC khi tiêu, dù `scheduleDrain` đã tính rồi.
+    // Kiểm lại quota NGAY TRƯỚC khi tiêu, dù `scheduleDrain` đã tính rồi.
     // Đây là chốt chặn duy nhất nằm đúng chỗ request thật sự rời máy, nên bất
     // biến "≤15 request/60s" được giữ tại đây thay vì phụ thuộc vào việc timer
     // không bao giờ nổ sớm (đồng hồ hệ thống nhảy, timer bị dồn...). Trả batch về
@@ -264,7 +264,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
       });
     } catch (error: unknown) {
-      // ⚠️ Ba nhánh, KHÁC NHAU về hậu quả — xem `ProviderUnavailableError`.
+      // Ba nhánh, KHÁC NHAU về hậu quả — xem `ProviderUnavailableError`.
       const now = Date.now();
       const quotaError =
         error instanceof ProviderUnavailableError && !error.retryable;
@@ -292,7 +292,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // 503 = model quá tải: TẠM THỜI và không tiêu quota ⇒ giữ câu trong
         // hàng đợi, KHÔNG tính công, chờ provider hồi.
         //
-        // ⚠️ Phải khai báo lịch nghỉ cho chính drain này (`drainNotBefore`),
+        // Phải khai báo lịch nghỉ cho chính drain này (`drainNotBefore`),
         // không chỉ re-queue: cửa sổ quota vẫn còn chỗ sau 503 nên nếu không,
         // `scheduleDrain` hẹn 0ms và 503 lặp lại liên tục.
         this.drainNotBefore = Math.max(

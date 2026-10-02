@@ -34,7 +34,7 @@ def check(label, got, expected):
 
 
 # 1. Cau co dau cham: tach TAI dau cham, dung theo cau chu khong phai so tu.
-# ⚠️ Phai co dau cham that — cau khong co dau cham thi ca 6 tu vao MOT nhom
+# Phai co dau cham that — cau khong co dau cham thi ca 6 tu vao MOT nhom
 # (vi con so tu 16), va do la hanh vi dung. Test truoc do quen dau cham va
 # viet nham ky vong, khong phai code sai.
 words = [w("Hello", 1.0), w("there", 1.4), w("friend.", 1.9), w("How", 2.5), w("are", 2.8), w("you?", 3.1)]
@@ -73,7 +73,7 @@ check(
 
 # 5. Tu CHAM NGUNG SO TU van mang moc cua nhom do — gan captionStart TRUOC khi
 #    kiem tra reset. Neu gan sau, tu nay nhan None va overlay khong ve duoc.
-# ⚠️ Danh sach phai DUNG bang max_words. Ban dau test nay con 3 tu nen tu thu
+# Danh sach phai DUNG bang max_words. Ban dau test nay con 3 tu nen tu thu
 #    ba thanh dau nhom moi va mang moc 2.0 — nham kiem tra thu khac.
 words = [w("a", 1.0), w("b", 1.5)]
 assign_caption_groups(words, max_words=2)

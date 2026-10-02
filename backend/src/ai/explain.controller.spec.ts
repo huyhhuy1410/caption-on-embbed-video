@@ -43,7 +43,7 @@ describe('ExplainController', () => {
     });
 
     expect(result).toEqual(OK);
-    // ⚠️ Điểm mấu chốt của Issue 5.16: /explain-word dùng CHUNG Gemini instance
+    // Điểm mấu chốt của Issue 5.16: /explain-word dùng CHUNG Gemini instance
     // (cùng key, cùng model) với /translate và caption, nên PHẢI ghi vào cùng bộ
     // đếm — không thì mỗi click vào một từ là một request Gemini ẩn.
     expect(limiter.callsInWindow()).toBe(1);

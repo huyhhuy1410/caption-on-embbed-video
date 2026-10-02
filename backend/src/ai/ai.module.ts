@@ -21,11 +21,11 @@ type ProviderName = (typeof PROVIDER_NAMES)[number];
  * Provider mặc định là `commandcode`; `gemini` vẫn
  * còn nguyên để quay lui: đổi `AI_PROVIDER=gemini` là chạy lại đúng đường cũ.
  *
- * ⚠️ Phải fallback chứ không để provider ném lỗi ở đây: constructor của chúng
+ * Phải fallback chứ không để provider ném lỗi ở đây: constructor của chúng
  * `throw` khi thiếu key, và factory này chạy lúc Nest khởi động ⇒ thiếu key là
  * app không boot, kéo theo cả caption EN (vốn không cần AI) chết theo.
  *
- * ⚠️ Tên provider lạ KHÔNG được `throw` ở đây — cùng lý do: app sẽ không boot.
+ * Tên provider lạ KHÔNG được `throw` ở đây — cùng lý do: app sẽ không boot.
  * Ghi log cảnh báo rồi rơi về mặc định để caption vẫn chạy.
  */
 function createAiProvider(): TranslationProvider & ExplainProvider {

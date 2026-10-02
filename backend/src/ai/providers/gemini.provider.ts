@@ -14,7 +14,7 @@ export interface GeminiConfig {
  * 503 (model quá tải) là trạng thái TẠM THỜI. Lần thử lại được đặt ở TẦNG GATEWAY,
  * không phải ở đây — xem `callGemini`.
  *
- * ⚠️ 429 KHÔNG retry ở đâu cả — xem `QUOTA_STATUS`. Hết quota là trạng thái của
+ * 429 KHÔNG retry ở đâu cả — xem `QUOTA_STATUS`. Hết quota là trạng thái của
  * CẢ PROJECT trong cửa sổ một phút, nên thử lại trong cùng phút chỉ tổ đốt thêm
  * quota mà chắc chắn vẫn 429. Chỉ có bộ đếm cửa sổ 60s ở gateway mới biết lúc nào
  * quota mở lại.
@@ -27,7 +27,7 @@ const MAX_RETRY_DELAY_MS = 8_000;
  * Backoff gợi ý cho 503. 503 không kèm `retryDelay`, nên dùng backoff mũ và cap
  * lại để một request hỏng không treo luồng quá lâu.
  *
- * ⚠️ Chỉ là GỢI Ý đặt vào `ProviderUnavailableError.retryAfterMs` cho tầng
+ * Chỉ là GỢI Ý đặt vào `ProviderUnavailableError.retryAfterMs` cho tầng
  * gateway. Việc thử lại thật do gateway làm, vì chỉ nó đếm được số request trong
  * cửa sổ quota.
  */
@@ -38,12 +38,12 @@ export function retryDelayMs(attempt: number): number {
 /**
  * Chờ tối thiểu khi Gemini báo 429 mà KHÔNG kèm gợi ý thời gian.
  *
- * ⚠️ Không có hằng số này thì 429 rơi về `retryAfterMs = 0` ⇒
+ * Không có hằng số này thì 429 rơi về `retryAfterMs = 0` ⇒
  * `pauseUntil(now + 0)` là no-op ⇒ hàng đợi thử lại ngay lập tức ⇒ đốt trọn
  * một cửa sổ quota bằng các request chắc chắn 429. Quota tính theo CỬA SỔ MỘT
  * PHÚT, nên chờ hết cửa sổ là lựa chọn thận trọng đúng bản chất quota.
  *
- * ⚠️ Cố ý khai báo riêng thay vì import từ `commandcode.provider`: mỗi provider
+ * Cố ý khai báo riêng thay vì import từ `commandcode.provider`: mỗi provider
  * một file độc lập, đổi transport của một bên không được kéo theo bên kia.
  */
 const QUOTA_FALLBACK_DELAY_MS = 60_000;
@@ -51,7 +51,7 @@ const QUOTA_FALLBACK_DELAY_MS = 60_000;
 /**
  * Thời gian server dặn chờ, đọc từ `retryDelay` trong body lỗi 429.
  *
- * ⚠️ KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
+ * KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
  * cắt nó xuống dưới một phút — bản trước cap ở 8s — là tự bảo đảm lần thử kế
  * tiếp rơi đúng vào cửa sổ vừa cạn, rồi 429 lại, và cứ thế.
  */
@@ -96,7 +96,7 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
   /**
    * POST MỘT generateContent call và trả JSON đã parse.
    *
-   * ⚠️ Hàm này KHÔNG tự thử lại, và đó là chủ ý — đừng thêm retry vào đây.
+   * Hàm này KHÔNG tự thử lại, và đó là chủ ý — đừng thêm retry vào đây.
    *
    * Lý do: throttle của gateway đếm số request để giữ trần 15 request/phút của
    * Gemini free tier. Retry nội bộ ở đây khiến MỘT lượt drain bắn nhiều HTTP call

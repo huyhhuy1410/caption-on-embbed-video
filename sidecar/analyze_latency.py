@@ -20,7 +20,7 @@ import re
 import sys
 import statistics
 
-# ⚠️ Console Windows mặc định là cp1252, in tiếng Việt có dấu sẽ ném
+# Console Windows mặc định là cp1252, in tiếng Việt có dấu sẽ ném
 # UnicodeEncodeError. Ép về UTF-8 và bật lỗi thay ra thay vì thay thế im lặng —
 # thay thế im lặng khiến số liệu sai mà không ai thấy.
 for _stream in (sys.stdout, sys.stderr):
@@ -114,7 +114,7 @@ def main():
     windows = {r["windowSec"] for r in rows}
     for w in sorted(windows):
         if w <= 3.0:  # 2 x OVERLAP_SIZE
-            print(f"\n⚠️ CẢNH BÁO: window {w}s <= 2 x OVERLAP(1.5s).")
+            print(f"\nCẢNH BÁO: window {w}s <= 2 x OVERLAP(1.5s).")
             print("  Phần overlap chiếm quá nhiều tỉ lệ, hai lượt liên tiếp")
             print("  trùng lặp nhiều mà không thu được ngữ cảnh nào mới.")
             print("  Có thể chấp nhận nếu độ trễ rất quan trọng, nhưng cần")

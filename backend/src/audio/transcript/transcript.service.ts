@@ -34,7 +34,7 @@ const DEDUP_WINDOW_SEC = 0.5;
  * Bỏ bản ghi trùng của cùng một từ — sliding window ghi lại 1.5s audio hai lần,
  * nên cùng một từ xuất hiện ở hai mốc lệch nhau ít.
  *
- * ⚠️ Chỉ so với từ LIỀN KỀ sau khi sort: các bản trùng nằm cạnh nhau, và mỗi
+ * Chỉ so với từ LIỀN KỀ sau khi sort: các bản trùng nằm cạnh nhau, và mỗi
  * từ chỉ cần so với bản đã giữ gần nhất. So với toàn bộ danh sách là O(n²) —
  * `getRangeFrom` có thể trả hàng nghìn từ.
  */
@@ -114,7 +114,7 @@ export class TranscriptService {
     const from = Math.min(...words.map((w) => w.videoStart));
     const to = Math.max(...words.map((w) => w.videoEnd));
 
-    // ⚠️ Xoá bản CŨ của CÙNG vùng này trước khi ghi (Issue 5.25).
+    // Xoá bản CŨ của CÙNG vùng này trước khi ghi (Issue 5.25).
     //
     // Sau mỗi lần tua, sidecar xoá bộ đệm và whisper gõ lại đúng vùng audio đó,
     // nhưng timestamp ra KHÁC: đường tính anchor đổi (`resolveAnchor` lấy mẫu
@@ -131,7 +131,7 @@ export class TranscriptService {
       if (normalizeSource(bucket.words[0]?.sourceId) !== source) continue;
       // Giữ từ nằm NGOÀI hoàn toàn vùng mới.
       //
-      // ⚠️ So sánh `videoStart` với `videoEnd` khi quyết định "nằm ngoài" — nếu
+      // So sánh `videoStart` với `videoEnd` khi quyết định "nằm ngoài" — nếu
       // so cả hai với `from` thì từ cũ chạm biên vẫn bị xoá, và thay vào đó
       // vùng mới ghi đè một từ lệch vài trăm ms cũng bị xoá ⇒ cache lủng củng.
       // Một từ chỉ bị coi là thuộc vùng mới khi nó CHỒNG lấn lên đó; từ nằm
@@ -207,7 +207,7 @@ export class TranscriptService {
    * cửa sổ thì sau mốc đó hệ thống không biết đã xem tới đâu và rơi về nhịp
    * transcribe thường (~2s), tức replay được một đoạn rồi đoạn sau phải chờ.
    *
-   * ⚠️ Điều kiện lọc phải là CHỒNG LẤN (`bucketEnd >= fromSec`), không phải
+   * Điều kiện lọc phải là CHỒNG LẤN (`bucketEnd >= fromSec`), không phải
    * "bắt đầu sau mốc". Bucket khoá theo giây của từ ĐẦU và trải ~một window
    * sidecar, nên nó có thể bắt đầu trước mốc tua rồi vươn qua sau: lọc theo
    * `anchorTime` là mất sạch các từ trong khoảng `fromSec → bucketEnd`. Phép

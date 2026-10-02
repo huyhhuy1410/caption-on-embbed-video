@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = 'https://api.commandcode.ai/provider/v1';
 /**
  * Model MẶC ĐỊNH — cố ý chọn dòng rẻ, KHÔNG phải dòng đắt.
  *
- * ⚠️ Đổi dòng model là đổi chi phí, nên default phải là dòng "flash" (nhanh +
+ * Đổi dòng model là đổi chi phí, nên default phải là dòng "flash" (nhanh +
  * rẻ) chứ không phải dòng "pro"/"max". Parker yêu cầu rõ: dùng model tối ưu
  * chi phí, không dùng model đắt. Việc dịch caption EN→VI là việc ngắn, lặp lại
  * liên tục, ~15–25 nhóm caption/phút — đây đúng là loại việc dòng flash làm
@@ -29,14 +29,14 @@ const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash';
 
 /**
  * 503 = model quá tải, TẠM THỜI. Thử lại đặt ở TẦNG GATEWAY, không ở đây.
- * ⚠️ Xem `callChat` — provider này KHÔNG tự retry, vì gateway đang đếm quota.
+ * Xem `callChat` — provider này KHÔNG tự retry, vì gateway đang đếm quota.
  */
 const RETRYABLE_STATUS = new Set([503]);
 
 /**
  * 429 = hết quota. Tài liệu nói upstream trả 429 với `rate_limit_error`.
  *
- * ⚠️ KHÔNG retry ở bất kỳ đâu — xem `ProviderUnavailableError`. Hết quota là
+ * KHÔNG retry ở bất kỳ đâu — xem `ProviderUnavailableError`. Hết quota là
  * trạng thái của CẢ PROJECT trong cửa sổ một phút, thử lại trong cùng phút chỉ
  * chỉ đốt thêm quota mà chắc chắn vẫn 429.
  */
@@ -47,7 +47,7 @@ const MAX_RETRY_DELAY_MS = 8_000;
 /**
  * Chờ tối thiểu khi provider báo 429 mà KHÔNG kèm gợi ý thời gian.
  *
- * ⚠️ Không có con số này thì 429 rơi về `retryAfterMs = 0` ⇒
+ * Không có con số này thì 429 rơi về `retryAfterMs = 0` ⇒
  * `pauseUntil(now + 0)` là no-op ⇒ hàng đợi thử lại ngay lập tức ⇒ đốt quota
  * liên tục. Quota của hệ
  * thống này tính theo CỬA SỔ MỘT PHÚT (`TRANSLATE_WINDOW_MS`), nên phải chờ
@@ -58,11 +58,11 @@ const QUOTA_FALLBACK_DELAY_MS = 60_000;
 /**
  * Backoff gợi ý cho 503 — lỗi của chính batch này, không phải quota.
  *
- * ⚠️ CHỈ LÀ GỢI Ý đặt vào `ProviderUnavailableError.retryAfterMs` cho tầng
+ * CHỈ LÀ GỢI Ý đặt vào `ProviderUnavailableError.retryAfterMs` cho tầng
  * gateway. Việc thử lại thật do gateway làm, vì chỉ nó đếm được số request
  * trong cửa sổ quota.
  *
- * ⚠️ Cố ý KHÔNG import từ `gemini.provider` dù logic giống hệt: mỗi provider
+ * Cố ý KHÔNG import từ `gemini.provider` dù logic giống hệt: mỗi provider
  * một file độc lập, đổi transport của Gemini không được kéo theo file này.
  */
 export function retryDelayMs(attempt: number): number {
@@ -72,7 +72,7 @@ export function retryDelayMs(attempt: number): number {
 /**
  * Thời gian server dặn chờ sau 429, đọc từ body rồi tới header.
  *
- * ⚠️ KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
+ * KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
  * cắt nó xuống dưới một phút là tự bảo đảm lần thử kế tiếp rơi đúng vào cửa sổ
  * vừa cạn, rồi 429 lại, và cứ thế.
  *
@@ -124,12 +124,12 @@ interface ExplainResult {
 /**
  * Bóc JSON ra khỏi câu trả lời của model.
  *
- * ⚠️ Chat Completions KHÔNG có `responseSchema` như Gemini, nên không thể ép
+ * Chat Completions KHÔNG có `responseSchema` như Gemini, nên không thể ép
  * model trả JSON đúng kiểu cấu trúc. Chỉ còn cách dặn trong prompt rồi tự bóc.
  * Model hay bọc JSON trong ```json ... ``` hoặc kèm một câu giải thích trước/
  * sau, nên phải cắt phần rác trước khi `JSON.parse`.
  *
- * ⚠️ KHÔNG gửi `response_format: {type:'json_object'}`: tài liệu CommandCode
+ * KHÔNG gửi `response_format: {type:'json_object'}`: tài liệu CommandCode
  * không liệt kê field đó cho `/chat/completions`, gửi field lạ dễ nhận 400 —
  * hậu quả là mất bản dịch, tệ hơn nhiều so với phải tự bóc JSON.
  */
@@ -157,7 +157,7 @@ export function extractJson(raw: string): string {
  * - Endpoint: `POST /chat/completions`
  * - Auth: `Authorization: Bearer <CMD_API_KEY>`
  *
- * ⚠️ Key nằm ở backend `.env`, TUYỆT ĐỐI không đóng gói vào extension (xem
+ * Key nằm ở backend `.env`, TUYỆT ĐỐI không đóng gói vào extension (xem
  * CLAUDE.md). Provider này chỉ được dựng phía server.
  */
 @Injectable()
@@ -182,7 +182,7 @@ export class CommandCodeProvider
   /**
    * POST MỘT chat completion và trả JSON đã parse.
    *
-   * ⚠️ Hàm này KHÔNG tự thử lại, và đó là chủ ý — đừng thêm retry vào đây.
+   * Hàm này KHÔNG tự thử lại, và đó là chủ ý — đừng thêm retry vào đây.
    *
    * Lý do: throttle của gateway đếm số request để giữ trần. Retry nội bộ ở đây
    * khiến MỘT lượt drain bắn nhiều HTTP call mà bộ đếm không thấy gì cả — đã

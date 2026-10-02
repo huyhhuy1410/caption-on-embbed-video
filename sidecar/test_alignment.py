@@ -1,6 +1,6 @@
 # unit test
 #
-# ⚠️ Kỳ vọng suy ra TỪ `OVERLAP_SIZE`, không viết cứng 1.5 (Issue 5.30).
+# Kỳ vọng suy ra TỪ `OVERLAP_SIZE`, không viết cứng 1.5 (Issue 5.30).
 # Lý do: `compute_video_time` trừ đúng bằng độ dài gối đầu mà bộ đệm giữ
 # lại, tức `OVERLAP_SIZE`. Viết cứng ở test cũ làm cả test lẫn hàm cùng dựa
 # vào một con số không ai ràng buộc — đổi overlap là cả hai xanh trong khi

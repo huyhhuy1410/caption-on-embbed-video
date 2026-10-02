@@ -21,7 +21,7 @@ export class TranslateController {
   ) {}
   @Post()
   async translate(@Body() body: TranslateDto) {
-    // ⚠️ Endpoint này dùng CHUNG trần quota với đường caption (WebSocket), nên
+    // Endpoint này dùng CHUNG trần quota với đường caption (WebSocket), nên
     // phải hỏi bộ đếm dùng chung trước khi gọi provider — xem
     // TranslationRateLimiter. Không kiểm tra ở đây thì một caller HTTP có thể
     // đẩy tổng số request vượt trần mà gateway không hề biết.

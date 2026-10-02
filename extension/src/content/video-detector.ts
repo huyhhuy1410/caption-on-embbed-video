@@ -96,7 +96,7 @@ function syncOverlayVisibility(): void {
 /**
  * Ẩn overlay khi video được chọn không có chỗ để hiện (Issue 5.23).
  *
- * ⚠️ Cố ý KHÔNG đổi sang video nhìn thấy: nhiều trang dùng video 0×0 làm nguồn
+ * Cố ý KHÔNG đổi sang video nhìn thấy: nhiều trang dùng video 0×0 làm nguồn
  * audio, mà nó VẪN phát ra tiếng và `tabCapture` vẫn bắt. Ưu tiên "video nhìn
  * thấy" sẽ neo nhầm sang video khác trong cùng trang — tệ hơn hẳn việc không
  * hiện gì. Người dùng tự chọn video qua picker nếu muốn xem phụ đề.
@@ -124,7 +124,7 @@ chrome.runtime.onMessage.addListener((message) => {
       // `dispose()` lúc tắt đã gỡ nút và xoá target, nên phải gắn lại ở đây —
       // không thì nút CC fullscreen chỉ mọc lại khi tình cờ có mutation DOM.
       fullscreen.setTarget(activeVideo, overlay);
-      // ⚠️ Bắt nguồn ngay lúc BẬT, không đợi `reconcile()` đổi video: offscreen
+      // Bắt nguồn ngay lúc BẬT, không đợi `reconcile()` đổi video: offscreen
       // mới khởi tạo nên `activeSourceId` của nó đang null, và các chunk đầu
       // sẽ rơi vào namespace chung. `reconcile()` chỉ gọi khi video ĐỔI, mà
       // lúc vừa bật thì `activeVideo` thường đã đúng sẵn (Issue 5.20).
@@ -245,12 +245,12 @@ document.addEventListener(
 // 2.3. Buffering: `paused` vẫn `false` nên handler `"pause"` ở trên không bắt
 // được (FR-2.4). `waiting` = hết dữ liệu, `stalled` = mạng chậm.
 //
-// ⚠️ DỪNG OVERLAY, KHÔNG CẮT CAPTURE: `tabCapture` bắt audio CẢ TAB, nên lúc
+// DỪNG OVERLAY, KHÔNG CẮT CAPTURE: `tabCapture` bắt audio CẢ TAB, nên lúc
 // video này buffer thì tab vẫn có thể phát tiếng từ video khác. Cắt audio ở
 // đây sẽ giết phụ đề của các video sau — đó là quyết định kiến trúc (EC-5),
 // không phải sót sót.
 //
-// ⚠️ KHÔNG dùng `currentTime` để đo "đứng yên": đó là so sánh với chính mốc
+// KHÔNG dùng `currentTime` để đo "đứng yên": đó là so sánh với chính mốc
 // vừa cập nhật ở frame trước, nên vòng rAF tự tắt ngay frame đầu (Issue 5.28).
 // `readyState` là trạng thái thật của media pipeline, không suy ra gì cả.
 for (const eventName of ["waiting", "stalled"] as const) {
@@ -281,7 +281,7 @@ document.addEventListener(
 /**
  * Mã định danh video, ổn định suốt phiên — dùng làm khoá cache (Issue 5.20).
  *
- * ⚠️ Phải là chuỗi, không phải tham chiếu element: `reconcile()` chạy lại rất
+ * Phải là chuỗi, không phải tham chiếu element: `reconcile()` chạy lại rất
  * nhiều (mutation DOM) và tạo element mới thì tham chiếu đổi mọi lần, còn
  * danh tính thì không. Mỗi video một `WeakMap` riêng ⇒ đổi `src` hoặc SPA thay
  * element vẫn ra CÙNG mã, nên cache của video đó còn dùng được.
@@ -301,7 +301,7 @@ function sourceIdFor(video: HTMLVideoElement): string {
 /**
  * Báo cho backend biết nguồn âm thanh vừa đổi.
  *
- * ⚠️ Bắn cho MỌI lần đổi, kể cả lúc caption đang TẮT: backend còn giữ cache
+ * Bắn cho MỌI lần đổi, kể cả lúc caption đang TẮT: backend còn giữ cache
  * của video trước, và nếu không báo thì lúc user bật lại caption trên video mới,
  * seek vẫn nhận lời của video cũ.
  */

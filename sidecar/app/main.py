@@ -32,7 +32,7 @@ OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)    # Độ gối đầu (overlap) 1.5 giâ
 # phần giữ lại chính là trọn window đã transcribe và phép trừ mất nghĩa.
 CATCHUP_WINDOW_SIZE = 2 * SAMPLE_RATE
 
-# ⚠️ Watchdog: phải lớn hơn `WINDOW_SIZE`, nếu không thì nó cắt bộ đệm đúng lúc
+# Watchdog: phải lớn hơn `WINDOW_SIZE`, nếu không thì nó cắt bộ đệm đúng lúc
 # window đang chờ đủ dữ liệu ⇒ transcribe lại cả đoạn, liên tục không ngừng.
 MAX_BUFFER_SIZE = 12 * SAMPLE_RATE     # Giới hạn bộ đệm tối đa 12 giây (Watchdog chống tràn RAM)
 # Số từ tối đa trong một nhóm caption trước khi buộc mở nhóm mới.
@@ -125,7 +125,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # audio đều mang `sourceId` của video đang phát, nên nhận ra
                 # nguồn đổi ngay từ dữ liệu, không phụ thuộc lệnh đi qua.
                 #
-                # ⚠️ Không thay thế nhánh `source-switch` bên trên: lệnh đó tới
+                # Không thay thế nhánh `source-switch` bên trên: lệnh đó tới
                 # SỚM, xoá bộ đệm trước khi chunk audio mới kịp về — đợi tới đây
                 # thì vài giây tiếng của video cũ vẫn còn nằm trong bộ đệm. Nhánh
                 # này chỉ là lưới an toàn cho lúc backend socket đang đóng.
@@ -167,7 +167,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             # Đủ audio cho một window thì chạy Whisper.
             #
-            # ⚠️ Cỡ window KHÔNG cố định: lượt đầu sau reset dùng window nhỏ
+            # Cỡ window KHÔNG cố định: lượt đầu sau reset dùng window nhỏ
             # để bắt kịp — xem `resolve_window_size` (Issue 5.22).
             window_size = resolve_window_size(is_first_chunk)
             if len(audio_buffer) >= window_size:
@@ -210,7 +210,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
 
-# === Helper: Ghi log độ trễ để đo thật ===
 def log_latency(
     anchor: dict[str, Any] | None,
     window_size: int,
@@ -218,26 +217,10 @@ def log_latency(
     is_first_chunk: bool,
     window_started_at: float,
 ) -> None:
-    """In một dòng log đủ để TÍNH ĐỘ TRỄ thật, không chỉ log thời điểm.
+    """Log độ trễ đo được: log backend không có timestamp nên phải tự tính ở đây.
 
-    ⚠️ Vì sao cần: log backend KHÔNG có timestamp (gotcha #36), nên từ log đó
-    không đo được độ trễ. Dòng này gộp ba mốc cần thiết, mỗi mốc một tên gọi
-    riêng để grep/sort được.
-
-    Ba mốc:
-    - `audioStartAt` — giây monotonic lúc frame đầu tiên của window được gom.
-    - `sentAt`       — giây monotonic lúc gửi `words` đi.
-    - `lagSec`       — **độ trễ tính sẵn**, không cần tự trừ.
-
-    ⚠️ `lagSec` = thời gian chờ whisper + độ dài audio đã gom. Lý do cộng độ
-    dài audio: tính từ lúc window BẮT ĐẦU gom, video đã chạy được
-    `window_size` giây rồi, mà trong `window_size` giây đó người dùng chưa
-    thấy chữ nào. Nói cách khác đây là độ trễ so với thời điểm video bắt đầu
-    phát đoạn audio đó — cái mà mắt người thật sự so.
-
-    ⚠️ `videoTime` là mốc VIDEO của đoạn, khác `audioStartAt` (mốc máy). Hai
-    cái này không trừ vào nhau được; giữ cả hai để khi đọc log mới biết đoạn
-    nào ứng với video từ đâu.
+    `lagSec` cộng cả độ dài audio đã gom, vì tính từ lúc window bắt đầu gom thì
+    video đã chạy được `window_size` giây mà chưa hiện chữ nào.
     """
     sent_at = time.perf_counter()
     video_time = anchor.get("videoTimeAtCapture", 0.0) if anchor else 0.0
@@ -253,50 +236,33 @@ def log_latency(
     )
 
 
-# === Helper: Nhận diện lệnh reset từ backend (tách khỏi vòng lặp để test được) ===
+# Các hàm dưới đây tách khỏi vòng lặp websocket để test được (Issue 4.20).
 def is_reset_command(metadata: dict[str, Any] | None) -> bool:
-    """Backend gửi type="reset" khi user tua (Issue 5.21).
-
-    Tách thành hàm thuần theo đúng bài học Issue 4.20: logic nằm trong vòng lặp
-    `while` của websocket thì không test được, mà đây lại là nhánh quyết định
-    phụ đề sau khi tua có khớp nội dung hay không.
-    """
+    """Backend gửi `type="reset"` khi user tua (Issue 5.21)."""
     return metadata is not None and metadata.get("type") == "reset"
 
 
-# === Helper: Nhận diệu lệnh ĐỔI NGUỒN từ backend (tách khỏi vòng lặp để test được) ===
 def is_source_switch(metadata: dict[str, Any] | None) -> bool:
-    """Backend gõ type="source-switch" khi `activeVideo` đổi (Issue 5.20).
+    """Backend gửi `type="source-switch"` khi `activeVideo` đổi (Issue 5.20).
 
-    Khác `is_reset_command` ở chỗ KÈM theo `sourceId` — đó là danh tính video
-    mới, dán lên từng từ để backend tách cache theo nguồn (FR-1.3). Nhánh reset
-    không đổi nguồn nên không cần.
-
-    Tách thành hàm thuần theo đúng bài học Issue 4.20: logic nằm trong vòng lặp
-    `while` của websocket thì không test được, mà đây là nhánh quyết định phụ đề
-    sau khi đổi video có lẫn nội dung video trước hay không.
+    Khác `is_reset_command` ở chỗ KÈM theo `sourceId` — danh tính video mới để
+    dán lên từng từ, tách cache theo nguồn (FR-1.3). Lệnh reset không đổi nguồn.
     """
     return metadata is not None and metadata.get("type") == "source-switch"
 
 
-# === Helper: Cỡ window cho lượt transcribe kế tiếp (tách khỏi vòng lặp để test được) ===
 def resolve_window_size(is_first_chunk: bool) -> int:
-    """Window nhỏ cho lượt ĐẦU sau reset/đầu stream, cỡ chuẩn cho các lượt sau.
+    """Cỡ window cho lượt transcribe kế tiếp.
 
-    `is_first_chunk=True` nghĩa là bộ đệm bắt đầu ĐÚNG tại anchor (không có gì
-    để trừ 1.5s) — đúng hai thời điểm user đang chờ caption xuất hiện: đầu
-    stream, và ngay sau khi tua. Chờ đủ window ở đó tạo khoảng trống nhìn thấy được
-    (Issue 5.22).
-
-    Tách thành hàm thuần theo bài học Issue 4.20 — nhánh này nằm trong vòng lặp
-    websocket thì không test được.
+    `is_first_chunk=True` nghĩa là bộ đệm bắt đầu ĐÚNG tại anchor — đúng hai
+    thời điểm user đang chờ caption: đầu stream và ngay sau khi tua. Chờ đủ
+    window chuẩn ở đó tạo khoảng trống nhìn thấy được (Issue 5.22).
     """
     return CATCHUP_WINDOW_SIZE if is_first_chunk else WINDOW_SIZE
 
 
-# === Helper: Hàm thuần tính mốc thời gian video cho một từ (tách khỏi whisper để test được) ===
 def compute_video_time(raw_video_time: float, word_time: float, is_first_chunk: bool) -> float:
-    # ⚠️ Trừ ĐÚNG bằng `OVERLAP_SIZE`, KHÔNG hardcode 1.5 (Issue 5.30).
+    # Trừ ĐÚNG bằng `OVERLAP_SIZE`, KHÔNG hardcode 1.5 (Issue 5.30).
     #
     # Sau mỗi lượt, bộ đệm giữ lại `[-OVERLAP_SIZE:]` làm gối đầu cho window
     # sau, nên mốc phải lùi đúng bằng độ dài gối đó. Trước đây con số 1.5
@@ -323,19 +289,14 @@ def parse_metadata(raw_message: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-# === Helper: Chia từ thành nhóm caption (tách khỏi vòng lặp để test được) ===
 def assign_caption_groups(words: list[dict[str, Any]], max_words: int) -> None:
     """Gán `captionStart` cho từng từ, mỗi nhóm dùng chung một mốc.
 
-    ⚠️ Tách thành hàm thuần theo bài học Issue 4.20: logic nằm trong hai vòng
-    lặp lồng nhau của `transcribe_chunk` thì không test được, mà đây lại là
-    nhánh quyết định chỗ nào bị cắt giữa câu.
-
-    ⚠️ `captionStart` của một nhóm là video time của TỪ ĐẦU nhóm đó. Vì vậy nếu
+    `captionStart` của một nhóm là video time của TỪ ĐẦU nhóm đó. Vì vậy nếu
     nhóm bị cắt giữa chừng (bởi `max_words` chứ không phải dấu câu) sẽ tách câu
     thành hai nhóm.
 
-    ⚠️ Gán `captionStart` TRƯỚC khi kiểm tra điều kiện reset — từ cuối nhóm vẫn
+    Gán `captionStart` TRƯỚC khi kiểm tra điều kiện reset — từ cuối nhóm vẫn
     phải mang mốc của nhóm đó. Gán sau sẽ làm từ cuối nhận `None`.
     """
     caption_start: float | None = None

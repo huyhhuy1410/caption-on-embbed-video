@@ -22,7 +22,7 @@ export class ExplainController {
 
   @Post()
   async explainWord(@Body() body: ExplainWordDto) {
-    // ⚠️ Endpoint này dùng CHUNG Gemini instance (và CHUNG quota 15 req/phút) với
+    // Endpoint này dùng CHUNG Gemini instance (và CHUNG quota 15 req/phút) với
     // /translate và đường caption, nên phải đi qua cùng bộ đếm — xem
     // TranslationRateLimiter. Ghi ở TẦNG GỌI, không ở ExplainService,
     // để không đếm trùng. Hết chỗ thì trả 429 ngay (HTTP, client tự thử lại),

@@ -34,7 +34,7 @@ describe('TranslationRateLimiter', () => {
   });
 
   it('blocks on cooldown even when the sliding window has room', () => {
-    // ⚠️ Hồi quy cho Issue 5.16: cửa sổ còn trống (0 request) KHÔNG được phép
+    // Hồi quy cho Issue 5.16: cửa sổ còn trống (0 request) KHÔNG được phép
     // bỏ qua cooldown — nếu không thì `pauseUntil` là dòng code chết và đường
     // khác tiếp tục bắn provider trong khi nó đã báo hết quota.
     limiter.pauseUntil(10_000);

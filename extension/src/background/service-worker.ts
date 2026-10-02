@@ -139,7 +139,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   // Chuyển tiếp kết quả từ backend xuống content script của tab đang capture.
-  // ⚠️ Phải chuyển NGUYÊN message, không dựng lại object `{type, words}` như
+  // Phải chuyển NGUYÊN message, không dựng lại object `{type, words}` như
   // trước — cách đó làm rơi mọi field khác mà backend gửi kèm.
   if (
     message?.type === "words" ||
