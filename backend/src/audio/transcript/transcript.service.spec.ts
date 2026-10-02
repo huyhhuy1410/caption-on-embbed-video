@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { TranscriptService, Word } from './transcript.service';
-// Helper tạo một từ với videoStart cho trước
+// Từ giả với `videoStart` cho trước.
 function makeWord(videoStart: number, sourceId: string | null = null): Word {
   return {
     w: 'test',
@@ -258,16 +258,11 @@ describe('TranscriptService', () => {
 
   describe('TTL', () => {
     it('removes a bucket that has not been accessed past TTL', () => {
-      // BƯỚC 1: mock Date.now về một mốc cố định
       const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
-      // addWords với videoStart = 0 (key 0)
       service.addWords([makeWord(0)]);
 
-      // BƯỚC 2: giả vờ thời gian trôi hơn 30 phút
       nowSpy.mockReturnValue(1_000_000 + 31 * 60 * 1000);
-      // gọi getRange -> bucket key 0 bị xoá -> kết quả rỗng
       const result = service.getRange(null, 0, 0.5);
-      // expect(...).toEqual([]);
       expect(result).toEqual([]);
       nowSpy.mockRestore();
     });
