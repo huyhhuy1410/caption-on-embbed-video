@@ -10,9 +10,15 @@ import { VideoClockService } from './clock/video-clock.service';
 import { TranslateService } from '../ai/translate.service';
 import { TranslationRateLimiter } from '../ai/translation-rate-limiter.service';
 import { ProviderUnavailableError } from '../ai/errors';
+import {
+  CaptureScope,
+  isScope,
+  sameScope,
+  captionKey,
+} from './streaming-transcript';
 
-/** Một caption group: các từ dùng chung một `captionStart`. */
-type CaptionGroup = { captionStart: number; text: string };
+/** Windowed dùng mốc thời gian; streaming dùng identity ổn định. */
+type CaptionGroup = { captionStart: number; text: string; captionId?: string };
 
 /**
  * Khoá hàng đợi dịch = (nguồn, captionStart).
@@ -22,12 +28,22 @@ type CaptionGroup = { captionStart: number; text: string };
  * câu của video A bị xem như đã thử (nên bỏ, không dịch lại) hoặc nhận nhầm bản
  * dịch của video B (Issue 5.20).
  */
-function queueKey(sourceId: string | null, captionStart: number): string {
-  return `${sourceId ?? ''}|${captionStart}`;
+function queueKey(
+  sourceId: string | null,
+  captionStart: number,
+  captionId?: string,
+): string {
+  return captionId
+    ? captionKey(sourceId, captionId)
+    : `${sourceId ?? ''}|${captionStart}`;
 }
 
 /** Nhóm đã gắn nguồn, dùng khi xếp hàng dịch. Xem `enqueueForTranslation`. */
-type QueuedGroup = { captionStart: number; text: string; sourceId: string | null };
+type QueuedGroup = CaptionGroup & {
+  sourceId: string | null;
+  sessionId?: string;
+  client?: WebSocket;
+};
 
 /** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
 const MAX_TRANSLATE_ATTEMPTS = 3;
@@ -48,7 +64,6 @@ const TRANSIENT_HOLD_MAX_MS = 5 * 60_000;
 
 @WebSocketGateway()
 export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
-  // Biến lưu trữ tham chiếu WebSocket client của Extension Chrome đang kết nối
   private extensionClient?: WebSocket;
 
   /**
@@ -60,6 +75,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    * cập nhật biến này thì replay trả lời của video trước.
    */
   private activeSourceId: string | null = null;
+  private activeScope?: CaptureScope;
+  private awaitingAudio = false;
+  private readonly inFlight = new Set<string>();
 
   /** value là `QueuedGroup` — phải giữ `sourceId` để drain ghi cache đúng nguồn. */
   private readonly pending = new Map<string, QueuedGroup>();
@@ -97,11 +115,15 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly translateService: TranslateService,
     private readonly rateLimiter: TranslationRateLimiter,
   ) {
-    // 1.1. Đăng ký callback lắng nghe kết quả Subtitle trả về từ Python Sidecar
     this.sidecarService.setOpenHandler(() => {
       // Sidecar giữ state theo từng WS connection; reconnect = buffer/source
       // sạch. Gửi lại nguồn HIỆN TẠI để window đầu sau reload vào đúng namespace.
-      if (this.activeSourceId !== null) {
+      if (this.activeScope)
+        this.sendToExtension({
+          type: 'sidecar-reconnected',
+          ...this.activeScope,
+        });
+      if (!this.activeScope && this.activeSourceId !== null) {
         this.sidecarService.sendSourceSwitch(this.activeSourceId);
       }
     });
@@ -113,12 +135,56 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       try {
         const parsedMessage = JSON.parse(message);
         if (parsedMessage.type === 'words') {
+          if (parsedMessage.mode === 'streaming') {
+            if (
+              !this.extensionClient ||
+              !this.activeScope ||
+              !isScope(parsedMessage) ||
+              !sameScope(this.activeScope, parsedMessage)
+            )
+              return;
+            const applied =
+              this.transcriptService.applyStreamingUpdate(parsedMessage);
+            if (!applied) return;
+            this.sendToExtension(applied.update);
+            for (const caption of applied.update.captions.filter(
+              (c) => c.finalized,
+            )) {
+              const cached = this.transcriptService.getTranslation(
+                this.activeSourceId,
+                caption.captionId,
+              );
+              if (cached)
+                this.sendToExtension({ type: 'translation', ...cached });
+            }
+            this.enqueueForTranslation(
+              applied.finalized.map((c) => ({
+                captionId: c.state.captionId,
+                captionStart: c.state.captionStart,
+                text: c.words.map((w) => w.w).join(' '),
+              })),
+            );
+            return;
+          }
+          if (
+            this.activeScope &&
+            (!isScope(parsedMessage) ||
+              !sameScope(this.activeScope, parsedMessage))
+          )
+            return;
+          if (
+            parsedMessage.words?.some(
+              (w: { sourceId?: string | null }) =>
+                (w.sourceId ?? null) !== this.activeSourceId,
+            )
+          )
+            return;
           this.transcriptService.addWords(parsedMessage.words);
-          // Dịch SAU khi đã forward/ghi cache — không chặn đường words.
           this.enqueueForTranslation(collectCaptionGroups(parsedMessage.words));
         }
       } catch (error) {
         console.warn('Failed to parse message', error);
+        return;
       }
       if (
         this.extensionClient &&
@@ -145,7 +211,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     for (const group of groups) {
       const cached = this.transcriptService.getTranslation(
         this.activeSourceId,
-        group.captionStart,
+        group.captionId ?? group.captionStart,
       );
       // So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
       // ranh giới window: lần đầu chỉ thấy nửa câu, lần sau mới đủ. Nếu chỉ
@@ -157,16 +223,30 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // dịch của video cũ bị ghi vào namespace của video mới.
       const queued: QueuedGroup = {
         captionStart: group.captionStart,
+        captionId: group.captionId,
         text: group.text,
         sourceId: this.activeSourceId,
+        sessionId: this.activeScope?.sessionId,
+        client: this.extensionClient,
       };
-      const key = queueKey(queued.sourceId, queued.captionStart);
+      const key = queueKey(
+        queued.sourceId,
+        queued.captionStart,
+        queued.captionId,
+      );
+      if (queued.captionId && this.inFlight.has(key)) continue;
       const tried = this.attempts.get(key) ?? 0;
       if (tried >= MAX_TRANSLATE_ATTEMPTS) continue;
 
       // Ghi đè: nhóm có thể đã trong hàng đợi với text CŨ (ngắn hơn), giờ dài
       // ra. Bản mới nhất là bản đúng.
       this.pending.set(key, queued);
+      while (this.pending.size > 300)
+        this.pending.delete(this.pending.keys().next().value!);
+      while (this.attempts.size > 300)
+        this.attempts.delete(this.attempts.keys().next().value!);
+      while (this.heldSince.size > 300)
+        this.heldSince.delete(this.heldSince.keys().next().value!);
     }
     this.scheduleDrain();
   }
@@ -201,7 +281,6 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }, wait);
   }
 
-
   /** Nhóm này đã bị giữ chờ 503 quá lâu chưa? Xem `TRANSIENT_HOLD_MAX_MS`. */
   private hasHeldTooLong(key: string, now: number): boolean {
     const since = this.heldSince.get(key);
@@ -226,11 +305,18 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    const batch = Array.from(this.pending.values());
+    const batch = Array.from(this.pending.values()).filter(
+      (g) =>
+        !g.captionId ||
+        !this.transcriptService.getTranslation(g.sourceId, g.captionId),
+    );
     this.pending.clear();
     if (batch.length === 0) return;
 
     this.draining = true;
+    batch.forEach((g) =>
+      this.inFlight.add(queueKey(g.sourceId, g.captionStart, g.captionId)),
+    );
     // Ghi mốc NGAY TRƯỚC khi bắn — đây là bộ đếm quota, phải khớp số request
     // thật đã rời máy, kể cả request rồi thất bại.
     this.rateLimiter.recordCall();
@@ -244,7 +330,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       batch.forEach((group, index) => {
         // Xoá mốc giữ NGAY khi thành công: để sót lại thì lần 503 sau nhóm này
         // bị coi là "đã giữ quá lâu" và bị bỏ oan.
-        this.heldSince.delete(queueKey(group.sourceId, group.captionStart));
+        this.heldSince.delete(
+          queueKey(group.sourceId, group.captionStart, group.captionId),
+        );
         const vi = results[index]?.text.trim();
         if (!vi) return;
 
@@ -252,26 +340,39 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // drain có thể chạy vài giây sau khi user đã đổi sang video khác.
         this.transcriptService.setTranslation({
           captionStart: group.captionStart,
+          captionId: group.captionId,
           text: group.text,
           vi,
           sourceId: group.sourceId,
         });
-        this.sendToExtension({
-          type: 'translation',
-          captionStart: group.captionStart,
-          text: group.text,
-          vi,
-        });
+        if (
+          group.sourceId === this.activeSourceId &&
+          group.sessionId === this.activeScope?.sessionId &&
+          group.client === this.extensionClient
+        ) {
+          this.sendToExtension({
+            type: 'translation',
+            captionStart: group.captionStart,
+            captionId: group.captionId,
+            sourceId: group.sourceId,
+            text: group.text,
+            vi,
+          });
+        }
       });
     } catch (error: unknown) {
       // Ba nhánh, KHÁC NHAU về hậu quả — xem `ProviderUnavailableError`.
       const now = Date.now();
       const quotaError =
         error instanceof ProviderUnavailableError && !error.retryable;
-      const overloaded = error instanceof ProviderUnavailableError && error.retryable;
+      const overloaded =
+        error instanceof ProviderUnavailableError && error.retryable;
       // 503 đã giữ quá trần ⇒ bỏ (còn câu mới trong hàng đợi vẫn được thử).
       const heldTooLong = batch.some((g) =>
-        this.hasHeldTooLong(queueKey(g.sourceId, g.captionStart), now),
+        this.hasHeldTooLong(
+          queueKey(g.sourceId, g.captionStart, g.captionId),
+          now,
+        ),
       );
 
       if (quotaError) {
@@ -282,7 +383,10 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Cooldown nằm ở limiter dùng chung, nên đường HTTP cũng dừng theo.
         this.rateLimiter.pauseUntil(now + error.retryAfterMs);
         for (const group of batch) {
-          this.pending.set(queueKey(group.sourceId, group.captionStart), group);
+          this.pending.set(
+            queueKey(group.sourceId, group.captionStart, group.captionId),
+            group,
+          );
         }
         console.warn(
           `Translation paused ${Math.round(error.retryAfterMs / 1000)}s (quota), ` +
@@ -300,7 +404,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           now + error.retryAfterMs,
         );
         for (const group of batch) {
-          const key = queueKey(group.sourceId, group.captionStart);
+          const key = queueKey(
+            group.sourceId,
+            group.captionStart,
+            group.captionId,
+          );
           if (!this.heldSince.has(key)) {
             this.heldSince.set(key, now);
           }
@@ -313,7 +421,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Còn lại: lỗi của CHÍNH batch (400/401/500) — tính công rồi bỏ sau MAX
         // lần; hoặc 503 đã giữ quá `TRANSIENT_HOLD_MAX_MS`.
         for (const group of batch) {
-          const key = queueKey(group.sourceId, group.captionStart);
+          const key = queueKey(
+            group.sourceId,
+            group.captionStart,
+            group.captionId,
+          );
           this.attempts.set(key, (this.attempts.get(key) ?? 0) + 1);
           this.heldSince.delete(key);
         }
@@ -323,6 +435,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         );
       }
     } finally {
+      batch.forEach((g) =>
+        this.inFlight.delete(queueKey(g.sourceId, g.captionStart, g.captionId)),
+      );
       this.draining = false;
       // Nhóm mới có thể đã về trong lúc đang chờ request này.
       this.scheduleDrain();
@@ -341,20 +456,95 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   handleConnection(client: WebSocket) {
     console.info('Extension connected to audio WebSocket');
     this.extensionClient = client;
+    this.activeScope = undefined;
+    this.awaitingAudio = false;
 
     client.on('error', (err) => {
       console.error('Extension audio WebSocket error:', err);
     });
 
     client.on('message', (data: RawData, isBinary: boolean) => {
+      if (client !== this.extensionClient) return;
       if (isBinary) {
+        if (this.activeScope && !this.awaitingAudio) return;
+        this.awaitingAudio = false;
         const buffer = toBuffer(data);
+        if (this.activeScope && buffer.length !== 32000) return;
         this.sidecarService.sendAudio(buffer);
         return;
       }
 
       try {
         const parsed: unknown = JSON.parse(data.toString());
+        if (isRecord(parsed) && (isScope(parsed) || this.activeScope)) {
+          if (!isScope(parsed)) return;
+          const control = [
+            'source-switch',
+            'seek',
+            'source-language',
+            'playback',
+          ].includes(String(parsed.type));
+          if (control) {
+            if (
+              parsed.type === 'seek' &&
+              (!Number.isFinite(parsed.seekTimeAtCapture) ||
+                Number(parsed.seekTimeAtCapture) < 0)
+            )
+              return;
+            if (
+              parsed.type === 'source-language' &&
+              parsed.language !== null &&
+              (typeof parsed.language !== 'string' ||
+                !/^[a-z]{2,3}$/.test(parsed.language))
+            )
+              return;
+            if (
+              parsed.type === 'playback' &&
+              !['paused', 'ended', 'playing'].includes(String(parsed.state))
+            )
+              return;
+            if (!this.adoptScope(parsed)) return;
+            this.awaitingAudio = false;
+            this.videoClockService.reset();
+            this.sidecarService.sendControl(
+              parsed as CaptureScope & { type: string },
+            );
+            if (parsed.type === 'seek')
+              this.replay(Number(parsed.seekTimeAtCapture));
+          } else if (parsed.type === 'restore-snapshot') {
+            if (!sameScope(this.activeScope, parsed)) return;
+            if (
+              this.transcriptService.restoreSnapshot(
+                parsed,
+                parsed.words,
+                parsed.translations,
+              )
+            )
+              this.replay(0);
+          } else if (parsed.type === 'audio') {
+            if (
+              !sameScope(this.activeScope, parsed) ||
+              parsed.frames !== 16000 ||
+              parsed.sampleRate !== 16000 ||
+              !Number.isSafeInteger(parsed.seq) ||
+              !Number.isFinite(parsed.frameStartVideoTime) ||
+              !Number.isFinite(parsed.videoTimeAtCapture) ||
+              !Number.isFinite(parsed.capturedAtEpochMs)
+            )
+              return;
+            const metadata =
+              process.env.CAPTION_MODE === 'streaming'
+                ? parsed
+                : {
+                    ...parsed,
+                    videoTimeAtCapture: this.videoClockService.resolveAnchor(
+                      Number(parsed.videoTimeAtCapture),
+                    ),
+                  };
+            this.awaitingAudio = this.sidecarService.sendMetadata(metadata);
+          }
+          return;
+        }
         if (isRecord(parsed) && parsed.type === 'source-switch') {
           const sourceId = (parsed as { sourceId?: string }).sourceId;
           if (typeof sourceId === 'string' && sourceId) {
@@ -386,10 +576,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             );
 
             // Bản dịch đi kèm, thiếu chúng thì dòng VI rỗng ở đúng các đoạn tiếp theo.
-            const replayTranslations = this.transcriptService.getTranslationsFrom(
-              sourceId,
-              seekTime,
-            );
+            const replayTranslations =
+              this.transcriptService.getTranslationsFrom(sourceId, seekTime);
             console.info('Seek received:', seekTime);
             console.info('Replay words:', replayWords.length);
             this.sendToExtension({
@@ -419,9 +607,49 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  handleDisconnect() {
+  private adoptScope(scope: CaptureScope): boolean {
+    const old = this.activeScope;
+    if (
+      old &&
+      scope.sessionId === old.sessionId &&
+      (scope.generation < old.generation ||
+        (scope.generation === old.generation &&
+          scope.sourceId !== old.sourceId))
+    )
+      return false;
+    this.activeScope = {
+      sessionId: scope.sessionId,
+      generation: scope.generation,
+      sourceId: scope.sourceId,
+    };
+    this.activeSourceId = scope.sourceId;
+    this.transcriptService.setScope(this.activeScope);
+    return true;
+  }
+
+  private replay(seekTime: number): void {
+    this.sendToExtension({
+      type: 'replay',
+      ...this.activeScope,
+      seekTime,
+      words: this.transcriptService.getRangeFrom(this.activeSourceId, seekTime),
+      translations: this.transcriptService.getTranslationsFrom(
+        this.activeSourceId,
+        seekTime,
+      ),
+      captions: this.transcriptService.getFinalizedCaptions(
+        this.activeSourceId,
+        seekTime,
+      ),
+    });
+  }
+
+  handleDisconnect(client?: WebSocket) {
+    if (client && client !== this.extensionClient) return;
     console.info('Extension disconnected from audio WebSocket');
     this.extensionClient = undefined;
+    this.awaitingAudio = false;
+    this.activeScope = undefined;
   }
 }
 
