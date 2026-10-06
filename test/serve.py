@@ -94,6 +94,13 @@ class RangeRequestHandler(SimpleHTTPRequestHandler):
         # Chỉ log range — log mỗi request làm nhiễu khi xem log test.
         if self.headers.get("Range"):
             super().log_message(fmt, *args)
+            
+    def handle(self):
+        try:
+            super().handle()
+        except ConnectionResetError:
+            # Browser frequently aborts Range requests when scrubbing/seeking.
+            pass
 
 
 class _BoundedReader:
@@ -112,7 +119,14 @@ class _BoundedReader:
                 chunk = self._handle.read(min(65536, self._remaining))
                 if not chunk:
                     break
-                outputfile.write(chunk)
+                try:
+                    outputfile.write(chunk)
+                except ConnectionResetError:
+                    # Browser frequently aborts Range requests when scrubbing/seeking.
+                    # Ignore the reset instead of dumping a stack trace.
+                    break
+                except BrokenPipeError:
+                    break
                 self._remaining -= len(chunk)
         finally:
             self._handle.close()

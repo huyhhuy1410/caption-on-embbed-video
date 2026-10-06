@@ -1,229 +1,149 @@
 import type { CaptionOverlay } from "./overlay";
 
-/**
- * "CC fullscreen" wrapper — AC-5.3 / FR-4.5.
- *
- * Fullscreen đẩy element lên top layer, trên cả root stacking context: overlay
- * nằm ở document.body sẽ không được vẽ, z-index không cứu được. Nên video và
- * overlay phải nằm chung một wrapper, và chính wrapper đó đi fullscreen.
- */
 type MovableNode = Node & {
   moveBefore?: (node: Node, child: Node | null) => void;
 };
 
-/** `before` chỉ dùng được khi còn là con của `parent`; SPA có thể đã gỡ nó. */
-function validBefore(parent: Node, node: Node, before: Node | null): Node | null {
-  if (before === null || before === node) return null;
-  return before.parentNode === parent ? before : null;
-}
+type FullscreenSession = {
+  wrapper: HTMLDivElement;
+  video: HTMLVideoElement;
+  overlay: CaptionOverlay;
+  parent: Node;
+  before: Node | null;
+  videoStyle: string;
+  videoMoved: boolean;
+  overlayParent: Node | null;
+  overlayBefore: Node | null;
+  overlayStyle: string;
+  root: Document | ShadowRoot;
+};
 
-/**
- * Cho node chưa nằm trong document. `moveBefore` là phép di chuyển, không phải
- * phép chèn — ném HierarchyRequestError khi node đang rời.
- */
-function insertNode(parent: Node, node: Node, before: Node | null): void {
-  parent.insertBefore(node, validBefore(parent, node, before));
-}
-
-/**
- * Cho node đã nằm trong document. `moveBefore` nguyên tử nên pause steps của
- * media element không chạy. Fallback `insertBefore` cũng an toàn: xoá và chèn
- * trong cùng một task, pause steps thoát sớm nếu element đã về lại document.
- */
 function moveNode(parent: Node, node: Node, before: Node | null): void {
+  const sibling = before !== node && before?.parentNode === parent ? before : null;
   const movable = parent as MovableNode;
-  if (typeof movable.moveBefore === "function") {
+  // moveBefore giữ state media; insertBefore là fallback cho Chrome cũ/node rời cây.
+  if (parent.isConnected && node.isConnected && movable.moveBefore) {
     try {
-      movable.moveBefore(node, validBefore(parent, node, before));
+      movable.moveBefore(node, sibling);
       return;
-    } catch (error) {
-      console.warn("Caption AI: moveBefore failed, falling back", error);
+    } catch {
+      // Các root khác nhau hoặc browser không hỗ trợ phép move này.
     }
   }
-  parent.insertBefore(node, validBefore(parent, node, before));
+  parent.insertBefore(node, sibling);
 }
 
-/**
- * Vùng ảnh thật của video sau khi `object-fit: contain` letterbox.
- *
- * Fullscreen kéo element thành 100%×100% nên getBoundingClientRect trả element
- * box phủ kín màn hình, còn ảnh chỉ chiếm một dải giữa — neo caption vào đó là
- * caption rơi xuống vệt đen.
- */
 function videoContentRect(video: HTMLVideoElement): DOMRect {
   const box = video.getBoundingClientRect();
-  const intrinsicWidth = video.videoWidth;
-  const intrinsicHeight = video.videoHeight;
-  if (!intrinsicWidth || !intrinsicHeight || !box.width || !box.height) {
-    return box;
-  }
-  const scale = Math.min(box.width / intrinsicWidth, box.height / intrinsicHeight);
-  const width = intrinsicWidth * scale;
-  const height = intrinsicHeight * scale;
-  return new DOMRect(
-    box.left + (box.width - width) / 2,
-    box.top + (box.height - height) / 2,
-    width,
-    height,
-  );
+  if (!video.videoWidth || !video.videoHeight || !box.width || !box.height) return box;
+  const scale = Math.min(box.width / video.videoWidth, box.height / video.videoHeight);
+  const width = video.videoWidth * scale;
+  const height = video.videoHeight * scale;
+  return new DOMRect(box.left + (box.width - width) / 2, box.top + (box.height - height) / 2, width, height);
 }
 
 export class CaptionFullscreen {
-  /** Chỉ non-null khi đang ở CC fullscreen. */
-  private wrapper: HTMLDivElement | null = null;
-
-  /** Ref, không phải bảo đảm — SPA có thể thay element bất cứ lúc nào. */
+  private session: FullscreenSession | null = null;
   private targetVideo: HTMLVideoElement | null = null;
   private targetOverlay: CaptionOverlay | null = null;
-
-  /** Điểm khôi phục, ghi lúc enter. Cần cả nextSibling để về đúng vị trí. */
-  private savedParent: Node | null = null;
-  private savedNextSibling: Node | null = null;
-  private savedVideoStyle: string | null = null;
-  private savedOverlayStyle: string | null = null;
-
   private button: HTMLButtonElement | null = null;
-
-  private readonly onFullscreenChange = (): void =>
-    this.handleFullscreenChange();
-
+  private observer: MutationObserver | null = null;
+  private readonly onFullscreenChange = (): void => this.handleFullscreenChange();
   private readonly onViewportResize = (): void => this.repositionOverlay();
 
   isActive(): boolean {
-    return this.wrapper !== null;
+    return this.session !== null;
   }
 
-  repositionOverlay(force = false): void {
-    const video = this.targetVideo;
-    const overlay = this.targetOverlay;
-    if (!this.wrapper || !video || !overlay) return;
-    overlay.position(videoContentRect(video), force);
-  }
-
-  /**
-   * Trỏ wrapper vào video hiện tại. Gọi từ reconcile() mỗi khi activeVideo đổi,
-   * để nút toggle tồn tại trước khi user cần bấm.
-   */
   setTarget(video: HTMLVideoElement, overlay: CaptionOverlay): void {
+    // Target mới không được lấy quyền sở hữu video của phiên fullscreen đang chạy.
+    if (this.session && (video !== this.session.video || overlay !== this.session.overlay)) {
+      this.exit();
+    }
     this.targetVideo = video;
     this.targetOverlay = overlay;
     this.mountButton(overlay);
   }
 
-  /**
-   * Dọn phiên fullscreen đã hỏng: wrapper hoặc video rời document. Không có
-   * fullscreenchange nào nổ cho việc đó, và reconcile() không đổi target khi
-   * đang active, nên không còn đường nào khác dọn.
-   */
-  recoverIfBroken(): void {
-    if (!this.wrapper) return;
-    if (!this.wrapper.isConnected) {
-      this.restore();
-      return;
-    }
-    if (!this.targetVideo || !this.targetVideo.isConnected) {
-      this.restore();
+  repositionOverlay(force = false): void {
+    const session = this.session;
+    if (session?.video.isConnected) {
+      session.overlay.position(videoContentRect(session.video), force);
     }
   }
 
-  /**
-   * Vào CC fullscreen. Mọi thao tác DOM bên dưới chạy trong một task, không có
-   * await xen giữa lúc video rời parent và lúc nó vào wrapper — xem moveNode().
-   * Await duy nhất là requestFullscreen ở cuối, phải còn trong task của handler
-   * click mới tính là user gesture.
-   */
+  recoverIfBroken(): void {
+    const session = this.session;
+    if (!session) return;
+    if (!session.wrapper.isConnected || !session.parent.isConnected ||
+        session.wrapper.parentNode !== session.parent ||
+        session.video.parentNode !== session.wrapper || !session.video.isConnected) {
+      this.exit();
+    }
+  }
+
   async enter(): Promise<void> {
     const video = this.targetVideo;
     const overlay = this.targetOverlay;
-
-    if (this.wrapper !== null || !video || !overlay || !video.isConnected) {
-      return;
-    }
-
-    this.savedParent = video.parentNode;
-    this.savedNextSibling = video.nextSibling;
-    this.savedVideoStyle = video.style.cssText;
-    this.savedOverlayStyle = overlay.element.style.cssText;
-
-    if (!this.savedParent) {
-      this.savedNextSibling = null;
-      this.savedVideoStyle = null;
-      this.savedOverlayStyle = null;
-      return;
-    }
-
+    if (this.session || !video?.isConnected || !overlay || !video.parentNode) return;
+    const root = video.getRootNode();
+    if (!(root instanceof Document || root instanceof ShadowRoot)) return;
+    const wrapper = document.createElement("div");
     const rect = video.getBoundingClientRect();
-
-    // this.wrapper được gán trước khi dựng xong DOM, nên lỗi giữa chừng sẽ để
-    // nó non-null mà chưa dời gì — và guard ở trên chặn luôn mọi lần bấm sau.
-    let wrapper: HTMLDivElement;
+    wrapper.style.cssText = `position:relative;width:${rect.width}px;height:${rect.height}px;background:#000;overflow:hidden;`;
+    const session: FullscreenSession = {
+      wrapper, video, overlay, parent: video.parentNode, before: video.nextSibling,
+      videoStyle: video.style.cssText, videoMoved: false, overlayParent: overlay.element.parentNode,
+      overlayBefore: overlay.element.nextSibling, overlayStyle: overlay.element.style.cssText, root,
+    };
+    this.session = session;
     try {
-      wrapper = document.createElement("div");
-      wrapper.style.cssText = `
-        position: relative;
-        width: ${rect.width}px;
-        height: ${rect.height}px;
-        background: #000;
-        overflow: hidden;
-      `;
-      this.wrapper = wrapper;
-
-      insertNode(this.savedParent, wrapper, this.savedNextSibling);
-
-      // Size tường minh: rule của site (`.player > video { ... }`) có thể không
-      // còn match sau khi video đổi parent.
-      video.style.cssText =
-        "display:block; width:100%; height:100%; object-fit:contain;";
+      moveNode(session.parent, wrapper, video);
+      video.style.cssText = "display:block;width:100%;height:100%;object-fit:contain;";
       moveNode(wrapper, video, null);
-
-      // Element fullscreen trở thành containing block cho position:fixed con
-      // cháu nó — đó là lý do overlay phải vào đây. Đặt vị trí thật sự ở
-      // handleFullscreenChange, khi layout đã ổn định.
-      wrapper.appendChild(overlay.element);
-
+      session.videoMoved = true;
+      // Top layer không vẽ overlay nằm ngoài element fullscreen.
+      moveNode(wrapper, overlay.element, null);
+      wrapper.addEventListener("fullscreenchange", this.onFullscreenChange);
       document.addEventListener("fullscreenchange", this.onFullscreenChange);
       window.addEventListener("resize", this.onViewportResize, { passive: true });
-    } catch (error) {
-      console.warn("Caption AI: could not build fullscreen wrapper", error);
-      this.restore();
-      return;
-    }
-
-    try {
+      this.observer = new MutationObserver(() => this.recoverIfBroken());
+      this.observer.observe(document, { childList: true, subtree: true });
+      let ancestorRoot: Node = root;
+      while (ancestorRoot instanceof ShadowRoot) {
+        this.observer.observe(ancestorRoot, { childList: true, subtree: true });
+        ancestorRoot = ancestorRoot.host.getRootNode();
+      }
+      this.setButtonLabel();
       await wrapper.requestFullscreen();
     } catch (error) {
-      console.warn("Caption AI: fullscreen request rejected", error);
-      this.restore();
+      console.warn("Caption AI: fullscreen request failed", error);
+      // Promise cũ có thể reject sau dispose + enter; không được dọn phiên mới.
+      if (this.session === session) this.restore(session);
     }
   }
 
-  /**
-   * Nút nằm trong shadow root của overlay để đi theo overlay vào wrapper. Đặt ở
-   * document.body thì nó ở lại ngoài và biến mất trong fullscreen — đúng vấn đề
-   * lớp này sinh ra để giải quyết.
-   *
-   * Là flex child chứ không absolute: :host co theo nội dung, nên offset tuyệt
-   * đối sẽ đè lên chữ caption.
-   */
+  private ownsFullscreen(session: FullscreenSession): boolean {
+    // Document retarget fullscreenElement thành host khi wrapper nằm trong shadow root.
+    return session.root.fullscreenElement === session.wrapper;
+  }
+
   private mountButton(overlay: CaptionOverlay): void {
-    if (this.button && this.button.isConnected) return;
-
-    const shadow = overlay.element.shadowRoot;
-    if (!shadow) return;
-
+    if (this.button?.getRootNode() === overlay.element.shadowRoot) return;
+    this.button?.remove();
+    this.button = null;
+    if (!overlay.element.shadowRoot) return;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "cc-fullscreen-btn";
+    // Inline style ensures the icon displays properly if the page overrides button styles
+    button.style.cssText = "display: flex; align-items: center; justify-content: center; font-size: 16px; width: 24px; height: 24px; line-height: 1; padding: 0; background: rgba(0, 0, 0, 0.5); color: white; border: 1px solid rgba(255, 255, 255, 0.3); border-radius: 4px; cursor: pointer; backdrop-filter: blur(4px); box-sizing: border-box;";
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (this.isActive()) {
-        this.exit();
-      } else {
-        void this.enter();
-      }
+      if (this.isActive()) this.exit();
+      else void this.enter();
     });
-
     overlay.mountToolbarButton(button);
     this.button = button;
     this.setButtonLabel();
@@ -232,114 +152,66 @@ export class CaptionFullscreen {
   private setButtonLabel(): void {
     if (!this.button) return;
     const active = this.isActive();
-    this.button.textContent = "⛶";
+    this.button.textContent = active ? "✖" : "⛶";
     this.button.title = active ? "Exit fullscreen" : "Caption fullscreen";
-    this.button.setAttribute(
-      "aria-label",
-      active ? "Exit caption fullscreen" : "Enter caption fullscreen",
-    );
+    this.button.setAttribute("aria-label", active ? "Exit caption fullscreen" : "Enter caption fullscreen");
     this.button.setAttribute("aria-pressed", String(active));
   }
 
   private exit(): void {
-    if (!this.wrapper) return;
-    if (document.fullscreenElement === this.wrapper) {
-      void document.exitFullscreen().catch(() => {
-        this.restore();
-      });
-    } else {
-      // Browser đã thoát (ESC), chỉ còn DOM chưa dọn.
-      this.restore();
+    const session = this.session;
+    if (!session) return;
+    if (this.ownsFullscreen(session)) {
+      void document.exitFullscreen().catch(() => {});
     }
+    // Dọn ngay cả khi browser không phát fullscreenchange cho subtree đã rời cây.
+    this.restore(session);
   }
 
-  /**
-   * Nổ ở cả chiều vào lẫn chiều ra. restore() gỡ chính listener này, nên event
-   * do exitFullscreen() sinh ra không thể quay lại đây lần hai.
-   */
   private handleFullscreenChange(): void {
-    const wrapper = this.wrapper;
-    // Phải guard wrapper: khi cả hai đều null thì phép so dưới là true.
-    if (wrapper !== null && document.fullscreenElement === wrapper) {
-      wrapper.style.width = "100%";
-      wrapper.style.height = "100%";
-      // Lúc này layout fullscreen mới áp. Gọi trong enter() sẽ đo nhầm box cũ,
-      // còn vòng rAF chỉ chạy khi video đang phát.
-      //
-      // `force = true`: overlay đã bị user kéo đi chỗ khác (FR-4.4) thì
-      // `position()` sẽ bỏ qua, mà `left`/`top` đang lưu theo viewport của
-      // TRANG — trong wrapper 100%×100% toạ độ đó không còn đúng.
+    const session = this.session;
+    if (!session) return;
+    if (this.ownsFullscreen(session)) {
+      session.wrapper.style.width = "100%";
+      session.wrapper.style.height = "100%";
       this.repositionOverlay(true);
-      this.setButtonLabel();
-      return;
-    }
-
-    if (wrapper !== null) {
-      this.restore();
+    } else {
+      this.restore(session);
     }
   }
 
-  /**
-   * Trả video và overlay về chỗ cũ rồi bỏ wrapper. Video phải ra khỏi wrapper
-   * trước khi wrapper bị xoá, không thì nó bị rời document theo và pause steps
-   * chạy.
-   */
-  private restore(): void {
-    const wrapper = this.wrapper;
-    const video = this.targetVideo;
-    const overlay = this.targetOverlay;
-    if (!wrapper) return;
-
-    // Vô điều kiện: enter() ghi đè inline style của video trước khi dời nó, nên
-    // lỗi ở khoảng giữa sẽ làm mất style gốc của site.
-    if (video && this.savedVideoStyle !== null) {
-      video.style.cssText = this.savedVideoStyle;
+  private restore(session: FullscreenSession): void {
+    if (this.session !== session) return;
+    this.session = null;
+    this.observer?.disconnect();
+    this.observer = null;
+    session.wrapper.removeEventListener("fullscreenchange", this.onFullscreenChange);
+    document.removeEventListener("fullscreenchange", this.onFullscreenChange);
+    window.removeEventListener("resize", this.onViewportResize);
+    const { wrapper, video, overlay, parent } = session;
+    const ownsVideo = video.parentNode === wrapper;
+    if (ownsVideo || (!session.videoMoved && video.parentNode === parent)) {
+      video.style.cssText = session.videoStyle;
     }
-
-    // Chỉ dời về nếu nó vẫn là của mình; SPA có thể đã lấy đi rồi.
-    if (video && video.parentNode === wrapper) {
-      if (this.savedParent && this.savedParent.isConnected) {
-        moveNode(this.savedParent, video, this.savedNextSibling);
-      } else {
-        video.remove();
-      }
+    if (ownsVideo && wrapper.isConnected && parent.isConnected && wrapper.parentNode === parent) {
+      moveNode(parent, video, session.before);
     }
-
-    // Overlay đang là con của wrapper, xoá wrapper là nó rời document theo.
-    if (overlay && overlay.element.parentNode === wrapper) {
-      overlay.element.style.cssText = this.savedOverlayStyle ?? "";
-      document.body.appendChild(overlay.element);
-      // Về layout thường, và không có gì reposition khi video đang pause.
-      //
-      // ÉP neo lại: `left`/`top` lúc trong fullscreen theo viewport toàn màn
-      // hình, không theo toạ độ trang — giữ lại thì overlay về trang ở chỗ lệch.
-      if (video) {
+    // Wrapper/parent bị SPA gỡ thì bỏ cùng video, không hồi sinh vào trang mới.
+    if (overlay.element.parentNode === wrapper) {
+      overlay.element.style.cssText = session.overlayStyle;
+      const destination = session.overlayParent?.isConnected ? session.overlayParent : document.body;
+      if (destination) moveNode(destination, overlay.element, session.overlayBefore);
+      if (video.isConnected && video.parentNode === parent) {
         overlay.resetToVideoAnchor();
         overlay.position(video.getBoundingClientRect(), true);
       }
     }
-
     wrapper.remove();
-
-    document.removeEventListener("fullscreenchange", this.onFullscreenChange);
-    window.removeEventListener("resize", this.onViewportResize);
-    this.wrapper = null;
-    this.savedParent = null;
-    this.savedNextSibling = null;
-    this.savedVideoStyle = null;
-    this.savedOverlayStyle = null;
     this.setButtonLabel();
   }
 
   dispose(): void {
-    if (this.wrapper) {
-      if (document.fullscreenElement === this.wrapper) {
-        void document.exitFullscreen().catch(() => {});
-      }
-      this.restore();
-    }
-    document.removeEventListener("fullscreenchange", this.onFullscreenChange);
-
+    this.exit();
     this.button?.remove();
     this.button = null;
     this.targetVideo = null;
