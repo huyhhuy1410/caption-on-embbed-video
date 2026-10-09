@@ -1,235 +1,209 @@
-let capturedTabId: number | undefined;
+import { SnapshotStore } from "../shared/snapshot-store";
+import { serializeTranscript } from "../content/transcript-export";
+import type { HealthState } from "../shared/protocol";
 
-console.info("Caption AI: service worker loaded");
-
-/**
- * MV3 giết service worker sau ~30s idle, nên state phiên phải nằm trong
- * `chrome.storage.session`: giữ trong biến thì `capturedTabId` mất và lần bấm
- * sau BẬT capture thứ hai thay vì tắt.
- */
 const SESSION_KEY = "captionSession";
-type CaptionSession = { tabId: number };
-
+const LAST_TAB_KEY = "lastCaptionTab";
 const BACKEND_URL = "http://127.0.0.1:8000";
-
+const snapshots = new SnapshotStore();
+// Snapshot chỉ được đọc qua SW, không mở toàn bộ storage cho content scripts.
+const storageReady = chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+void storageReady.catch(error => console.warn("Caption AI: storage access restriction failed", error));
+type CaptionSession = { tabId: number };
 type ExplainResult =
   | { ok: true; explanation: unknown }
   | { ok: false; kind: "throttled"; retryAfterMs: number }
   | { ok: false; kind: "unavailable" }
   | { ok: false; kind: "error"; message: string };
 
-/**
- * Content script không fetch được cross-origin, nên nó hỏi qua service worker.
- * Trả `true` để giữ kênh message mở cho tới khi request xong — thiếu nó thì
- * `sendResponse` sau `await` sẽ mất.
- */
-async function requestExplanation(
-  word: string,
-  context: string,
-): Promise<ExplainResult> {
+async function requestExplanation(word: string, context: string): Promise<ExplainResult> {
   try {
     const response = await fetch(`${BACKEND_URL}/explain-word`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ word, context, lang: "vi" }),
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word, context, lang: "vi" }), signal: AbortSignal.timeout(30_000),
     });
     if (response.status === 429) {
-      const body = (await response.json()) as { retryAfterMs?: number };
-      return {
-        ok: false,
-        kind: "throttled",
-        retryAfterMs:
-          typeof body.retryAfterMs === "number" ? body.retryAfterMs : 0,
-      };
+      const body = await response.json();
+      return { ok: false, kind: "throttled", retryAfterMs: Number(body.retryAfterMs) || 0 };
     }
     if (response.status === 503) return { ok: false, kind: "unavailable" };
-    if (!response.ok) {
-      return { ok: false, kind: "error", message: `HTTP ${response.status}` };
-    }
+    if (!response.ok) return { ok: false, kind: "error", message: `HTTP ${response.status}` };
     return { ok: true, explanation: await response.json() };
-  } catch (error: unknown) {
-    return {
-      ok: false,
-      kind: "error",
-      message: error instanceof Error ? error.message : String(error),
-    };
+  } catch (error) {
+    return { ok: false, kind: "error", message: String(error) };
   }
 }
 
 async function readSession(): Promise<CaptionSession | undefined> {
-  const stored = await chrome.storage.session.get(SESSION_KEY);
-  const value: unknown = stored[SESSION_KEY];
-  if (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { tabId?: unknown }).tabId === "number"
-  ) {
-    return value as CaptionSession;
-  }
-  return undefined;
+  const value = (await chrome.storage.session.get(SESSION_KEY))[SESSION_KEY];
+  return value && Number.isInteger(value.tabId) ? value : undefined;
 }
 
-// Chrome chỉ cấp `activeTab` khi user bấm icon, nên đây là gesture surface duy
-// nhất để bật; và cũng là chỗ tự nhiên nhất để tắt.
-chrome.action.onClicked.addListener((tab) => {
+// `captions-off` xoá session trước khi content script flush snapshot, nên tab
+// vừa capture vẫn phải được phép ghi nốt. Chỉ tin tab do SW tự ghi.
+async function readTrustedTabId(senderTabId: number): Promise<boolean> {
+  const value = (await chrome.storage.session.get(LAST_TAB_KEY))[LAST_TAB_KEY];
+  return Number.isInteger(value) && value === senderTabId;
+}
+
+async function requestHealth(): Promise<HealthState> {
+  try {
+    const response = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(2500) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const state = await response.json();
+    if (state.backend !== "ready" || !["ready", "loading", "error", "unavailable"].includes(state.sidecar)) {
+      throw new Error("Invalid health response");
+    }
+    return state;
+  } catch {
+    return { backend: "unavailable", sidecar: "unavailable" };
+  }
+}
+
+function toOffscreen(message: object): Promise<unknown> {
+  return chrome.runtime.sendMessage({ ...message, target: "offscreen" });
+}
+
+// Toolbar là gesture duy nhất cấp activeTab cho tabCapture.
+let toggles: Promise<void> = Promise.resolve();
+chrome.action.onClicked.addListener(tab => {
   if (tab.id === undefined) return;
   const tabId = tab.id;
-
-  void (async () => {
+  toggles = toggles.then(async () => {
     const session = await readSession();
-    if (session !== undefined && session.tabId === tabId) {
-      await stopCapture(tabId);
-      return;
-    }
-    await startCapture(tabId);
-  })().catch((error: unknown) => {
-    console.error("Caption AI SW: toggle failed", error);
-  });
+    if (session) await stopCapture(session.tabId);
+    if (session?.tabId !== tabId) await startCapture(tabId);
+  }).catch(error => console.error("Caption AI: capture toggle failed", error));
 });
 
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === "video-clock") {
-    void chrome.runtime
-      .sendMessage({
-        type: "video-clock",
-        videoTime: message.videoTime,
-      })
-      .catch((error: unknown) => {
-        console.warn("Caption AI SW: could not relay video clock", error);
-      });
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || message.target === "offscreen") return;
+  if (message.target === "service-worker") {
+    if (sender.tab || sender.url !== chrome.runtime.getURL("dist/offscreen/offscreen.html")) return;
+    void readSession().then(async session => {
+      if (!session) return;
+      if (!["words", "replay", "translation", "capture-scope", "capture-ready", "status", "error"].includes(message.type)) return;
+      await chrome.tabs.sendMessage(session.tabId, message).catch(() => {});
+    });
+    return;
   }
-
-  // Đổi video: relay xuống offscreen để ghim nguồn vào chunk audio kế tiếp
-  // (Issue 5.20). Không đi qua content script — content đã gửi, SW chỉ nối.
-  if (message?.type === "source-switch") {
-    void chrome.runtime
-      .sendMessage({
-        type: "source-switch",
-        sourceId: message.sourceId,
-      })
-      .catch((error: unknown) => {
-        console.warn("Caption AI SW: could not relay source switch", error);
-      });
-  }
-
-  if (message?.type === "seek") {
-    console.info("Caption AI SW: seek received", message);
-    void chrome.runtime
-      .sendMessage({
-        type: "seek",
-        seekTimeAtCapture: message.seekTimeAtCapture,
-      })
-      .catch((error: unknown) => {
-        console.warn("Caption AI SW: could not relay seek", error);
-      });
-  }
-
-  if (message?.type === "explain-popup-request") {
-    void requestExplanation(String(message.word ?? ""), String(message.context ?? ""))
-      .then((result) => sendResponse(result))
-      .catch((error: unknown) => {
-        sendResponse({
-          ok: false,
-          kind: "error",
-          message: error instanceof Error ? error.message : String(error),
-        });
-      });
+  // Popup không có sender.tab; xử lý trước guard dành riêng cho content script.
+  const fromPopup = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL("dist/popup/popup.html");
+  if (fromPopup && message.action === "caption:toggle") {
+    toggles = toggles.then(async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab?.id === undefined) throw new Error("No active tab");
+        const session = await readSession();
+        if (session?.tabId === tab.id) {
+          await stopCapture(tab.id);
+          await chrome.storage.local.set({ captionEnabled: false });
+          sendResponse({ enabled: false });
+        } else {
+          if (session) await stopCapture(session.tabId);
+          await startCapture(tab.id);
+          await chrome.storage.local.set({ captionEnabled: true });
+          sendResponse({ enabled: true });
+        }
+      } catch (error) {
+        console.error("Caption AI: popup capture toggle failed", error);
+        sendResponse({ enabled: false, error: String(error) });
+      }
+    });
     return true;
   }
-
-  // Chuyển tiếp kết quả từ backend xuống content script của tab đang capture.
-  // Phải chuyển NGUYÊN message, không dựng lại object `{type, words}` như
-  // trước — cách đó làm rơi mọi field khác mà backend gửi kèm.
-  if (
-    message?.type === "words" ||
-    message?.type === "replay" ||
-    message?.type === "translation"
-  ) {
-    void (async () => {
-      // Đọc từ storage chứ không dùng biến in-memory: SW có thể đã ngủ và tỉnh
-      // dậy, lúc đó `capturedTabId` là `undefined` dù phiên vẫn đang chạy.
-      const session = await readSession();
-      const tabId = session?.tabId ?? capturedTabId;
-      if (tabId === undefined) return;
-      await chrome.tabs.sendMessage(tabId, message).catch((error: unknown) => {
-        console.warn("Caption AI SW: could not relay to content", error);
-      });
-    })();
+  if (fromPopup && message.action === "caption:status") {
+    void readSession()
+      .then(session => sendResponse({ enabled: Boolean(session), state: session ? "Captions on" : "Captions off" }))
+      .catch(error => sendResponse({ state: "Unavailable", error: String(error) }));
+    return true;
   }
+  if (fromPopup && message.action === "caption:health") {
+    void requestHealth().then(sendResponse);
+    return true;
+  }
+  // Chỉ nhận control từ top-frame của tab capture; tab khác không đổi source/clock.
+  if (!sender.tab?.id || (sender.frameId ?? 0) !== 0) return;
+  if (message.type === "explain-popup-request") {
+    void requestExplanation(String(message.word ?? ""), String(message.context ?? "")).then(sendResponse);
+    return true;
+  }
+  if (message.type === "health-request") {
+    void requestHealth().then(sendResponse);
+    return true;
+  }
+  const controls = ["video-clock", "source-switch", "seek", "source-language", "playback", "restore-snapshot"];
+  const requests = ["snapshot-load", "snapshot-save", "export-transcript"];
+  if (!controls.includes(message.type) && !requests.includes(message.type)) return;
+  void (async () => {
+    const session = await readSession();
+    const senderTabId = sender.tab!.id!;
+    if (session?.tabId !== senderTabId) {
+      // Chỉ ngoại lệ là snapshot-save sau khi session đã đóng; các request còn
+      // lại từ tab khác phải bị chặn như bình thường.
+      if (message.type !== "snapshot-save" || !(await readTrustedTabId(senderTabId))) {
+        throw new Error("No active capture for this tab");
+      }
+    }
+    if (controls.includes(message.type)) {
+      await toOffscreen(message);
+      return { ok: true };
+    }
+    await storageReady;
+    if (typeof message.url !== "string" || !message.url) throw new Error("Missing snapshot url");
+    if (message.type === "snapshot-load") return { ok: true, snapshot: await snapshots.load(message.url) };
+    if (message.type === "snapshot-save") {
+      await snapshots.save(message.url, message.snapshot);
+      return { ok: true };
+    }
+    if (!["srt", "vtt", "txt"].includes(message.format)) throw new Error("Invalid export format");
+    const text = serializeTranscript(message.format, message.words, message.translations);
+    if (text.length > 4 * 1024 * 1024) throw new Error("Export exceeds size limit");
+    const id = await chrome.downloads.download({
+      url: `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`,
+      filename: `caption-ai.${message.format}`, saveAs: true,
+    });
+    return { ok: true, downloadId: id };
+  })().then(sendResponse).catch(error => sendResponse({ ok: false, message: String(error) }));
+  return true;
 });
 
 async function startCapture(tabId: number): Promise<void> {
   const streamId = await new Promise<string>((resolve, reject) => {
-    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
+    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, id => {
       const error = chrome.runtime.lastError;
-      if (error) {
-        reject(new Error(error.message ?? "Could not capture tab audio"));
-        return;
-      }
-      resolve(id);
+      if (error) reject(new Error(error.message ?? "Could not capture tab audio"));
+      else resolve(id);
     });
   });
-
-  console.info("Caption AI SW: tab capture stream ID acquired", {
-    tabId,
-    streamId,
-  });
-
   await ensureOffscreenDocument();
-  await new Promise<void>((resolve) => setTimeout(resolve, 100));
-
-  console.info("Caption AI SW: dispatching start-audio-capture to offscreen");
-  chrome.runtime.sendMessage({
-    type: "start-audio-capture",
-    streamId,
-    tabId,
-  });
-
-  capturedTabId = tabId;
-  await chrome.storage.session.set({ [SESSION_KEY]: { tabId } });
-
-  await chrome.tabs.sendMessage(tabId, { type: "capturing" });
+  await chrome.storage.session.set({ [SESSION_KEY]: { tabId }, [LAST_TAB_KEY]: tabId });
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "capturing" });
+    await toOffscreen({ type: "start-audio-capture", streamId });
+  } catch (error) {
+    await stopCapture(tabId);
+    throw error;
+  }
 }
 
-/**
- * Tắt hẳn phiên: dừng capture ở offscreen, báo content script ẩn overlay.
- *
- * Không gọi `chrome.offscreen.closeDocument()` — giữ document sống để lần bật
- * sau không dính bẫy Issue 2.3 (receiver phải tồn tại trước khi send).
- */
 async function stopCapture(tabId: number): Promise<void> {
-  console.info("Caption AI SW: stopping capture", { tabId });
-
-  capturedTabId = undefined;
   await chrome.storage.session.remove(SESSION_KEY);
-
-  // Offscreen dọn socket/AudioContext; nó KHÔNG có `chrome.tabs` nên không tự
-  // báo được cho content script (Issue 5.1) — SW làm việc đó.
-  await chrome.runtime
-    .sendMessage({ type: "stop-audio-capture" })
-    .catch((error: unknown) => {
-      console.warn("Caption AI SW: could not stop audio capture", error);
-    });
-
-  await chrome.tabs
-    .sendMessage(tabId, { type: "captions-off" })
-    .catch((error: unknown) => {
-      console.warn("Caption AI SW: could not notify content", error);
-    });
+  await toOffscreen({ type: "stop-audio-capture" }).catch(() => {});
+  await chrome.tabs.sendMessage(tabId, { type: "captions-off" }).catch(() => {});
 }
 
-async function ensureOffscreenDocument() {
-  const contexts = await chrome.runtime.getContexts({});
-  const exists = contexts.some(
-    (context) => context.contextType === "OFFSCREEN_DOCUMENT",
-  );
+chrome.tabs.onRemoved.addListener(tabId => {
+  void readSession().then(session => {
+    if (session?.tabId === tabId) return stopCapture(tabId);
+  });
+});
 
-  if (!exists) {
-    console.info("Caption AI SW: creating offscreen document");
+async function ensureOffscreenDocument(): Promise<void> {
+  const contexts = await chrome.runtime.getContexts({});
+  if (!contexts.some(context => context.contextType === "OFFSCREEN_DOCUMENT")) {
     await chrome.offscreen.createDocument({
-      url: "dist/offscreen/offscreen.html",
-      reasons: [chrome.offscreen.Reason.USER_MEDIA],
+      url: "dist/offscreen/offscreen.html", reasons: [chrome.offscreen.Reason.USER_MEDIA],
       justification: "Capture tab audio for local transcription.",
     });
   }

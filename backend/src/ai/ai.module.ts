@@ -5,6 +5,7 @@ import { NullProvider } from './providers/null.provider';
 import { EXPLAIN_PROVIDER, TRANSLATION_PROVIDER } from './tokens';
 import { TranslateService } from './translate.service';
 import { ExplainService } from './explain.service';
+import { ExplainCacheService } from './explain-cache.service';
 import { TranslationRateLimiter } from './translation-rate-limiter.service';
 import { TranslateController } from './translate.controller';
 import { ExplainController } from './explain.controller';
@@ -65,7 +66,8 @@ function createAiProvider(): TranslationProvider & ExplainProvider {
   providers: [
     TranslateService,
     ExplainService,
-    // Bo dem quota dung chung cho ca duong WS (gateway) lan duong HTTP.
+    ExplainCacheService,
+    // Bộ đếm quota dùng chung cho cả WS và HTTP.
     TranslationRateLimiter,
     {
       // Một instance duy nhất chia cho cả hai token bên dưới.
@@ -86,6 +88,7 @@ function createAiProvider(): TranslationProvider & ExplainProvider {
     EXPLAIN_PROVIDER,
     TranslateService,
     ExplainService,
+    ExplainCacheService,
     TranslationRateLimiter,
   ],
   controllers: [TranslateController, ExplainController],

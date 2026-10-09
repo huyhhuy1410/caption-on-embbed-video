@@ -1,4 +1,16 @@
 import { Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { groupWords, intersects, membership, normalizeRuns } from './windowed-transcript';
+import type { VideoRange, WindowedPatch } from './windowed-transcript';
+import {
+  CaptureScope,
+  CaptionState,
+  FinalCaption,
+  StreamingTranscriptStore,
+  WordsUpdate,
+  captionKey,
+  validWord,
+} from '../streaming-transcript';
 export type Word = {
   w: string;
   s: number;
@@ -18,6 +30,11 @@ export type Word = {
    * namespace riêng thay vì coi như không nguồn — xem `sourceKey`.
    */
   sourceId?: string | null;
+  windowedGroupId?: string;
+  wordId?: string;
+  captionId?: string;
+  provisional?: boolean;
+  capturedAtEpochMs?: number;
 };
 
 type Bucket = {
@@ -25,34 +42,10 @@ type Bucket = {
   lastAccess: number;
   /** Giây video đầu tiên của bucket — khoá đã ghép chuỗi nên phải giữ riêng. */
   anchorTime: number;
+  ranges: VideoRange[];
 };
 
-/** Khoảng video-time hai bản của cùng một từ được coi là trùng (giây). */
-const DEDUP_WINDOW_SEC = 0.5;
-
-/**
- * Bỏ bản ghi trùng của cùng một từ — sliding window ghi lại 1.5s audio hai lần,
- * nên cùng một từ xuất hiện ở hai mốc lệch nhau ít.
- *
- * Chỉ so với từ LIỀN KỀ sau khi sort: các bản trùng nằm cạnh nhau, và mỗi
- * từ chỉ cần so với bản đã giữ gần nhất. So với toàn bộ danh sách là O(n²) —
- * `getRangeFrom` có thể trả hàng nghìn từ.
- */
-function dedupWords(sorted: Word[]): Word[] {
-  const out: Word[] = [];
-  for (const word of sorted) {
-    const last = out[out.length - 1];
-    if (
-      last &&
-      last.w.toLowerCase() === word.w.toLowerCase() &&
-      Math.abs(last.videoStart - word.videoStart) < DEDUP_WINDOW_SEC
-    ) {
-      continue;
-    }
-    out.push(word);
-  }
-  return out;
-}
+export type WindowedResult = WindowedPatch<Word> & { mode: 'windowed' };
 
 function normalizeSource(sourceId: string | null | undefined): string | null {
   // `undefined` và `null` là CÙNG một namespace (không rõ nguồn). Không gộp thì
@@ -82,6 +75,8 @@ function bucketKey(
  * tự thì sinh mới mỗi lần transcribe lại.
  */
 export type SentenceTranslation = {
+  windowedGroupId?: string;
+  captionId?: string;
   captionStart: number;
   text: string;
   vi: string;
@@ -104,77 +99,221 @@ export class TranscriptService {
   private static readonly MAX_BUCKETS = 300;
 
   private readonly cache = new Map<string, Bucket>();
+  private readonly streaming = new StreamingTranscriptStore();
+
+  setScope(scope: CaptureScope): void {
+    this.streaming.setScope(scope);
+  }
+
+  applyStreamingUpdate(
+    update: unknown,
+  ): { update: WordsUpdate; finalized: FinalCaption[] } | null {
+    return this.streaming.apply(update);
+  }
+
+  getFinalizedCaptions(sourceId: string | null, from = 0): CaptionState[] {
+    return this.streaming.getFinalized(sourceId, from).map((c) => c.state);
+  }
+
+  restoreSnapshot(
+    scope: CaptureScope,
+    words: unknown,
+    translations: unknown,
+  ): boolean {
+    if (
+      !Array.isArray(words) ||
+      words.length > 5000 ||
+      !Array.isArray(translations) ||
+      translations.length > 300
+    )
+      return false;
+    if (
+      !words.every(
+        (w) =>
+          validWord(w) &&
+          w.provisional !== true &&
+          (w.captionId === undefined ||
+            (typeof w.captionId === 'string' &&
+              w.captionId.length > 0 &&
+              w.captionId.length <= 256 &&
+              typeof w.wordId === 'string' &&
+              w.wordId.length > 0 &&
+              w.wordId.length <= 256 &&
+              w.provisional === false)),
+      )
+    )
+      return false;
+    if (
+      !translations.every(
+        (t) =>
+          t &&
+          typeof t === 'object' &&
+          Number.isFinite(t.captionStart) &&
+          t.captionStart >= 0 &&
+          typeof t.text === 'string' &&
+          t.text.length <= 10000 &&
+          typeof t.vi === 'string' &&
+          t.vi.length <= 10000 &&
+          (t.captionId === undefined ||
+            (typeof t.captionId === 'string' && t.captionId.length <= 256)),
+      )
+    )
+      return false;
+    const groups = new Map<string, Word[]>();
+    const legacy: Word[] = [];
+    const seen = new Set<string>();
+    for (const raw of words as Word[]) {
+      const w = { ...raw, sourceId: scope.sourceId };
+      if (!w.captionId) {
+        legacy.push(w);
+        continue;
+      }
+      if (seen.has(w.wordId!)) return false;
+      seen.add(w.wordId!);
+      const group = groups.get(w.captionId) ?? [];
+      if (group.some((old) => old.captionStart !== w.captionStart))
+        return false;
+      group.push(w);
+      groups.set(w.captionId, group);
+    }
+    for (const members of groups.values())
+      members.sort((a, b) => a.videoStart - b.videoStart);
+    const entries = [...groups].map(([captionId, members]) => ({
+      state: {
+        captionId,
+        captionStart: members[0].captionStart,
+        wordIds: members.map((w) => w.wordId!),
+        finalized: true,
+      },
+      words: members.sort((a, b) => a.videoStart - b.videoStart),
+      sourceId: scope.sourceId,
+      lastAccess: Date.now(),
+    }));
+    const canonical = this.streaming.restore(scope.sourceId, entries);
+    const restoredIds = new Map<string, string>();
+    const current = this.windowedBuckets(scope.sourceId);
+    const ordered = [...legacy].sort((a, b) => a.videoStart - b.videoStart);
+    for (const [key, members] of groupWords(ordered)) {
+      const indexes = members.map(w => ordered.indexOf(w));
+      if (indexes[indexes.length - 1] - indexes[0] + 1 !== members.length) continue;
+      const range = { from: members[0].videoStart, to: Math.max(...members.map(w => w.videoEnd)) };
+      const identical = current.find(bucket => membership(bucket.words) === membership(members));
+      if (identical) { restoredIds.set(key, identical.words[0].windowedGroupId!); continue; }
+      if (current.some(bucket => bucket.ranges.some(coverage =>
+        coverage.from < range.to && coverage.to > range.from ||
+        coverage.from === range.from && coverage.to === range.to))) continue;
+      const id = randomUUID();
+      const bucket = { words: members.map(w => ({ ...w, windowedGroupId: id })),
+        ranges: [range], anchorTime: range.from, lastAccess: Date.now() };
+      this.cache.set(captionKey(scope.sourceId, id), bucket);
+      current.push(bucket);
+      restoredIds.set(key, id);
+    }
+    this.evict();
+    for (const raw of translations as SentenceTranslation[]) {
+      const entry = raw.captionId ? canonical.get(raw.captionId) : undefined;
+      if (raw.captionId && !entry) continue;
+      if (entry && entry.words.map((w) => w.w).join(' ') !== raw.text) continue;
+      const restoredId = raw.captionId ? undefined : restoredIds.get(raw.windowedGroupId ?? `legacy:${raw.captionStart}`);
+      if (!raw.captionId && (!restoredId || !this.isCurrentWindowedGroup(scope.sourceId, restoredId, raw.text))) continue;
+      const t = {
+        ...raw,
+        ...(restoredId ? { windowedGroupId: restoredId } : {}),
+        sourceId: scope.sourceId,
+        ...(entry
+          ? {
+              captionId: entry.state.captionId,
+              captionStart: entry.state.captionStart,
+            }
+          : {}),
+      };
+      if (!this.getTranslation(scope.sourceId, t.windowedGroupId ?? t.captionId ?? t.captionStart))
+        this.setTranslation(t);
+    }
+    return true;
+  }
 
   // Tách map riêng khỏi `cache`: words đến liên tục, bản dịch đến muộn (sau call AI).
   private readonly translations = new Map<string, TranslationBucket>();
-  addWords(words: Word[]) {
-    if (words.length === 0) return;
-
-    // Khoảng video-time mà lượt ghi này phủ, dùng để tìm bản CŨ cần thay.
-    const from = Math.min(...words.map((w) => w.videoStart));
-    const to = Math.max(...words.map((w) => w.videoEnd));
-
-    // Xoá bản CŨ của CÙNG vùng này trước khi ghi (Issue 5.25).
-    //
-    // Sau mỗi lần tua, sidecar xoá bộ đệm và whisper gõ lại đúng vùng audio đó,
-    // nhưng timestamp ra KHÁC: đường tính anchor đổi (`resolveAnchor` lấy mẫu
-    // của chunk trước, `compute_video_time` trừ 1.5s gối đầu) nên cùng một câu
-    // ra hai mốc lệch nhau hơn 0.5s. Dedup lúc đọc chỉ so với từ LIỀN KỀ nên
-    // không nhận ra là trùng ⇒ giữ cả hai ⇒ bucket phình, `getRange` trả lẫn
-    // các bản timeline khác nhau, overlay nhảy giữa chúng.
-    //
-    // Duyệt MỌI bucket của nguồn này chứ không chỉ bucket trùng khoá: sau khi
-    // tua, anchor lệch làm cùng một vùng rơi vào hai khoá khác nhau (`v1|50` và
-    // `v1|51`), nên chỉ xoá bucket trùng khoá sẽ bỏ sót bản cũ.
-    const source = normalizeSource(words[0].sourceId);
-    for (const [bucketKey, bucket] of this.cache) {
-      if (normalizeSource(bucket.words[0]?.sourceId) !== source) continue;
-      // Giữ từ nằm NGOÀI hoàn toàn vùng mới.
-      //
-      // So sánh `videoStart` với `videoEnd` khi quyết định "nằm ngoài" — nếu
-      // so cả hai với `from` thì từ cũ chạm biên vẫn bị xoá, và thay vào đó
-      // vùng mới ghi đè một từ lệch vài trăm ms cũng bị xoá ⇒ cache lủng củng.
-      // Một từ chỉ bị coi là thuộc vùng mới khi nó CHỒNG lấn lên đó; từ nằm
-      // ngay trước/sau thì giữ nguyên, vì nó phục vụ một đoạn khác.
-      const kept = bucket.words.filter(
-        (w) => w.videoStart >= to || w.videoEnd <= from,
-      );
-      if (kept.length === bucket.words.length) continue;
-      if (kept.length === 0) {
-        this.cache.delete(bucketKey);
-      } else {
-        bucket.words = kept;
-      }
+  private windowedBuckets(sourceId: string | null | undefined): Bucket[] {
+    for (const [key, bucket] of this.cache) {
+      if (Date.now() - bucket.lastAccess > TranscriptService.TTL_MS) this.cache.delete(key);
     }
-
-    const key = bucketKey(words[0].sourceId, Math.floor(words[0].videoStart));
-    const existing = this.cache.get(key);
-    const merged = existing
-      ? existing.words.concat(words).sort((a, b) => a.videoStart - b.videoStart)
-      : words;
-    this.cache.set(key, {
-      words: merged,
-      lastAccess: Date.now(),
-      anchorTime: Math.floor(words[0].videoStart),
-    });
-    console.info(
-      'Cache words:',
-      words.length,
-      'video range:',
-      words[0].videoStart,
-      words[words.length - 1].videoStart,
-      'key:',
-      key,
-    );
-    this.evict();
+    return [...this.cache.values()].filter(bucket =>
+      normalizeSource(bucket.words[0]?.sourceId) === normalizeSource(sourceId));
   }
+
+  addWords(words: Word[]): WindowedResult {
+    const empty: WindowedResult = { mode: 'windowed', words: [], replaceRanges: [], removedWindowedGroupIds: [] };
+    if (!words.length || !words.every(validWord)) return empty;
+    const source = normalizeSource(words[0].sourceId);
+    if (words.some(w => normalizeSource(w.sourceId) !== source || w.wordId)) return empty;
+    const buckets = this.windowedBuckets(source);
+    const old = buckets.flatMap(bucket => bucket.words).sort((a, b) => a.videoStart - b.videoStart);
+    const range = { from: Math.min(...words.map(w => w.videoStart)), to: Math.max(...words.map(w => w.videoEnd)) };
+    const previous = groupWords(old);
+    const inputRuns = normalizeRuns(words, [], randomUUID);
+    const incoming = [...groupWords(inputRuns).values()].flatMap(group => {
+      const ordered = [...group].sort((a, b) => a.videoStart - b.videoStart);
+      const match = [...previous.values()].find(members => membership(members) === membership(ordered));
+      const id = match?.[0].windowedGroupId ?? randomUUID();
+      return ordered.map(w => ({ ...w, windowedGroupId: id }));
+    });
+    const incomingIds = new Set(incoming.map(w => w.windowedGroupId));
+    const reference = old.filter(w => !incomingIds.has(w.windowedGroupId!)).concat(incoming);
+    const next = normalizeRuns(old.filter(w => !incomingIds.has(w.windowedGroupId!) && !intersects(w, range)).concat(incoming), reference, randomUUID);
+    const groups = groupWords(next);
+    const removed = [...previous.keys()].filter(id => !groups.has(id));
+    for (const id of removed) this.translations.delete(captionKey(source, id));
+    const affected = next.filter(w => !previous.has(w.windowedGroupId!) || incomingIds.has(w.windowedGroupId!));
+    const now = Date.now();
+    const liveGroups = [...groups].filter(([id]) => incomingIds.has(id));
+    const liveRanges = new Map(liveGroups.map(([id, members], index) => [id, {
+      from: index === 0 ? range.from : members[0].videoStart,
+      to: index + 1 < liveGroups.length ? liveGroups[index + 1][1][0].videoStart : range.to,
+    }]));
+    for (const [key, bucket] of this.cache) {
+      if (normalizeSource(bucket.words[0]?.sourceId) === source && !groups.has(bucket.words[0]?.windowedGroupId!)) this.cache.delete(key);
+    }
+    for (const [id, members] of groups) {
+      const key = captionKey(source, id);
+      const existing = this.cache.get(key);
+      if (existing && !incomingIds.has(id)) continue;
+      const from = Math.min(...members.map(w => w.videoStart));
+      const to = Math.max(...members.map(w => w.videoEnd));
+      this.cache.set(key, { words: members, lastAccess: now, anchorTime: from,
+        ranges: [liveRanges.get(id) ?? { from, to }] });
+    }
+    this.evict();
+    return { mode: 'windowed', words: affected, replaceRanges: [range], removedWindowedGroupIds: removed };
+  }
+
+  getWindowedReplay(sourceId: string | null | undefined, fromSec: number): WindowedResult {
+    const all = this.windowedBuckets(sourceId);
+    const selected = all.filter(bucket => bucket.ranges.some(range => range.to >= fromSec));
+    const coverage = selected.flatMap(bucket => bucket.ranges);
+    const buckets = all.filter(bucket => selected.includes(bucket) || bucket.words.some(word => coverage.some(range => intersects(word, range))));
+    for (const bucket of buckets) bucket.lastAccess = Date.now();
+    return { mode: 'windowed', words: buckets.flatMap(bucket => bucket.words).sort((a, b) => a.videoStart - b.videoStart),
+      replaceRanges: buckets.flatMap(bucket => bucket.ranges), removedWindowedGroupIds: [] };
+  }
+
+  isCurrentWindowedGroup(sourceId: string | null, id: string, text: string): boolean {
+    const members = this.windowedBuckets(sourceId).flatMap(bucket => bucket.words).filter(w => w.windowedGroupId === id);
+    return members.length > 0 && members.map(w => w.w).join(' ') === text;
+  }
+
   /**
    * Từ trong `[fromSec, toSec]` của ĐÚNG nguồn này.
    *
    * `sourceId` bắt buộc: không lọc theo nguồn thì hai video cùng nằm trong một
    * khoảng giây sẽ trả lẫn lời của nhau.
    */
-  getRange(sourceId: string | null | undefined, fromSec: number, toSec: number) {
+  getRange(
+    sourceId: string | null | undefined,
+    fromSec: number,
+    toSec: number,
+  ) {
     let result: Word[] = [];
     const now = Date.now();
     for (const [key, bucket] of this.cache) {
@@ -183,7 +322,9 @@ export class TranscriptService {
       }
     }
     for (const bucket of this.cache.values()) {
-      if (normalizeSource(bucket.words[0]?.sourceId) !== normalizeSource(sourceId)) {
+      if (
+        normalizeSource(bucket.words[0]?.sourceId) !== normalizeSource(sourceId)
+      ) {
         continue;
       }
       const lastWord = bucket.words[bucket.words.length - 1];
@@ -195,9 +336,12 @@ export class TranscriptService {
     }
 
     result.sort((a, b) => a.videoStart - b.videoStart);
-    return dedupWords(result).filter(
-      (word) => word.videoStart >= fromSec && word.videoStart <= toSec,
-    );
+    return result
+      .concat(
+        this.streaming.getFinalized(sourceId, fromSec).flatMap((c) => c.words),
+      )
+      .filter((word) => word.videoStart >= fromSec && word.videoStart <= toSec)
+      .sort((a, b) => a.videoStart - b.videoStart);
   }
 
   /**
@@ -213,10 +357,7 @@ export class TranscriptService {
    * `anchorTime` là mất sạch các từ trong khoảng `fromSec → bucketEnd`. Phép
    * lọc cuối ở từng từ đã xử lý đúng phần đó (Issue 5.35).
    */
-  getRangeFrom(
-    sourceId: string | null | undefined,
-    fromSec: number,
-  ): Word[] {
+  getRangeFrom(sourceId: string | null | undefined, fromSec: number): Word[] {
     const now = Date.now();
 
     for (const [key, bucket] of this.cache) {
@@ -238,8 +379,13 @@ export class TranscriptService {
     }
 
     result.sort((a, b) => a.videoStart - b.videoStart);
-    const deduped = dedupWords(result);
-    return deduped.filter((word) => word.videoStart >= fromSec);
+    const deduped = result;
+    return deduped
+      .filter((word) => word.videoStart >= fromSec)
+      .concat(
+        this.streaming.getFinalized(source, fromSec).flatMap((c) => c.words),
+      )
+      .sort((a, b) => a.videoStart - b.videoStart);
   }
   private evict() {
     while (this.cache.size > TranscriptService.MAX_BUCKETS) {
@@ -262,16 +408,32 @@ export class TranscriptService {
   /** Bản dịch đã cache cho nhóm này của đúng nguồn, nếu có. */
   getTranslation(
     sourceId: string | null | undefined,
-    captionStart: number,
+    captionStart: number | string,
   ): SentenceTranslation | undefined {
-    return this.translations.get(bucketKey(sourceId, captionStart))?.t;
+    const key =
+      typeof captionStart === 'string'
+        ? captionKey(sourceId, captionStart)
+        : bucketKey(sourceId, captionStart);
+    const bucket = this.translations.get(key);
+    if (!bucket) return undefined;
+    if (Date.now() - bucket.lastAccess > TranscriptService.TTL_MS) {
+      this.translations.delete(key);
+      return undefined;
+    }
+    bucket.lastAccess = Date.now();
+    return bucket.t;
   }
 
   setTranslation(t: SentenceTranslation): void {
-    this.translations.set(bucketKey(t.sourceId, t.captionStart), {
-      t,
-      lastAccess: Date.now(),
-    });
+    this.translations.set(
+      (t.windowedGroupId ?? t.captionId)
+        ? captionKey(t.sourceId, (t.windowedGroupId ?? t.captionId)!)
+        : bucketKey(t.sourceId, t.captionStart),
+      {
+        t,
+        lastAccess: Date.now(),
+      },
+    );
     this.evictTranslations();
   }
 
@@ -309,6 +471,12 @@ export class TranscriptService {
     const now = Date.now();
     const result: SentenceTranslation[] = [];
     const source = normalizeSource(sourceId);
+    const replayWindowedIds = new Set(this.getWindowedReplay(source, fromSec).words.map(w => w.windowedGroupId));
+    const replayCaptionIds = new Set(
+      this.streaming
+        .getFinalized(source, fromSec)
+        .map((c) => c.state.captionId),
+    );
 
     for (const [key, bucket] of this.translations) {
       if (now - bucket.lastAccess > TranscriptService.TTL_MS) {
@@ -316,7 +484,15 @@ export class TranscriptService {
         continue;
       }
       if (normalizeSource(bucket.t.sourceId) !== source) continue;
-      if (bucket.t.captionStart < fromSec) continue;
+      if (bucket.t.windowedGroupId) {
+        if (replayWindowedIds.has(bucket.t.windowedGroupId) && this.isCurrentWindowedGroup(source, bucket.t.windowedGroupId, bucket.t.text)) result.push(bucket.t);
+        continue;
+      }
+      if (
+        bucket.t.captionStart < fromSec &&
+        (!bucket.t.captionId || !replayCaptionIds.has(bucket.t.captionId))
+      )
+        continue;
       bucket.lastAccess = now;
       result.push(bucket.t);
     }

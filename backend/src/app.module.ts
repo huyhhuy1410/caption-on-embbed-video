@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { HealthController } from './health/health.controller';
+import { HealthModule } from './health/health.module';
 import { AudioGateway } from './audio/audio.gateway';
 import { SidecarService } from './audio/sidecar/sidecar.service';
 import { TranscriptService } from './audio/transcript/transcript.service';
@@ -12,13 +12,12 @@ import { VideoClockService } from './audio/clock/video-clock.service';
 @Module({
   imports: [
     AiModule,
-    // Nạp biến môi trường (.env) toàn cục cho toàn bộ ứng dụng
+    HealthModule,
     ConfigModule.forRoot({
       isGlobal: true,
     }),
   ],
-  controllers: [AppController, HealthController],
-  // AudioGateway, SidecarService và TranscriptService phối hợp xử lý pipeline audio
+  controllers: [AppController],
   providers: [
     AppService,
     AudioGateway,

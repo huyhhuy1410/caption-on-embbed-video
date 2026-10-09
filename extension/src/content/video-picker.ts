@@ -16,7 +16,6 @@ export class VideoPicker {
   private chip: HTMLButtonElement;
   private panel: HTMLDivElement;
   private list: HTMLDivElement;
-  private renderedIds: string[] = [];
   private videosRef: HTMLVideoElement[] = [];
 
   /** Video user ghim, `null` = đang theo heuristic. */
@@ -46,6 +45,7 @@ export class VideoPicker {
     private readonly onPick: (video: HTMLVideoElement) => void,
   ) {
     this.host = document.createElement("div");
+    this.host.dataset.captionAiOwned = "true";
     this.shadow = this.host.attachShadow({ mode: "open" });
     this.chip = document.createElement("button");
     this.panel = document.createElement("div");
@@ -146,6 +146,14 @@ export class VideoPicker {
 
     this.chip.type = "button";
     this.chip.className = "chip";
+    this.chip.setAttribute("aria-expanded", "false");
+    this.shadow.addEventListener("keydown", (event) => {
+      if ((event as KeyboardEvent).key !== "Escape" || !this.expanded) return;
+      event.preventDefault();
+      event.stopPropagation();
+      this.setExpanded(false);
+      this.chip.focus();
+    });
     this.panel.className = "panel";
     this.chip.addEventListener("click", (event) => {
       event.preventDefault();
@@ -198,7 +206,9 @@ export class VideoPicker {
       if (!drag || drag.pointerId !== event.pointerId) return;
       this.suppressClick = drag.moved;
       this.drag = null;
-      this.chip.releasePointerCapture?.(event.pointerId);
+      if (this.chip.hasPointerCapture?.(event.pointerId)) {
+        this.chip.releasePointerCapture(event.pointerId);
+      }
     };
     this.chip.addEventListener("pointerup", release);
     this.chip.addEventListener("pointercancel", release);
@@ -207,22 +217,23 @@ export class VideoPicker {
 
   /** Vẽ lại danh sách. Danh sách không đổi thì chỉ cập nhật mục đang ghim. */
   setVideos(videos: HTMLVideoElement[]): void {
-    // Video đã ghim bị SPA gỡ thì thôi ghim — `reconcile()` cũng rơi về heuristic.
-    if (this.picked && !videos.includes(this.picked)) this.picked = null;
+    const connected = [...new Set(videos)].filter((video) => video.isConnected);
+    if (this.picked && !connected.includes(this.picked)) this.picked = null;
 
-    if (videos.length < 2) {
+    if (connected.length < 2) {
       this.clear();
       return;
     }
 
-    const ids = videos.map((v, i) => `${indexOf(v)}:${i}`);
-    if (ids.join() !== this.renderedIds.join()) {
-      this.renderedIds = ids;
-      this.render(videos);
+    // Ref identity phân biệt video trong shadow roots; query document trả -1 cho tất cả.
+    if (connected.length !== this.videosRef.length ||
+        connected.some((video, index) => video !== this.videosRef[index])) {
+      this.render(connected);
     } else {
       this.markActive();
+      this.refreshLabels();
     }
-    this.updateChip(videos);
+    this.updateChip(connected);
     this.host.style.display = "block";
   }
 
@@ -285,6 +296,7 @@ export class VideoPicker {
   private setExpanded(next: boolean): void {
     if (next === this.expanded) return;
     this.expanded = next;
+    this.chip.setAttribute("aria-expanded", String(next));
     if (next) {
       this.host.dataset.expanded = "true";
       document.addEventListener("pointerdown", this.onDocumentPointerDown, true);
@@ -319,6 +331,7 @@ export class VideoPicker {
       item.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
+        if (!video.isConnected || !this.videosRef.includes(video)) return;
         // Bấm lại video đã ghim thì giữ nguyên: `reconcile()` ưu tiên "video
         // đang phát" nên bỏ ghim xong nó chọn lại chính video đó.
         if (video !== this.picked) {
@@ -333,6 +346,17 @@ export class VideoPicker {
       this.list.appendChild(item);
     }
     this.markActive();
+  }
+
+  private refreshLabels(): void {
+    for (const item of Array.from(this.list.querySelectorAll("button"))) {
+      const video = this.videosRef[Number(item.dataset.index)];
+      if (!video) continue;
+      const name = item.querySelector(".name");
+      const tag = item.querySelector(".tag");
+      if (name) name.textContent = describeVideo(video);
+      if (tag) tag.textContent = videoTag(video);
+    }
   }
 
   private markActive(): void {
@@ -350,13 +374,14 @@ export class VideoPicker {
   clear(): void {
     this.setExpanded(false);
     this.host.style.display = "none";
-    this.renderedIds = [];
     this.videosRef = [];
     this.list.textContent = "";
   }
 
   dispose(): void {
-    this.setExpanded(false);
+    this.clear();
+    this.picked = null;
+    this.drag = null;
     this.host.remove();
   }
 }
@@ -393,8 +418,4 @@ export function isVisible(video: HTMLVideoElement): boolean {
     rect.height > 0 &&
     (video.offsetWidth > 0 || video.offsetHeight > 0)
   );
-}
-
-function indexOf(video: HTMLVideoElement): number {
-  return Array.from(document.querySelectorAll("video")).indexOf(video);
 }

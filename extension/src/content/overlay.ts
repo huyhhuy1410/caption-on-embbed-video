@@ -1,9 +1,8 @@
-export interface CaptionWord {
-  w: string;
-  videoStart: number;
-  videoEnd: number;
-  captionStart: number;
-}
+import { applyPatch, groupWords } from "../shared/windowed-transcript";
+import type { WindowedPatch } from "../shared/windowed-transcript";
+import { captionKey, TranscriptState, validWord } from "../shared/transcript-state";
+import type { CaptureScope, WordsUpdate, CaptionWord, SentenceTranslation } from "../shared/protocol";
+export type { CaptionWord, SentenceTranslation } from "../shared/protocol";
 
 /** Từ user vừa bấm, kèm câu chứa nó — `/explain-word` cần ngữ cảnh để giải
  * nghĩa đúng nghĩa trong video, không phải nghĩa từ điển. */
@@ -11,13 +10,6 @@ export interface WordPick {
   word: string;
   context: string;
   anchor: { left: number; top: number; right: number; bottom: number };
-}
-
-/** Bản dịch một câu. `captionStart` là khoá nhóm, ổn định qua replay. */
-export interface SentenceTranslation {
-  captionStart: number;
-  text: string;
-  vi: string;
 }
 
 /** Màu của hai dòng caption (FR-4.9). */
@@ -55,14 +47,14 @@ const KEEP_VISIBLE_PX = 48;
 
 /** Một nhóm caption đã chuẩn hoá từ `words[]`. */
 interface CaptionGroup {
-  key: number;
+  key: string;
   words: CaptionWord[];
   signature: string;
 }
 
 /** Một dòng caption đã dựng trong DOM. */
 interface RenderedLine {
-  key: number;
+  key: string;
   wrapper: HTMLDivElement;
   en: HTMLDivElement;
   vi: HTMLDivElement;
@@ -73,7 +65,7 @@ interface RenderedLine {
 
 /** Neo thị giác của dòng đầu đang đọc — giữ manual scroll qua DOM update. */
 interface ScrollAnchor {
-  key: number;
+  key: string;
   offset: number;
 }
 
@@ -87,7 +79,12 @@ export class CaptionOverlay {
   private settingsButton: HTMLButtonElement;
   private settingsMenu: HTMLDivElement;
   private words: CaptionWord[] = [];
-  private translations = new Map<number, string>();
+  private readonly transcript = new TranscriptState();
+  private readonly firstRendered = new Set<string>();
+  private readonly finalizedRendered = new Set<string>();
+  private metricFramePending = false;
+  private translationHistory = new Map<string, SentenceTranslation>();
+  private translations = new Map<string, string>();
   private readonly colorInputs = new Map<CaptionColorKey, HTMLInputElement>();
   private wordPick: ((pick: WordPick) => void) | null = null;
   private userPositioned = false;
@@ -100,8 +97,8 @@ export class CaptionOverlay {
   } | null = null;
   private colors: CaptionColors = { ...DEFAULT_COLORS };
   private renderedLines: RenderedLine[] = [];
-  private readonly renderedByKey = new Map<number, RenderedLine>();
-  private activeKey: number | null = null;
+  private readonly renderedByKey = new Map<string, RenderedLine>();
+  private activeKey: string | null = null;
   private activeWordIndex = -1;
   private lastVideoTime = 0;
 
@@ -121,6 +118,7 @@ export class CaptionOverlay {
 
   constructor() {
     this.host = document.createElement("div");
+    this.host.dataset.captionAiOwned = "";
     this.shadow = this.host.attachShadow({ mode: "open" });
     this.lineHost = document.createElement("div");
     this.dragHandle = document.createElement("div");
@@ -372,9 +370,9 @@ input[type="color"] {
       const keyRaw = target.getAttribute("data-caption-key");
       const indexRaw = target.getAttribute("data-index");
       if (keyRaw === null || indexRaw === null) return;
-      const key = Number(keyRaw);
+      const key = keyRaw;
       const index = Number(indexRaw);
-      if (!Number.isFinite(key) || !Number.isInteger(index)) return;
+      if (!Number.isInteger(index)) return;
       const pick = this.pickAt(key, index);
       if (pick) {
         const rect = target.getBoundingClientRect();
@@ -393,6 +391,7 @@ input[type="color"] {
     // Chỉ thao tác THẬT của người mới chuyển sang manual. Không dùng event
     // `scroll`: Chrome cũng phát nó khi row mới/VI mới làm đổi chiều cao (scroll
     // anchoring), khiến auto-scroll tự dừng dù user không chạm gì.
+    this.lineHost.addEventListener("scroll", () => this.measureFirstRender(), { passive: true });
     this.lineHost.tabIndex = 0;
     this.lineHost.addEventListener("wheel", () => this.switchToManualScroll(), {
       passive: true,
@@ -541,7 +540,7 @@ input[type="color"] {
 
   /** Tra theo khoá ổn định, không theo vị trí DOM có thể đổi khi thêm dòng. */
   private pickAt(
-    key: number,
+    key: string,
     index: number,
   ): Omit<WordPick, "anchor"> | null {
     const line = this.renderedByKey.get(key);
@@ -552,34 +551,117 @@ input[type="color"] {
   }
 
   setWords(words: CaptionWord[]): void {
-    this.words = this.words.concat(words);
-    this.words.sort((a, b) => a.videoStart - b.videoStart);
+    // Tương thích batch cũ: thay từng group, không suy diễn coverage cho replay thưa.
+    const groups = groupWords(words);
+    const incoming = [...groups.values()].flatMap(members => members.map(w => ({ ...w,
+      windowedGroupId: w.windowedGroupId ?? `legacy:${w.captionStart}` })));
+    this.applyWindowedPatch({ words: incoming, replaceRanges: [], removedWindowedGroupIds: [] });
+  }
 
-    const deduped: CaptionWord[] = [];
-    for (const word of this.words) {
-      const last = deduped[deduped.length - 1];
-      if (
-        last &&
-        last.w.toLowerCase() === word.w.toLowerCase() &&
-        Math.abs(last.videoStart - word.videoStart) < 0.5
-      ) {
-        continue;
-      }
-      deduped.push(word);
+  applyWindowedPatch(patch: WindowedPatch<CaptionWord>): boolean {
+    const validId = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.length <= 512;
+    if (!patch || !Array.isArray(patch.words) || patch.words.length > 10_000 ||
+      !Array.isArray(patch.replaceRanges) || patch.replaceRanges.length > 1000 ||
+      !Array.isArray(patch.removedWindowedGroupIds) || patch.removedWindowedGroupIds.length > 1000 ||
+      patch.words.some(w => !validWord(w) || w.wordId || w.captionId || !validId(w.windowedGroupId)) ||
+      patch.removedWindowedGroupIds.some(id => !validId(id)) ||
+      patch.replaceRanges.some(range => !range || !Number.isFinite(range.from) || range.from < 0 ||
+        !Number.isFinite(range.to) || range.to < range.from)) return false;
+    let fragment = 0;
+    const fragmentPrefix = `local:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    this.words = applyPatch(this.words.filter(w => !w.wordId), patch, () => `${fragmentPrefix}:${fragment++}`)
+      .concat(this.words.filter(w => Boolean(w.wordId))).sort((a, b) => a.videoStart - b.videoStart);
+    // Giới hạn theo group để không persist một identity với membership bị cắt.
+    while (this.words.length > 10_000) {
+      const key = captionKey(this.words[0]);
+      this.words = this.words.filter(word => captionKey(word) !== key);
     }
-    this.words = deduped;
+    this.groupsDirty = true;
+    for (const [key, item] of this.translationHistory) {
+      const members = this.words.filter(word => captionKey(word) === key);
+      if (!members.length || item.windowedGroupId && members.map(w => w.w).join(" ") !== item.text) {
+        this.translationHistory.delete(key);
+        this.translations.delete(key);
+      }
+    }
+    this.reconcileLines();
+    return true;
+  }
+
+  setScope(scope: CaptureScope): void {
+    this.transcript.setScope(scope);
+    this.words = this.words.filter(word => !word.wordId).concat(this.transcript.values());
     this.groupsDirty = true;
     this.reconcileLines();
+  }
+
+  applyUpdate(update: WordsUpdate): boolean {
+    if (!this.transcript.apply(update)) return false;
+    this.words = this.transcript.values();
+    this.groupsDirty = true;
+    this.reconcileLines();
+    this.measureFirstRender();
+    return true;
+  }
+
+  mergeReplay(words: CaptionWord[]): void {
+    const streaming = words.filter(word => Boolean(word.wordId));
+    this.transcript.mergeFinalized(streaming);
+    if (streaming.length) {
+      this.words = this.transcript.values();
+      this.groupsDirty = true;
+      this.reconcileLines();
+    }
+    const legacy = words.filter(word => !word.wordId);
+    if (legacy.length) this.setWords(legacy);
+  }
+
+  finalizedHistory(): { words: CaptionWord[]; translations: SentenceTranslation[] } {
+    const words = this.words.filter(word => !word.wordId).concat(this.transcript.finalized());
+    const retained = new Set(words.map(captionKey));
+    return { words, translations: [...this.translationHistory.entries()]
+      .filter(([key]) => retained.has(key)).map(([, item]) => item) };
+  }
+
+  private measureFirstRender(): void {
+    if (this.metricFramePending || this.host.style.display === "none") return;
+    this.metricFramePending = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      this.metricFramePending = false;
+      if (!this.host.isConnected || this.host.style.display === "none") return;
+      const viewport = this.lineHost.getBoundingClientRect();
+      const finalized = new Set(this.transcript.finalized().map(word => word.wordId));
+      for (const line of this.renderedLines) {
+        for (let index = 0; index < line.words.length; index++) {
+          const word = line.words[index];
+          if (!word.wordId || !Number.isFinite(word.capturedAtEpochMs)) continue;
+          const rect = line.spans[index].getBoundingClientRect();
+          if (!rect.width || !rect.height || rect.bottom <= Math.max(0, viewport.top) ||
+              rect.top >= Math.min(window.innerHeight, viewport.bottom) ||
+              rect.right <= Math.max(0, viewport.left) || rect.left >= Math.min(window.innerWidth, viewport.right)) continue;
+          const lagMs = performance.timeOrigin + performance.now() - word.capturedAtEpochMs!;
+          if (!Number.isFinite(lagMs) || lagMs < 0) continue;
+          if (!this.firstRendered.has(word.wordId)) {
+            this.firstRendered.add(word.wordId);
+            console.info(`LAG stage=first wordId=${word.wordId} lagMs=${lagMs.toFixed(1)} provisional=${Boolean(word.provisional)}`);
+          }
+          if (finalized.has(word.wordId) && !this.finalizedRendered.has(word.wordId)) {
+            this.finalizedRendered.add(word.wordId);
+            console.info(`LAG stage=finalized wordId=${word.wordId} lagMs=${lagMs.toFixed(1)}`);
+          }
+        }
+      }
+    }));
   }
 
   /** Mọi nhóm đã nạp của video hiện tại, sắp theo từ đầu tiên. */
   private getGroups(): CaptionGroup[] {
     if (!this.groupsDirty) return this.groups;
-    const byKey = new Map<number, CaptionWord[]>();
+    const byKey = new Map<string, CaptionWord[]>();
     for (const word of this.words) {
-      const group = byKey.get(word.captionStart);
+      const group = byKey.get(captionKey(word));
       if (group) group.push(word);
-      else byKey.set(word.captionStart, [word]);
+      else byKey.set(captionKey(word), [word]);
     }
     this.groups = Array.from(byKey, ([key, groupWords]) => {
       groupWords.sort((a, b) => a.videoStart - b.videoStart);
@@ -587,7 +669,7 @@ input[type="color"] {
         key,
         words: groupWords,
         signature: groupWords
-          .map((w) => `${w.videoStart}:${w.videoEnd}:${w.w}`)
+          .map((w) => `${w.wordId ?? ""}:${w.videoStart}:${w.videoEnd}:${w.w}:${w.provisional}:${w.capturedAtEpochMs}`)
           .join("\u0001"),
       };
     }).sort((a, b) => a.words[0].videoStart - b.words[0].videoStart);
@@ -609,7 +691,10 @@ input[type="color"] {
         high = mid - 1;
       }
     }
-    return found === -1 ? null : this.words[found];
+    if (found === -1) return null;
+    const word = this.words[found];
+    // Batch ASR có thể đến sau khi từ đã phát xong; không giữ sáng từ cuối qua khoảng trống.
+    return videoTime < word.videoEnd ? word : null;
   }
 
   update(videoTime: number): void {
@@ -653,6 +738,12 @@ input[type="color"] {
       }
     }
 
+    const retainedWords = new Set(this.words.map(word => word.wordId));
+    for (const id of this.firstRendered) if (!retainedWords.has(id)) this.firstRendered.delete(id);
+    for (const id of this.finalizedRendered) if (!retainedWords.has(id)) this.finalizedRendered.delete(id);
+    for (const key of this.translationHistory.keys()) {
+      if (!wanted.has(key)) { this.translationHistory.delete(key); this.translations.delete(key); }
+    }
     this.renderedLines = groups
       .map((g) => this.renderedByKey.get(g.key))
       .filter((line): line is RenderedLine => line !== undefined);
@@ -698,6 +789,7 @@ input[type="color"] {
       span.textContent = `${word.w} `;
       span.dataset.captionKey = String(group.key);
       span.dataset.index = String(index);
+      if (word.wordId) span.dataset.wordId = word.wordId;
       line.en.appendChild(span);
       return span;
     });
@@ -710,7 +802,7 @@ input[type="color"] {
   }
 
   private setActiveWord(word: CaptionWord | null): void {
-    const nextKey = word?.captionStart ?? null;
+    const nextKey = word ? captionKey(word) : null;
     const keyChanged = this.activeKey !== nextKey;
     if (keyChanged) {
       const oldLine =
@@ -766,7 +858,7 @@ input[type="color"] {
     this.lineHost.scrollTop = target;
   }
 
-  private applyVi(key: number): void {
+  private applyVi(key: string): void {
     const line = this.renderedByKey.get(key);
     if (!line) return;
     const anchor = this.autoScroll ? null : this.captureScrollAnchor();
@@ -775,16 +867,24 @@ input[type="color"] {
     else this.scrollToCurrent();
   }
 
-  setTranslation(captionStart: number, vi: string): void {
-    this.translations.set(captionStart, vi);
-    this.applyVi(captionStart);
+  setTranslation(captionStart: number, vi: string, captionId?: string, text = ""): void {
+    const key = captionId ?? `windowed:${captionStart}`;
+    this.translations.set(key, vi);
+    this.translationHistory.set(key, { captionStart, captionId, text, vi });
+    this.applyVi(key);
   }
 
   setTranslations(list: SentenceTranslation[]): void {
     const anchor = this.autoScroll ? null : this.captureScrollAnchor();
     for (const item of list) {
-      this.translations.set(item.captionStart, item.vi);
-      const line = this.renderedByKey.get(item.captionStart);
+      const key = captionKey(item);
+      if (item.windowedGroupId) {
+        const members = this.words.filter(word => captionKey(word) === key);
+        if (!members.length || members.map(w => w.w).join(" ") !== item.text) continue;
+      }
+      this.translations.set(key, item.vi);
+      this.translationHistory.set(key, item);
+      const line = this.renderedByKey.get(key);
       if (line) this.patchTranslation(line);
     }
     if (anchor) this.restoreScrollAnchor(anchor);
@@ -846,7 +946,9 @@ input[type="color"] {
   }
 
   show(): void {
+    const wasHidden = this.host.style.display === "none";
     this.host.style.display = "flex";
+    if (wasHidden) this.measureFirstRender();
   }
 
   hide(): void {
@@ -855,6 +957,10 @@ input[type="color"] {
 
   clear(): void {
     this.words = [];
+    this.transcript.clear();
+    this.firstRendered.clear();
+    this.finalizedRendered.clear();
+    this.translationHistory.clear();
     this.translations.clear();
     this.groups = [];
     this.groupsDirty = true;

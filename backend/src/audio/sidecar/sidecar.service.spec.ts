@@ -87,7 +87,9 @@ describe('SidecarService reconnect', () => {
   beforeEach(async () => {
     jest.useFakeTimers();
     mockSockets = [];
-    module = await Test.createTestingModule({ providers: [SidecarService] }).compile();
+    module = await Test.createTestingModule({
+      providers: [SidecarService],
+    }).compile();
     service = module.get(SidecarService);
     service.onModuleInit();
   });
@@ -189,6 +191,39 @@ describe('SidecarService reconnect', () => {
     expect(sentJson()).toEqual([
       { type: 'source-switch', sourceId: 'current-source' },
       { type: 'reset' },
+    ]);
+  });
+
+  it('restores latest full scope and language after reconnect and rejects stale controls', () => {
+    const scope = { sessionId: 's', generation: 1, sourceId: 'v1' };
+    service.sendControl({ ...scope, type: 'source-language', language: 'vi' });
+    service.sendControl({
+      ...scope,
+      generation: 2,
+      sourceId: 'v2',
+      type: 'source-switch',
+    });
+    expect(
+      service.sendControl({
+        ...scope,
+        type: 'source-language',
+        language: 'en',
+      }),
+    ).toBe(false);
+    open();
+    const latest = { ...scope, generation: 2, sourceId: 'v2' };
+    expect(sentJson()).toEqual([
+      { ...latest, type: 'source-switch' },
+      { ...latest, type: 'source-language', language: 'vi' },
+      { ...latest, type: 'reset' },
+    ]);
+    close();
+    jest.advanceTimersByTime(250);
+    open();
+    expect(sentJson()).toEqual([
+      { ...latest, type: 'source-switch' },
+      { ...latest, type: 'source-language', language: 'vi' },
+      { ...latest, type: 'reset' },
     ]);
   });
 

@@ -1,9 +1,6 @@
-import {
-  Injectable,
-  OnModuleDestroy,
-  OnModuleInit,
-} from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { WebSocket } from 'ws';
+import { CaptureScope, isScope, sameScope } from '../streaming-transcript';
 
 const SIDECAR_URL = 'ws://127.0.0.1:9000/ws';
 const RECONNECT_BASE_MS = 250;
@@ -24,6 +21,57 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
    */
   private pendingReset = false;
   private pendingSourceId?: string;
+  private latestScope?: CaptureScope;
+  private language: string | null = null;
+  private playback?: 'paused' | 'ended' | 'playing';
+
+  sendControl(
+    control: CaptureScope & {
+      type: string;
+      language?: string | null;
+      state?: 'paused' | 'ended' | 'playing';
+      seekTimeAtCapture?: number;
+    },
+  ): boolean {
+    if (!isScope(control)) return false;
+    const old = this.latestScope;
+    if (
+      old?.sessionId === control.sessionId &&
+      (control.generation < old.generation ||
+        (control.generation === old.generation &&
+          control.sourceId !== old.sourceId))
+    )
+      return false;
+    if (old && !sameScope(old, control)) this.playback = undefined;
+    this.latestScope = {
+      sessionId: control.sessionId,
+      generation: control.generation,
+      sourceId: control.sourceId,
+    };
+    if (control.type === 'source-language')
+      this.language = control.language ?? null;
+    if (control.type === 'playback') this.playback = control.state;
+    return this.sendMetadata(
+      control.type === 'seek' ? { ...control, type: 'reset' } : control,
+    );
+  }
+
+  private restoreScope(): void {
+    if (!this.latestScope) return;
+    this.sendMetadata({ ...this.latestScope, type: 'source-switch' });
+    this.sendMetadata({
+      ...this.latestScope,
+      type: 'source-language',
+      language: this.language,
+    });
+    this.sendMetadata({ ...this.latestScope, type: 'reset' });
+    if (this.playback)
+      this.sendMetadata({
+        ...this.latestScope,
+        type: 'playback',
+        state: this.playback,
+      });
+  }
 
   onModuleInit(): void {
     this.connect();
@@ -53,7 +101,8 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
 
       // Callback chạy trước flush để nguồn hiện tại ghi đè pending source cũ.
       this.onOpen?.();
-      this.flushPendingControls();
+      if (this.latestScope) this.restoreScope();
+      else this.flushPendingControls();
     });
 
     socket.on('message', (data) => {

@@ -2,9 +2,14 @@
   "name": "caption-ai-extension",
   "private": true,
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node tests/run-tests.mjs",
+    "test:browser": "node tests/run-caption-notice.mjs",
+    "test:e2e": "npm run build && node tests/run-e2e.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/chrome": "^0.0.287",
     "esbuild": "^0.24.0",
     "typescript": "^5.7.0"

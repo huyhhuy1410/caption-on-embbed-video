@@ -18,7 +18,7 @@ import {
 } from './streaming-transcript';
 
 /** Windowed dùng mốc thời gian; streaming dùng identity ổn định. */
-type CaptionGroup = { captionStart: number; text: string; captionId?: string };
+type CaptionGroup = { captionStart: number; text: string; captionId?: string; windowedGroupId?: string };
 
 /**
  * Khoá hàng đợi dịch = (nguồn, captionStart).
@@ -42,6 +42,7 @@ function queueKey(
 type QueuedGroup = CaptionGroup & {
   sourceId: string | null;
   sessionId?: string;
+  generation?: number;
   client?: WebSocket;
 };
 
@@ -155,7 +156,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
                 caption.captionId,
               );
               if (cached)
-                this.sendToExtension({ type: 'translation', ...cached });
+                this.sendToExtension({ type: 'translation', ...cached, ...this.activeScope });
             }
             this.enqueueForTranslation(
               applied.finalized.map((c) => ({
@@ -179,8 +180,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             )
           )
             return;
-          this.transcriptService.addWords(parsedMessage.words);
-          this.enqueueForTranslation(collectCaptionGroups(parsedMessage.words));
+          if (!Array.isArray(parsedMessage.words)) return;
+          const patch = this.transcriptService.addWords(parsedMessage.words);
+          this.sendToExtension({ ...parsedMessage, ...patch });
+          this.enqueueForTranslation(collectCaptionGroups(patch.words));
+          return;
         }
       } catch (error) {
         console.warn('Failed to parse message', error);
@@ -211,12 +215,15 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     for (const group of groups) {
       const cached = this.transcriptService.getTranslation(
         this.activeSourceId,
-        group.captionId ?? group.captionStart,
+        group.windowedGroupId ?? group.captionId ?? group.captionStart,
       );
       // So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
       // ranh giới window: lần đầu chỉ thấy nửa câu, lần sau mới đủ. Nếu chỉ
       // kiểm tra khoá thì bản dịch NỬA CÂU đã cache sẽ chặn luôn bản đầy đủ.
-      if (cached && cached.text === group.text) continue;
+      if (cached && cached.text === group.text) {
+        this.sendToExtension({ type: 'translation', ...cached, ...this.activeScope });
+        continue;
+      }
 
       // Ghi nguồn vào nhóm NGAY LÚC XẾP HÀNG, không đọc `activeSourceId` lúc
       // drain — drain có thể chạy vài giây sau, mà user đã kịp đổi video ⇒ bản
@@ -224,17 +231,19 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const queued: QueuedGroup = {
         captionStart: group.captionStart,
         captionId: group.captionId,
+        windowedGroupId: group.windowedGroupId,
         text: group.text,
         sourceId: this.activeSourceId,
         sessionId: this.activeScope?.sessionId,
+        generation: this.activeScope?.generation,
         client: this.extensionClient,
       };
       const key = queueKey(
         queued.sourceId,
         queued.captionStart,
-        queued.captionId,
+        queued.windowedGroupId ?? queued.captionId,
       );
-      if (queued.captionId && this.inFlight.has(key)) continue;
+      if ((queued.captionId || queued.windowedGroupId) && this.inFlight.has(key)) continue;
       const tried = this.attempts.get(key) ?? 0;
       if (tried >= MAX_TRANSLATE_ATTEMPTS) continue;
 
@@ -294,6 +303,10 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
    * call chặn luồng `words`. Lỗi (hết quota, mạng, thiếu key) chỉ log — caption
    * EN phải chạy bất kể.
    */
+  private currentGroup(group: CaptionGroup & { sourceId: string | null }): boolean {
+    return !group.windowedGroupId || this.transcriptService.isCurrentWindowedGroup(group.sourceId, group.windowedGroupId, group.text);
+  }
+
   private async drain(): Promise<void> {
     // Kiểm lại quota NGAY TRƯỚC khi tiêu, dù `scheduleDrain` đã tính rồi.
     // Đây là chốt chặn duy nhất nằm đúng chỗ request thật sự rời máy, nên bất
@@ -307,15 +320,15 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     const batch = Array.from(this.pending.values()).filter(
       (g) =>
-        !g.captionId ||
-        !this.transcriptService.getTranslation(g.sourceId, g.captionId),
+        this.currentGroup(g) && (!(g.windowedGroupId ?? g.captionId) ||
+        !this.transcriptService.getTranslation(g.sourceId, (g.windowedGroupId ?? g.captionId)!)),
     );
     this.pending.clear();
     if (batch.length === 0) return;
 
     this.draining = true;
     batch.forEach((g) =>
-      this.inFlight.add(queueKey(g.sourceId, g.captionStart, g.captionId)),
+      this.inFlight.add(queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId)),
     );
     // Ghi mốc NGAY TRƯỚC khi bắn — đây là bộ đếm quota, phải khớp số request
     // thật đã rời máy, kể cả request rồi thất bại.
@@ -331,16 +344,17 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Xoá mốc giữ NGAY khi thành công: để sót lại thì lần 503 sau nhóm này
         // bị coi là "đã giữ quá lâu" và bị bỏ oan.
         this.heldSince.delete(
-          queueKey(group.sourceId, group.captionStart, group.captionId),
+          queueKey(group.sourceId, group.captionStart, group.windowedGroupId ?? group.captionId),
         );
         const vi = results[index]?.text.trim();
-        if (!vi) return;
+        if (!vi || !this.currentGroup(group)) return;
 
         // `sourceId` lấy từ nhóm đã xếp hàng, KHÔNG phải `activeSourceId`:
         // drain có thể chạy vài giây sau khi user đã đổi sang video khác.
         this.transcriptService.setTranslation({
           captionStart: group.captionStart,
           captionId: group.captionId,
+        windowedGroupId: group.windowedGroupId,
           text: group.text,
           vi,
           sourceId: group.sourceId,
@@ -348,12 +362,15 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         if (
           group.sourceId === this.activeSourceId &&
           group.sessionId === this.activeScope?.sessionId &&
+          group.generation === this.activeScope?.generation &&
           group.client === this.extensionClient
         ) {
           this.sendToExtension({
             type: 'translation',
+            ...this.activeScope,
             captionStart: group.captionStart,
             captionId: group.captionId,
+        windowedGroupId: group.windowedGroupId,
             sourceId: group.sourceId,
             text: group.text,
             vi,
@@ -370,7 +387,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // 503 đã giữ quá trần ⇒ bỏ (còn câu mới trong hàng đợi vẫn được thử).
       const heldTooLong = batch.some((g) =>
         this.hasHeldTooLong(
-          queueKey(g.sourceId, g.captionStart, g.captionId),
+          queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId),
           now,
         ),
       );
@@ -383,8 +400,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Cooldown nằm ở limiter dùng chung, nên đường HTTP cũng dừng theo.
         this.rateLimiter.pauseUntil(now + error.retryAfterMs);
         for (const group of batch) {
+          if (!this.currentGroup(group)) continue;
           this.pending.set(
-            queueKey(group.sourceId, group.captionStart, group.captionId),
+            queueKey(group.sourceId, group.captionStart, group.windowedGroupId ?? group.captionId),
             group,
           );
         }
@@ -404,10 +422,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           now + error.retryAfterMs,
         );
         for (const group of batch) {
+          if (!this.currentGroup(group)) continue;
           const key = queueKey(
             group.sourceId,
             group.captionStart,
-            group.captionId,
+            group.windowedGroupId ?? group.captionId,
           );
           if (!this.heldSince.has(key)) {
             this.heldSince.set(key, now);
@@ -421,10 +440,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Còn lại: lỗi của CHÍNH batch (400/401/500) — tính công rồi bỏ sau MAX
         // lần; hoặc 503 đã giữ quá `TRANSIENT_HOLD_MAX_MS`.
         for (const group of batch) {
+          if (!this.currentGroup(group)) continue;
           const key = queueKey(
             group.sourceId,
             group.captionStart,
-            group.captionId,
+            group.windowedGroupId ?? group.captionId,
           );
           this.attempts.set(key, (this.attempts.get(key) ?? 0) + 1);
           this.heldSince.delete(key);
@@ -436,7 +456,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       }
     } finally {
       batch.forEach((g) =>
-        this.inFlight.delete(queueKey(g.sourceId, g.captionStart, g.captionId)),
+        this.inFlight.delete(queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId)),
       );
       this.draining = false;
       // Nhóm mới có thể đã về trong lúc đang chờ request này.
@@ -632,7 +652,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       type: 'replay',
       ...this.activeScope,
       seekTime,
-      words: this.transcriptService.getRangeFrom(this.activeSourceId, seekTime),
+      ...(process.env.CAPTION_MODE === 'streaming'
+        ? { words: this.transcriptService.getRangeFrom(this.activeSourceId, seekTime) }
+        : this.transcriptService.getWindowedReplay(this.activeSourceId, seekTime)),
       translations: this.transcriptService.getTranslationsFrom(
         this.activeSourceId,
         seekTime,
@@ -661,26 +683,16 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 function collectCaptionGroups(words: unknown): CaptionGroup[] {
   if (!Array.isArray(words)) return [];
 
-  const groups = new Map<number, string[]>();
+  const groups = new Map<string, CaptionGroup>();
   for (const raw of words) {
-    if (!isRecord(raw)) continue;
-    const text = typeof raw.w === 'string' ? raw.w : '';
-    const captionStart = raw.captionStart;
-    if (!text || typeof captionStart !== 'number') continue;
-
-    const existing = groups.get(captionStart);
-    if (existing) {
-      existing.push(text);
-    } else {
-      groups.set(captionStart, [text]);
-    }
+    if (!isRecord(raw) || typeof raw.w !== 'string' || typeof raw.captionStart !== 'number') continue;
+    const id = typeof raw.windowedGroupId === 'string' ? raw.windowedGroupId : undefined;
+    const key = id ?? String(raw.captionStart);
+    const group = groups.get(key);
+    if (group) group.text += ` ${raw.w}`;
+    else groups.set(key, { captionStart: raw.captionStart, text: raw.w, windowedGroupId: id });
   }
-
-  const result: CaptionGroup[] = [];
-  for (const [captionStart, parts] of groups) {
-    result.push({ captionStart, text: parts.join(' ') });
-  }
-  return result.sort((a, b) => a.captionStart - b.captionStart);
+  return [...groups.values()];
 }
 
 function toBuffer(data: RawData): Buffer {

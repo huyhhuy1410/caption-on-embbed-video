@@ -73,6 +73,7 @@ export class WordPopup {
 
   constructor() {
     this.host = document.createElement("div");
+    this.host.dataset.captionAiOwned = "";
     this.shadow = this.host.attachShadow({ mode: "open" });
     this.card = document.createElement("div");
     this.card.className = "card";
