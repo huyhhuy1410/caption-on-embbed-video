@@ -215,6 +215,23 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.session.worker
         self.assertEqual(self.messages[1]["words"][0]["videoStart"], 11.5)
 
+    async def test_windowed_pause_after_window_does_not_flush_overlap_only(self):
+        """Pause ngay sau một window chỉ còn overlap: không được emit lại.
+
+        Anchor của window đã bị xoá sau khi gửi, nên flush phần overlap sẽ tính
+        mốc video âm và backend loại cả batch.
+        """
+        self.runtime.settings = Settings(mode="windowed")
+        audio = np.ones(SAMPLE_RATE, dtype=np.float32)
+        for seq in [1, 2]:
+            self.session.audio(audio, {**metadata(seq=seq), "videoTimeAtCapture": 10 + seq})
+        await self.session.worker
+        self.session.worker = None
+        self.assertEqual(len(self.messages), 1)
+        self.session.control({**metadata(seq=3), "type": "playback", "state": "paused"})
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(self.messages), 1)
+
     async def test_websocket_control_boundary_and_stale_generation(self):
         import json
         audio = np.ones(SAMPLE_RATE, dtype=np.int16).tobytes()

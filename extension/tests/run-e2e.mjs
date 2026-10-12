@@ -8,6 +8,15 @@ import { fileURLToPath } from 'node:url';
 const extension = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const root = resolve(extension, '..');
 const videoFile = resolve(process.env.CAPTION_E2E_VIDEO ?? join(root, 'test/video1.mp4'));
+function durationSetting(name, fallback) {
+  const value = process.env[name] === undefined ? fallback : Number(process.env[name]);
+  if (!Number.isFinite(value) || value <= 0 || value > 120000) {
+    throw new Error(`${name} must be a positive duration no greater than 120000ms.`);
+  }
+  return value;
+}
+const playMs = durationSetting('CAPTION_E2E_PLAY_MS', 45000);
+const translationWaitMs = durationSetting('CAPTION_E2E_TRANSLATION_WAIT_MS', 60000);
 const output = join(root, '.tmp', 'e2e', new Date().toISOString().replace(/[:.]/g, '-'));
 const events = [];
 const samples = [];
@@ -46,7 +55,8 @@ async function startActiveRowObserver() {
       const video = document.querySelector('video');
       globalThis.__captionE2ETransitions.push({ phase: globalThis.__captionE2EPhase,
         key, videoTime: video?.currentTime ?? null, at: Date.now(),
-        text: active?.querySelector('.line-en')?.textContent?.trim() ?? '' });
+        enText: active?.querySelector('.line-en')?.textContent?.trim() ?? '',
+        viText: active?.querySelector('.line-vi')?.textContent?.trim() ?? '' });
     };
     const hostObserver = new MutationObserver(recordActiveRow);
     hostObserver.observe(document.documentElement, { childList: true, subtree: true });
@@ -84,6 +94,8 @@ async function sample(phase) {
       const lines = [...(shadow?.querySelectorAll('.line') ?? [])].map(line => ({
         key: line.getAttribute('data-caption-key'),
         active: line.classList.contains('line-active'),
+        enText: line.querySelector('.line-en')?.textContent?.trim() ?? '',
+        viText: line.querySelector('.line-vi')?.textContent?.trim() ?? '',
         words: [...line.querySelectorAll('.line-en span')].map(span => ({
           text: span.textContent.trim(), index: Number(span.getAttribute('data-index')),
           wordId: span.getAttribute('data-word-id'), active: span.classList.contains('word-active'),
@@ -130,7 +142,8 @@ function summarize() {
       const candidates = packets.filter(packet => packet.at <= sample.at).flatMap(packet => packet.words ?? [])
         .filter(word => word.w?.trim() === activeWord.text &&
           (activeWord.wordId ? word.wordId === activeWord.wordId :
-            (word.captionId ?? `windowed:${word.captionStart}`) === activeLine.key));
+            (word.windowedGroupId ? `windowed-id:${word.windowedGroupId}` :
+              (word.captionId ?? `windowed:${word.captionStart}`)) === activeLine.key));
       // Chỉ kết luận khi tất cả timing ứng viên đều đã hết; legacy không có wordId.
       if (candidates.length && candidates.every(word => Number.isFinite(word.videoEnd) && word.videoEnd + 0.15 < sample.videoTime)) {
         lateHighlights.push({ phase: sample.phase, videoTime: sample.videoTime,
@@ -146,13 +159,30 @@ function summarize() {
       jumps.push({ phase: c.phase, transitions: [a, b, c] });
     }
   }
+  const phaseEvidence = Object.fromEntries([...new Set(samples.map(sample => sample.phase))].map(phase => {
+    const phaseSamples = samples.filter(sample => sample.phase === phase);
+    const phasePackets = packets.filter(packet => packet.phase === phase);
+    return [phase, {
+      vietnameseObserved: phaseSamples.some(sample => sample.lines.some(line => line.viText)),
+      vietnameseSampleCount: phaseSamples.filter(sample => sample.lines.some(line => line.viText)).length,
+      finalRowCount: phaseSamples.at(-1)?.lines.length ?? 0,
+      finalVietnameseRowCount: phaseSamples.at(-1)?.lines.filter(line => line.viText).length ?? 0,
+      replayWordCount: phasePackets.filter(packet => packet.type === 'replay')
+        .reduce((count, packet) => count + (packet.words?.length ?? 0), 0),
+      translationPacketCount: phasePackets.filter(packet => packet.type === 'translation').length,
+      replayTranslationCount: phasePackets.filter(packet => packet.type === 'replay')
+        .reduce((count, packet) => count + (packet.translations?.length ?? 0), 0),
+      translationCount: phasePackets.filter(packet => packet.type === 'translation' && packet.vi?.trim()).length,
+    }];
+  }));
   return { adjacentRepetitionCandidates: repeats, rowBacktrackCandidates: jumps,
-    activeRowTransitions,
+    activeRowTransitions, phaseEvidence,
     expiredHighlightSamples: lateHighlights.slice(0, 100),
     sampleCount: samples.length, receivedPacketCount: packets.length,
     caveats: ['Adjacent repetitions may be genuine speech; compare against the audio.',
       'Polling can miss sub-200ms transitions.',
       'Windowed arrival timing is not capture-to-render latency.',
+      'No Vietnamese observed is inconclusive, not a passing translation result.',
       'No mocked capture, transcript, or ASR is used.'] };
 }
 
@@ -208,12 +238,14 @@ try {
   // Listener quan sát không trả response, không thay đổi dữ liệu hay đường capture.
   await worker.evaluate(() => {
     globalThis.__captionE2EPackets = [];
+    globalThis.__captionE2EPhase = 'first-play';
     chrome.runtime.onMessage.addListener(message => {
-      if (message.target === 'service-worker' && ['words', 'replay', 'capture-scope', 'status'].includes(message.type)) {
-        globalThis.__captionE2EPackets.push({ at: Date.now(), ...message });
+      if (message.target === 'service-worker' && ['words', 'replay', 'translation', 'capture-scope', 'status'].includes(message.type)) {
+        globalThis.__captionE2EPackets.push({ at: Date.now(), phase: globalThis.__captionE2EPhase, ...message });
       }
     });
   });
+  const setPacketPhase = phase => worker.evaluate(value => { globalThis.__captionE2EPhase = value; }, phase);
   page = context.pages()[0] ?? await context.newPage();
   page.on('console', message => record('console', { level: message.type(), text: message.text() }));
   page.on('pageerror', error => record('pageerror', { message: String(error) }));
@@ -222,6 +254,7 @@ try {
   await startActiveRowObserver();
   await page.bringToFront();
   console.log(`E2E_BROWSER_READY: Chromium opened with extension ${extensionId}.`);
+  console.log(`E2E_EXPECTED_RUN_MS: ${playMs + translationWaitMs * 2 + 18000}`);
   console.log('E2E_CAPTURE_REQUIRED: Click extension toolbar icon -> Turn on Captions on the Caption E2E tab within 120 seconds.');
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
@@ -234,32 +267,68 @@ try {
   let phase = 'first-play';
   sampleTimer = setInterval(() => void sample(phase), 200);
   await page.locator('video').evaluate(video => video.play());
-  await page.waitForTimeout(25000);
+  record('play-start', { phase, videoTime: await page.locator('video').evaluate(video => video.currentTime) });
+  await page.waitForTimeout(playMs);
   await sample(phase);
   await drainActiveRowTransitions();
   await page.screenshot({ path: join(output, 'first-play.png') });
   packets.push(...await worker.evaluate(() => globalThis.__captionE2EPackets.splice(0)));
+  await page.locator('video').evaluate(video => video.pause());
+  phase = 'first-play-settle';
+  await setActiveRowPhase(phase);
+  await setPacketPhase(phase);
+  await page.evaluate(() => { globalThis.__captionE2ETransitions = []; });
+  record('phase-start', { phase, paused: true, waitMs: translationWaitMs,
+    videoTime: await page.locator('video').evaluate(video => video.currentTime) });
+  console.log(`E2E_TRANSLATION_WAIT: ${phase}, ${translationWaitMs}ms`);
+  await page.waitForTimeout(translationWaitMs);
+  await sample(phase);
+  await drainActiveRowTransitions();
+  packets.push(...await worker.evaluate(() => globalThis.__captionE2EPackets.splice(0)));
+  record('phase-complete', { phase, paused: true,
+    videoTime: await page.locator('video').evaluate(video => video.currentTime) });
+  await page.screenshot({ path: join(output, 'first-play-settled.png') });
   phase = 'seek-replay';
   await setActiveRowPhase(phase);
+  await setPacketPhase(phase);
+  record('phase-start', { phase, target: 2, videoTime: await page.locator('video').evaluate(video => video.currentTime) });
   record('seek', { target: 2 });
   await page.locator('video').evaluate(async video => {
     video.pause();
     await new Promise(resolve => { video.addEventListener('seeked', resolve, { once: true }); video.currentTime = 2; });
     await video.play();
   });
+  record('seek-complete', { phase, target: 2, videoTime: await page.locator('video').evaluate(video => video.currentTime) });
+  record('play-start', { phase, videoTime: await page.locator('video').evaluate(video => video.currentTime) });
   await page.waitForTimeout(18000);
   await sample(phase);
   await page.screenshot({ path: join(output, 'seek-replay.png') });
   await drainActiveRowTransitions();
-  await page.evaluate(() => globalThis.__captionE2EStopObserver?.());
   await page.locator('video').evaluate(video => video.pause());
   packets.push(...await worker.evaluate(() => globalThis.__captionE2EPackets.splice(0)));
+  phase = 'seek-replay-settle';
+  await setActiveRowPhase(phase);
+  await setPacketPhase(phase);
+  record('phase-start', { phase, paused: true, waitMs: translationWaitMs,
+    videoTime: await page.locator('video').evaluate(video => video.currentTime) });
+  console.log(`E2E_TRANSLATION_WAIT: ${phase}, ${translationWaitMs}ms`);
+  await page.waitForTimeout(translationWaitMs);
+  await sample(phase);
+  await drainActiveRowTransitions();
+  packets.push(...await worker.evaluate(() => globalThis.__captionE2EPackets.splice(0)));
+  record('phase-complete', { phase, paused: true,
+    videoTime: await page.locator('video').evaluate(video => video.currentTime) });
+  await page.screenshot({ path: join(output, 'seek-replay-settled.png') });
+  await page.evaluate(() => globalThis.__captionE2EStopObserver?.());
   const evidence = summarize();
   if (!samples.some(sample => sample.overlayVisible && sample.lines.some(line => line.words.length))) {
     throw new Error('Capture activated but no rendered caption was observed; inspect events and packets.');
   }
-  report = { status: 'completed-with-observations', health, ...evidence };
+  const vietnameseObserved = Object.values(evidence.phaseEvidence).some(phase => phase.vietnameseObserved);
+  report = { status: 'completed-with-observations', translationStatus: vietnameseObserved ? 'observed' : 'inconclusive-no-vietnamese-observed', health, ...evidence };
   console.log(`E2E_OBSERVATIONS: samples=${samples.length}, packets=${packets.length}, repetitions=${evidence.adjacentRepetitionCandidates.length}, rowBacktracks=${evidence.rowBacktrackCandidates.length}, expiredHighlights=${evidence.expiredHighlightSamples.length}`);
+  console.log(`E2E_TRANSLATION_STATUS: ${report.translationStatus}`);
+  console.log(`E2E_PHASE_EVIDENCE: ${JSON.stringify(evidence.phaseEvidence)}`);
 } catch (error) {
   report = { status: captureStarted ? 'failed' : 'blocked', error: String(error), ...summarize() };
   console.error(`E2E_${report.status.toUpperCase()}: ${error}`);

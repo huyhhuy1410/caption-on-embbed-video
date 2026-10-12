@@ -4,6 +4,10 @@ import { applyPatch, groupWords } from './windowed-transcript';
 function word(w: string, start: number, captionStart = 1): Word {
   return { w, s: start, e: start + 0.2, videoStart: start, videoEnd: start + 0.2, captionStart, c: 0.9, sourceId: 'v1' };
 }
+/** Giữ đúng mốc đo được từ E2E, không làm tròn về lưới 0.2s của `word`. */
+function timed(w: string, videoStart: number, videoEnd: number, c: number, captionStart: number): Word {
+  return { w, s: videoStart - captionStart, e: videoEnd - captionStart, videoStart, videoEnd, captionStart, c, sourceId: 'v1' };
+}
 const scope = { sessionId: 'session', generation: 1, sourceId: 'v1' };
 
 describe('canonical windowed transcript', () => {
@@ -71,10 +75,199 @@ describe('canonical windowed transcript', () => {
     expect(service.getRangeFrom('v1', 0).map(w => w.w)).toEqual(['-', 'after']);
   });
 
+  it('reuses full-text translation after timing and confidence jitter', () => {
+    const service = new TranscriptService();
+    const initial = service.addWords([word('we', 1), word('leave', 1.3)]);
+    const oldId = initial.words[0].windowedGroupId!;
+    const translation = { windowedGroupId: oldId, captionStart: 1,
+      text: 'we leave', vi: 'chúng ta đi', sourceId: 'v1' };
+    service.setTranslation(translation);
+    const revised = service.addWords([
+      { ...word('we', 1.07, 1.07), c: 0.8 },
+      { ...word('leave', 1.37, 1.07), c: 0.7 },
+    ]);
+    const newId = revised.words[0].windowedGroupId!;
+    expect(newId).not.toBe(oldId);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    expect(service.getTranslation('v1', newId)).toEqual({ ...translation,
+      windowedGroupId: newId, captionStart: 1.07 });
+    expect(translation.windowedGroupId).toBe(oldId);
+    expect(service.getTranslationsFrom('v1', 0)).toEqual([
+      expect.objectContaining({ windowedGroupId: newId, vi: 'chúng ta đi' }),
+    ]);
+    expect(applyPatch(initial.words, revised, () => 'unexpected'))
+      .toEqual(service.getWindowedReplay('v1', 0).words);
+  });
+
+  it('restores translation when the original hypothesis returns after a changed sentence', () => {
+    const service = new TranscriptService();
+    const input = [word('we', 1), word('leave', 1.3)];
+    const oldId = service.addWords(input).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'we leave', vi: 'chúng ta đi', sourceId: 'v1' });
+    const changed = service.addWords([word('you', 1), word('stay', 1.3)]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    expect(service.getTranslationsFrom('v1', 0)).toEqual([]);
+    expect(service.getTranslation('v1', changed.words[0].windowedGroupId!)).toBeUndefined();
+    for (let i = 0; i < 3; i++) {
+      const returned = service.addWords(input.map(w => ({ ...w, c: 0.8 - i * 0.1 })));
+      expect(service.getTranslation('v1', returned.words[0].windowedGroupId!))
+        .toMatchObject({ text: 'we leave', vi: 'chúng ta đi' });
+      service.addWords([word('you', 1), word('stay', 1.3)]);
+    }
+  });
+
+  it.each(['there?', 'else!'])('does not reuse translation for changed text %s', text => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('Hello', 1), word('there!', 1.3)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'Hello there!', vi: 'xin chào', sourceId: 'v1' });
+    const patch = service.addWords([word('Hello', 1.02, 1.02), word(text, 1.32, 1.02)]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    expect(service.getTranslation('v1', patch.words[0].windowedGroupId!)).toBeUndefined();
+  });
+
+  it('does not reuse a full translation for a fragment or stale cached text', () => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('we', 1), word('saw', 1.3), word('it', 1.6)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'we saw it', vi: 'chúng tôi thấy nó', sourceId: 'v1' });
+    const patch = service.addWords([word('saw', 1.3, 1.3), word('it', 1.6, 1.3)]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    for (const group of groupWords(patch.words).keys())
+      expect(service.getTranslation('v1', group)).toBeUndefined();
+    const fragmentId = patch.words.find(w => w.w === 'saw')!.windowedGroupId!;
+    service.setTranslation({ windowedGroupId: fragmentId, captionStart: 1.3,
+      text: 'wrong text', vi: 'stale', sourceId: 'v1' });
+    const jitter = service.addWords([word('saw', 1.34, 1.34), word('it', 1.64, 1.34)]);
+    expect(service.getTranslation('v1', jitter.words[0].windowedGroupId!)).toBeUndefined();
+  });
+
+  it('matches repeated occurrences by time, not global text', () => {
+    const service = new TranscriptService();
+    const initial = service.addWords([word('echo', 1, 1), word('echo', 10, 10)]);
+    initial.words.forEach((w, i) => service.setTranslation({ windowedGroupId: w.windowedGroupId,
+      captionStart: w.captionStart, text: 'echo', vi: `occurrence-${i}`, sourceId: 'v1' }));
+    const unrelated = service.addWords([word('echo', 20, 20)]);
+    expect(service.getTranslation('v1', unrelated.words[0].windowedGroupId!)).toBeUndefined();
+    const otherSource = service.addWords([{ ...word('echo', 1.04, 1.04), sourceId: 'v2' }]);
+    expect(service.getTranslation('v2', otherSource.words[0].windowedGroupId!)).toBeUndefined();
+    const revised = service.addWords([word('echo', 1.04, 1.04), word('echo', 10.04, 10.04)]);
+    expect(revised.words.map(w => service.getTranslation('v1', w.windowedGroupId!)?.vi))
+      .toEqual(['occurrence-0', 'occurrence-1']);
+  });
+
+  it('rejects one old occurrence matching multiple new occurrences', () => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('echo', 1), word('now', 5)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'echo now', vi: 'old', sourceId: 'v1' });
+    const patch = service.addWords([
+      word('echo', 1.1, 1.1), word('now', 1.4, 1.1),
+      word('echo', 4.5, 4.5), word('now', 4.8, 4.5),
+    ]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    for (const id of groupWords(patch.words).keys())
+      expect(service.getTranslation('v1', id)).toBeUndefined();
+  });
+
+  it('counts untranslated old occurrences when deciding ambiguity', () => {
+    const service = new TranscriptService();
+    const initial = service.addWords([
+      { ...word('echo', 1, 1), videoEnd: 3 },
+      { ...word('echo', 2, 2), videoEnd: 4 },
+    ]);
+    service.setTranslation({ windowedGroupId: initial.words[0].windowedGroupId,
+      captionStart: 1, text: 'echo', vi: 'ambiguous', sourceId: 'v1' });
+    const patch = service.addWords([{ ...word('echo', 1.5, 1.5), videoEnd: 3.5 }]);
+    expect(service.getTranslation('v1', patch.words[0].windowedGroupId!)).toBeUndefined();
+  });
+
+  it('does not transfer expired translations', () => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('echo', 1)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'echo', vi: 'expired', sourceId: 'v1' });
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 31 * 60_000);
+    try {
+      const patch = service.addWords([word('echo', 1.04, 1.04)]);
+      expect(service.getTranslation('v1', patch.words[0].windowedGroupId!)).toBeUndefined();
+    } finally { clock.mockRestore(); }
+  });
+
   it('does not share canonical state between sources', () => {
     const service = new TranscriptService();
     service.addWords([word('one', 1)]);
     service.addWords([{ ...word('two', 1), sourceId: 'v2' }]);
     expect(service.getWindowedReplay('v1', 0).words.map(w => w.w)).toEqual(['one']);
+  });
+
+  // Hai window liền nhau của E2E: cửa sổ trước nghe trọn `teeth`, cửa sổ sau mở
+  // đầu ở 14.46 giữa từ và nghe ra mảnh cụt `If`. Giao khoảng xoá `teeth` rồi
+  // `If` không được sửa lại ở cửa sổ nào → mất chữ vĩnh viễn (Issue 5.52).
+  it('keeps a word the next window cut through instead of its clipped head', () => {
+    const service = new TranscriptService();
+    const first = service.addWords([
+      timed('While', 13.26, 13.84, 0.323, 13.26),
+      timed('brushing', 13.84, 14.14, 0.979, 13.26),
+      timed('your', 14.14, 14.42, 0.994, 13.26),
+      timed('teeth', 14.42, 14.68, 1, 13.26),
+      timed('you', 14.68, 14.92, 0.631, 13.26),
+      timed('think', 14.92, 15.3, 0.976, 13.26),
+    ]);
+    const teethId = first.words.find(w => w.w === 'teeth')!.windowedGroupId!;
+    service.setTranslation({ windowedGroupId: teethId, captionStart: 13.26,
+      text: 'While brushing your teeth you think', vi: 'trong khi đánh răng bạn nghĩ', sourceId: 'v1' });
+
+    const patch = service.addWords([
+      timed('If', 14.46, 14.74, 0.496, 14.46),
+      timed('you', 14.74, 14.9, 0.974, 14.46),
+      timed('think', 14.9, 15.28, 0.993, 14.46),
+      timed('I', 15.28, 15.68, 0.826, 14.46),
+    ]);
+    const words = service.getWindowedReplay('v1', 0).words;
+    expect(words.map(w => w.w)).toEqual(['While', 'brushing', 'your', 'teeth', 'you', 'think', 'I']);
+    expect(words.some(w => w.w === 'If')).toBe(false);
+    // `teeth` sống trong nhóm cũ đã cụt nên nhóm đó bị retire: mảnh cụt không được
+    // thừa hưởng bản dịch cả câu. Điều phải giữ là nó vẫn là nhóm hợp lệ, dịch được.
+    const fragmentId = words.find(w => w.w === 'teeth')!.windowedGroupId!;
+    expect(service.isCurrentWindowedGroup('v1', fragmentId, 'While brushing your teeth')).toBe(true);
+    expect(service.getTranslation('v1', teethId)).toBeUndefined();
+    service.setTranslation({ windowedGroupId: fragmentId, captionStart: 13.26,
+      text: 'While brushing your teeth', vi: 'trong khi đánh răng', sourceId: 'v1' });
+    expect(service.getTranslation('v1', fragmentId)?.vi).toBe('trong khi đánh răng');
+    expect(applyPatch(first.words, patch, () => 'unexpected-local-fragment')
+      .map(w => w.w)).toEqual(words.map(w => w.w));
+  });
+
+  // Cửa sổ trước vẫn còn `reach` nằm trọn trong vùng chồng: cửa sổ sau chỉ nghe
+  // được đuôi từ nên mở đầu bằng `for` — chữ thật, không phải mảnh cụt.
+  it('keeps a cut-through word whose re-decoded head is genuine speech', () => {
+    const service = new TranscriptService();
+    service.addWords([
+      timed('you', 20.02, 20.28, 0.972, 18.46),
+      timed('reach', 20.28, 20.56, 0.78, 18.46),
+      timed('for', 20.56, 20.82, 0.997, 18.46),
+      timed('your', 20.82, 21.16, 0.983, 18.46),
+    ]);
+    service.addWords([timed('for', 20.47, 20.79, 0.747, 20.47), timed('your', 20.79, 21.17, 0.985, 20.47)]);
+    const words = service.getWindowedReplay('v1', 0).words;
+    expect(words.map(w => w.w)).toEqual(['you', 'reach', 'for', 'your']);
+    expect(words.filter(w => w.w === 'your')).toHaveLength(1);
+  });
+
+  // Từ bắt đầu trước mép trái batch cũng bị batch đó thay khi nó thực sự nằm trong
+  // dải batch (chữa lại) — luật cũ không được phép đóng băng mọi từ cũ.
+  it('still replaces a word that genuinely starts inside the batch range', () => {
+    const service = new TranscriptService();
+    const initial = service.addWords([word('Rushing', 18.46, 18.46), word('out', 19.1, 18.46)]);
+    const oldId = initial.words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 18.46,
+      text: 'Rushing out', vi: 'vội ra', sourceId: 'v1' });
+    service.addWords([timed('Rushing', 18.46, 19.1, 0.568, 18.46), timed('out', 19.1, 19.34, 0.995, 18.46)]);
+    service.addWords([timed('out', 19.34, 19.46, 0.98, 19.34), timed('the', 19.46, 19.66, 0.996, 19.34)]);
+    const words = service.getWindowedReplay('v1', 0).words;
+    expect(words.map(w => w.w)).toEqual(['Rushing', 'out', 'the']);
+    expect(new Set(words.map(w => w.windowedGroupId)).size).toBeGreaterThan(1);
   });
 });

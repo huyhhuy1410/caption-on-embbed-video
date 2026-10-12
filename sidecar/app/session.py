@@ -53,6 +53,10 @@ class CaptionSession:
         self.first = True
         self.window_audio = np.empty(0, dtype=np.float32)
         self.window_anchor: dict[str, Any] | None = None
+        # False khi `window_audio` chỉ còn là overlap của window vừa gửi. Flush
+        # lúc đó sẽ decode lại phần đã phát mà anchor đã bị xoá → mốc video âm,
+        # batch bị backend loại (Issue 5.41).
+        self.window_dirty = False
         self.last_seq: int | None = None
 
     def reset(self, scope: Scope) -> None:
@@ -63,6 +67,7 @@ class CaptionSession:
         self.transcript = StreamingTranscript(scope, self.runtime.settings.max_words_per_caption)
         self.window_audio = np.empty(0, dtype=np.float32)
         self.window_anchor = None
+        self.window_dirty = False
         self.first = True
         self.last_seq = None
         self.last_flushed_end = -1
@@ -121,6 +126,7 @@ class CaptionSession:
             if self.window_anchor is None:
                 self.window_anchor = dict(metadata)
             self.window_audio = np.concatenate((self.window_audio, audio))
+            self.window_dirty = True
             size = (2 if self.first else 3) * SAMPLE_RATE
             if len(self.window_audio) >= size:
                 snapshot = Snapshot(self.window_audio[:size].copy(), 0, ())
@@ -128,6 +134,7 @@ class CaptionSession:
                                 self.window_anchor, language=self.language.decode_language))
                 self.window_audio = self.window_audio[-int(1.5 * SAMPLE_RATE):]
                 self.window_anchor = None
+                self.window_dirty = False
                 self.first = False
 
     def flush(self) -> None:
@@ -136,11 +143,12 @@ class CaptionSession:
             self.last_flushed_end = self.rolling.end
             self.submit(Job(self.epoch, self.scope, self.rolling.snapshot(), flush=True,
                             language=self.language.decode_language))
-        elif len(self.window_audio):
+        elif len(self.window_audio) and self.window_dirty:
             self.submit(Job(self.epoch, self.scope, Snapshot(self.window_audio.copy(), 0, ()),
                             self.first, self.window_anchor, True, self.language.decode_language))
             self.window_audio = np.empty(0, dtype=np.float32)
             self.window_anchor = None
+            self.window_dirty = False
             self.first = True
 
     def submit(self, job: Job) -> None:

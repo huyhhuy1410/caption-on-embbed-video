@@ -26,7 +26,11 @@ function fixture() {
   const control = (payload: object) => handlers.get('message')!(Buffer.from(JSON.stringify(payload)), false);
   control({ type: 'source-switch', ...scope });
   return { transcript, translate, messages, control,
-    words: (text: string, generation = 1) => receive!(Buffer.from(JSON.stringify({ type: 'words', ...scope, generation, words: [word(text)] }))) };
+    words: (text: string, generation = 1, offset = 0) => receive!(Buffer.from(JSON.stringify({
+      type: 'words', ...scope, generation,
+      words: [{ ...word(text), videoStart: 1 + offset, videoEnd: 1.5 + offset,
+        captionStart: 1 + offset }],
+    }))) };
 }
 
 describe('windowed gateway', () => {
@@ -49,6 +53,28 @@ describe('windowed gateway', () => {
     const replay = f.messages.at(-1)!;
     expect(replay.words).toEqual(f.messages[0].words);
     expect(replay.translations[0].vi).toBe('VI');
+  });
+
+  it('delivers cached Vietnamese under the revised group without another provider call', async () => {
+    const f = fixture();
+    f.translate.mockResolvedValue([{ text: 'xin chào' }]);
+    f.words('hello');
+    const oldId = f.messages[0].words[0].windowedGroupId;
+    await jest.advanceTimersByTimeAsync(1);
+    f.words('hello', 1, 0.07);
+    const patch = f.messages.at(-2)!;
+    const translation = f.messages.at(-1)!;
+    const newId = patch.words[0].windowedGroupId;
+    expect(newId).not.toBe(oldId);
+    expect(patch.removedWindowedGroupIds).toContain(oldId);
+    expect(translation).toMatchObject({ type: 'translation', ...scope,
+      windowedGroupId: newId, captionStart: 1.07, text: 'hello', vi: 'xin chào' });
+    await jest.advanceTimersByTimeAsync(1);
+    expect(f.translate).toHaveBeenCalledTimes(1);
+    f.control({ type: 'seek', ...scope, generation: 2, seekTimeAtCapture: 1 });
+    expect(f.messages.at(-1)!.translations).toEqual([
+      expect.objectContaining({ windowedGroupId: newId, vi: 'xin chào' }),
+    ]);
   });
 
   it('never caches or delivers a deferred translation after its group is replaced', async () => {
