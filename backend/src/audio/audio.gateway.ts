@@ -44,6 +44,7 @@ type QueuedGroup = CaptionGroup & {
   sessionId?: string;
   generation?: number;
   client?: WebSocket;
+  enqueuedAt?: number;
 };
 
 /** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
@@ -86,6 +87,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
 
   private draining = false;
+  private translationBatchSequence = 0;
 
   /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<string, number>();
@@ -249,6 +251,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       // Ghi đè: nhóm có thể đã trong hàng đợi với text CŨ (ngắn hơn), giờ dài
       // ra. Bản mới nhất là bản đúng.
+      queued.enqueuedAt = this.pending.get(key)?.enqueuedAt ?? Date.now();
       this.pending.set(key, queued);
       while (this.pending.size > 300)
         this.pending.delete(this.pending.keys().next().value!);
@@ -284,6 +287,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       0,
     );
 
+    if (wait > 0) console.debug('[translation-timing]', {
+      event: 'wait', waitMs: wait, pendingCount: this.pending.size,
+    });
     this.drainTimer = setTimeout(() => {
       this.drainTimer = undefined;
       void this.drain();
@@ -327,6 +333,15 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (batch.length === 0) return;
 
     this.draining = true;
+    const batchId = ++this.translationBatchSequence;
+    const startedAt = Date.now();
+    let sentCount = 0;
+    let staleCount = 0;
+    let emptyCount = 0;
+    console.debug('[translation-timing]', { event: 'start', batchId,
+      batchSize: batch.length,
+      oldestQueueMs: Math.max(...batch.map(g => startedAt - (g.enqueuedAt ?? startedAt))),
+    });
     batch.forEach((g) =>
       this.inFlight.add(queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId)),
     );
@@ -340,6 +355,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         'en',
       );
 
+      console.debug('[translation-timing]', { event: 'provider-complete', batchId,
+        elapsedMs: Date.now() - startedAt });
       batch.forEach((group, index) => {
         // Xoá mốc giữ NGAY khi thành công: để sót lại thì lần 503 sau nhóm này
         // bị coi là "đã giữ quá lâu" và bị bỏ oan.
@@ -347,7 +364,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           queueKey(group.sourceId, group.captionStart, group.windowedGroupId ?? group.captionId),
         );
         const vi = results[index]?.text.trim();
-        if (!vi || !this.currentGroup(group)) return;
+        if (!vi) { emptyCount++; return; }
+        if (!this.currentGroup(group)) { staleCount++; return; }
 
         // `sourceId` lấy từ nhóm đã xếp hàng, KHÔNG phải `activeSourceId`:
         // drain có thể chạy vài giây sau khi user đã đổi sang video khác.
@@ -365,6 +383,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           group.generation === this.activeScope?.generation &&
           group.client === this.extensionClient
         ) {
+          sentCount++;
           this.sendToExtension({
             type: 'translation',
             ...this.activeScope,
@@ -378,6 +397,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         }
       });
     } catch (error: unknown) {
+      console.debug('[translation-timing]', { event: 'error', batchId,
+        elapsedMs: Date.now() - startedAt,
+        errorType: error instanceof Error ? error.name : 'unknown' });
       // Ba nhánh, KHÁC NHAU về hậu quả — xem `ProviderUnavailableError`.
       const now = Date.now();
       const quotaError =
@@ -455,6 +477,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         );
       }
     } finally {
+      console.debug('[translation-timing]', { event: 'complete', batchId,
+        elapsedMs: Date.now() - startedAt, sentCount, staleCount, emptyCount,
+        pendingCount: this.pending.size });
       batch.forEach((g) =>
         this.inFlight.delete(queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId)),
       );
