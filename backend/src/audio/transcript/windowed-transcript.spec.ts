@@ -71,6 +71,126 @@ describe('canonical windowed transcript', () => {
     expect(service.getRangeFrom('v1', 0).map(w => w.w)).toEqual(['-', 'after']);
   });
 
+  it('reuses full-text translation after timing and confidence jitter', () => {
+    const service = new TranscriptService();
+    const initial = service.addWords([word('we', 1), word('leave', 1.3)]);
+    const oldId = initial.words[0].windowedGroupId!;
+    const translation = { windowedGroupId: oldId, captionStart: 1,
+      text: 'we leave', vi: 'chúng ta đi', sourceId: 'v1' };
+    service.setTranslation(translation);
+    const revised = service.addWords([
+      { ...word('we', 1.07, 1.07), c: 0.8 },
+      { ...word('leave', 1.37, 1.07), c: 0.7 },
+    ]);
+    const newId = revised.words[0].windowedGroupId!;
+    expect(newId).not.toBe(oldId);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    expect(service.getTranslation('v1', newId)).toEqual({ ...translation,
+      windowedGroupId: newId, captionStart: 1.07 });
+    expect(translation.windowedGroupId).toBe(oldId);
+    expect(service.getTranslationsFrom('v1', 0)).toEqual([
+      expect.objectContaining({ windowedGroupId: newId, vi: 'chúng ta đi' }),
+    ]);
+    expect(applyPatch(initial.words, revised, () => 'unexpected'))
+      .toEqual(service.getWindowedReplay('v1', 0).words);
+  });
+
+  it('restores translation when the original hypothesis returns after a changed sentence', () => {
+    const service = new TranscriptService();
+    const input = [word('we', 1), word('leave', 1.3)];
+    const oldId = service.addWords(input).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'we leave', vi: 'chúng ta đi', sourceId: 'v1' });
+    const changed = service.addWords([word('you', 1), word('stay', 1.3)]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    expect(service.getTranslationsFrom('v1', 0)).toEqual([]);
+    expect(service.getTranslation('v1', changed.words[0].windowedGroupId!)).toBeUndefined();
+    for (let i = 0; i < 3; i++) {
+      const returned = service.addWords(input.map(w => ({ ...w, c: 0.8 - i * 0.1 })));
+      expect(service.getTranslation('v1', returned.words[0].windowedGroupId!))
+        .toMatchObject({ text: 'we leave', vi: 'chúng ta đi' });
+      service.addWords([word('you', 1), word('stay', 1.3)]);
+    }
+  });
+
+  it.each(['there?', 'else!'])('does not reuse translation for changed text %s', text => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('Hello', 1), word('there!', 1.3)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'Hello there!', vi: 'xin chào', sourceId: 'v1' });
+    const patch = service.addWords([word('Hello', 1.02, 1.02), word(text, 1.32, 1.02)]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    expect(service.getTranslation('v1', patch.words[0].windowedGroupId!)).toBeUndefined();
+  });
+
+  it('does not reuse a full translation for a fragment or stale cached text', () => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('we', 1), word('saw', 1.3), word('it', 1.6)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'we saw it', vi: 'chúng tôi thấy nó', sourceId: 'v1' });
+    const patch = service.addWords([word('saw', 1.3, 1.3), word('it', 1.6, 1.3)]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    for (const group of groupWords(patch.words).keys())
+      expect(service.getTranslation('v1', group)).toBeUndefined();
+    const fragmentId = patch.words.find(w => w.w === 'saw')!.windowedGroupId!;
+    service.setTranslation({ windowedGroupId: fragmentId, captionStart: 1.3,
+      text: 'wrong text', vi: 'stale', sourceId: 'v1' });
+    const jitter = service.addWords([word('saw', 1.34, 1.34), word('it', 1.64, 1.34)]);
+    expect(service.getTranslation('v1', jitter.words[0].windowedGroupId!)).toBeUndefined();
+  });
+
+  it('matches repeated occurrences by time, not global text', () => {
+    const service = new TranscriptService();
+    const initial = service.addWords([word('echo', 1, 1), word('echo', 10, 10)]);
+    initial.words.forEach((w, i) => service.setTranslation({ windowedGroupId: w.windowedGroupId,
+      captionStart: w.captionStart, text: 'echo', vi: `occurrence-${i}`, sourceId: 'v1' }));
+    const unrelated = service.addWords([word('echo', 20, 20)]);
+    expect(service.getTranslation('v1', unrelated.words[0].windowedGroupId!)).toBeUndefined();
+    const otherSource = service.addWords([{ ...word('echo', 1.04, 1.04), sourceId: 'v2' }]);
+    expect(service.getTranslation('v2', otherSource.words[0].windowedGroupId!)).toBeUndefined();
+    const revised = service.addWords([word('echo', 1.04, 1.04), word('echo', 10.04, 10.04)]);
+    expect(revised.words.map(w => service.getTranslation('v1', w.windowedGroupId!)?.vi))
+      .toEqual(['occurrence-0', 'occurrence-1']);
+  });
+
+  it('rejects one old occurrence matching multiple new occurrences', () => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('echo', 1), word('now', 5)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'echo now', vi: 'old', sourceId: 'v1' });
+    const patch = service.addWords([
+      word('echo', 1.1, 1.1), word('now', 1.4, 1.1),
+      word('echo', 4.5, 4.5), word('now', 4.8, 4.5),
+    ]);
+    expect(service.getTranslation('v1', oldId)).toBeUndefined();
+    for (const id of groupWords(patch.words).keys())
+      expect(service.getTranslation('v1', id)).toBeUndefined();
+  });
+
+  it('counts untranslated old occurrences when deciding ambiguity', () => {
+    const service = new TranscriptService();
+    const initial = service.addWords([
+      { ...word('echo', 1, 1), videoEnd: 3 },
+      { ...word('echo', 2, 2), videoEnd: 4 },
+    ]);
+    service.setTranslation({ windowedGroupId: initial.words[0].windowedGroupId,
+      captionStart: 1, text: 'echo', vi: 'ambiguous', sourceId: 'v1' });
+    const patch = service.addWords([{ ...word('echo', 1.5, 1.5), videoEnd: 3.5 }]);
+    expect(service.getTranslation('v1', patch.words[0].windowedGroupId!)).toBeUndefined();
+  });
+
+  it('does not transfer expired translations', () => {
+    const service = new TranscriptService();
+    const oldId = service.addWords([word('echo', 1)]).words[0].windowedGroupId!;
+    service.setTranslation({ windowedGroupId: oldId, captionStart: 1,
+      text: 'echo', vi: 'expired', sourceId: 'v1' });
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 31 * 60_000);
+    try {
+      const patch = service.addWords([word('echo', 1.04, 1.04)]);
+      expect(service.getTranslation('v1', patch.words[0].windowedGroupId!)).toBeUndefined();
+    } finally { clock.mockRestore(); }
+  });
+
   it('does not share canonical state between sources', () => {
     const service = new TranscriptService();
     service.addWords([word('one', 1)]);

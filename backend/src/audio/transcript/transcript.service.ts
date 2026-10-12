@@ -70,9 +70,8 @@ function bucketKey(
 /**
  * Bản dịch của một caption group.
  *
- * Khoá là `captionStart` (mốc video đã round 2 chữ số), KHÔNG phải số thứ tự
- * tăng dần: seek về đoạn cũ phải tra lại đúng bản dịch cũ (FR-7.5), mà số thứ
- * tự thì sinh mới mỗi lần transcribe lại.
+ * Nhóm canonical dùng windowedGroupId/captionId; captionStart chỉ là khoá
+ * dự phòng cho dữ liệu legacy. Bản dịch chỉ hợp lệ với toàn bộ text của nhóm.
  */
 export type SentenceTranslation = {
   windowedGroupId?: string;
@@ -90,6 +89,15 @@ export type SentenceTranslation = {
 
 type TranslationBucket = {
   t: SentenceTranslation;
+  lastAccess: number;
+};
+
+type WindowedTranslationHistory = {
+  sourceId: string | null;
+  text: string;
+  range: VideoRange;
+  translation?: SentenceTranslation;
+  currentId?: string;
   lastAccess: number;
 };
 
@@ -235,6 +243,8 @@ export class TranscriptService {
 
   // Tách map riêng khỏi `cache`: words đến liên tục, bản dịch đến muộn (sau call AI).
   private readonly translations = new Map<string, TranslationBucket>();
+  // Lịch sử hypothesis không phải state đang hiển thị; replay chỉ đọc `translations`.
+  private readonly windowedTranslationHistory = new Map<string, WindowedTranslationHistory>();
   private windowedBuckets(sourceId: string | null | undefined): Bucket[] {
     for (const [key, bucket] of this.cache) {
       if (Date.now() - bucket.lastAccess > TranscriptService.TTL_MS) this.cache.delete(key);
@@ -264,6 +274,61 @@ export class TranscriptService {
     const next = normalizeRuns(old.filter(w => !incomingIds.has(w.windowedGroupId!) && !intersects(w, range)).concat(incoming), reference, randomUUID);
     const groups = groupWords(next);
     const removed = [...previous.keys()].filter(id => !groups.has(id));
+    const currentGroups = [...groups];
+    const rangeOf = (members: Word[]): VideoRange => ({
+      from: Math.min(...members.map(w => w.videoStart)),
+      to: Math.max(...members.map(w => w.videoEnd)),
+    });
+    const history = this.windowedTranslationHistory;
+    const historyNow = Date.now();
+    for (const [key, entry] of history) {
+      if (historyNow - entry.lastAccess > TranscriptService.TTL_MS) history.delete(key);
+    }
+    for (const [oldId, members] of previous) {
+      const text = members.map(w => w.w).join(' ');
+      let entry = [...history.values()].find(h => h.sourceId === source && h.currentId === oldId);
+      if (!entry) {
+        entry = { sourceId: source, text, range: rangeOf(members),
+          currentId: oldId, lastAccess: historyNow };
+        history.set(captionKey(source, oldId), entry);
+      }
+      const translation = this.getTranslation(source, oldId);
+      if (translation && normalizeSource(translation.sourceId) === source && translation.text === text)
+        entry.translation = { ...translation };
+    }
+    const candidates = [...history.values()].filter(h => h.sourceId === source).map(entry => ({
+      entry,
+      newIds: currentGroups.filter(([, members]) => {
+        const range = rangeOf(members);
+        return members.map(w => w.w).join(' ') === entry.text &&
+          entry.range.from < range.to && entry.range.to > range.from;
+      }).map(([id]) => id),
+    }));
+    const historyByNew = new Map<string, WindowedTranslationHistory[]>();
+    for (const candidate of candidates) {
+      for (const id of candidate.newIds) {
+        const matches = historyByNew.get(id) ?? [];
+        matches.push(candidate.entry);
+        historyByNew.set(id, matches);
+      }
+    }
+    // Kể cả occurrence chưa dịch cũng chặn ambiguity. Chỉ nối lineage một-một;
+    // giữ range gốc để jitter không kéo bản dịch dần sang occurrence bên cạnh.
+    for (const { entry, newIds } of candidates) {
+      if (entry.currentId && groups.has(entry.currentId)) continue;
+      if (newIds.length !== 1) continue;
+      const [id] = newIds;
+      if (previous.has(id) || historyByNew.get(id)?.length !== 1) continue;
+      entry.currentId = id;
+      if (incomingIds.has(id)) entry.lastAccess = historyNow;
+      if (!entry.translation || this.getTranslation(source, id)) continue;
+      this.setTranslation({ ...entry.translation, windowedGroupId: id,
+        captionStart: groups.get(id)![0].captionStart, sourceId: source });
+    }
+    if (history.size > TranscriptService.MAX_BUCKETS) {
+      const oldest = [...history].sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+      for (const [key] of oldest.slice(0, history.size - TranscriptService.MAX_BUCKETS)) history.delete(key);
+    }
     for (const id of removed) this.translations.delete(captionKey(source, id));
     const affected = next.filter(w => !previous.has(w.windowedGroupId!) || incomingIds.has(w.windowedGroupId!));
     const now = Date.now();
