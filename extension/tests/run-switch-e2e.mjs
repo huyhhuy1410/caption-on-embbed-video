@@ -26,7 +26,11 @@ async function sample(phase) {
         activeText: [...line.querySelectorAll('.line-en span.word-active')].map(span => span.textContent.trim()).join(' '),
       }));
       const video = document.querySelector(`#${phase === 'video-a' ? 'a' : 'b'}`);
+      const videoRect = video.getBoundingClientRect();
+      const overlayRect = host?.getBoundingClientRect();
       return { at: Date.now(), phase, currentTime: video.currentTime, paused: video.paused,
+        videoRect: { left: videoRect.left, top: videoRect.top, right: videoRect.right, bottom: videoRect.bottom, width: videoRect.width, height: videoRect.height },
+        overlayRect: overlayRect ? { left: overlayRect.left, top: overlayRect.top, right: overlayRect.right, bottom: overlayRect.bottom, width: overlayRect.width, height: overlayRect.height } : null,
         overlayVisible: Boolean(host && getComputedStyle(host).display !== 'none'), lines };
     }, phase));
   } catch (error) { record('sample-error', { message: String(error) }); }
@@ -89,26 +93,43 @@ try {
   await sample(phase);
   await page.screenshot({ path: join(output, 'video-a.png') });
   await page.locator('#a').evaluate(v => v.pause());
-  await page.locator('#b').evaluate(v => { v.style.display = 'inline'; v.play(); });
   phase = 'video-b';
   record('video-switch', { from: 'A', to: 'B' });
+  await page.locator('#b').evaluate(v => { v.style.display = 'inline'; v.play(); });
   await page.waitForTimeout(22000);
   await sample(phase);
   await page.screenshot({ path: join(output, 'video-b.png') });
   await page.locator('#b').evaluate(v => v.pause());
   packets.push(...await worker.evaluate(() => globalThis.__captionSwitchPackets.splice(0)));
   const linesByPhase = Object.fromEntries(['video-a', 'video-b'].map(p => [p, [...new Set(samples.filter(s => s.phase === p).flatMap(s => s.lines.map(l => l.text).filter(Boolean)))]]));
-  const bTime = Math.min(...samples.filter(s => s.phase === 'video-b').map(s => s.at));
+  const switchEvent = [...events].reverse().find(event => event.kind === 'video-switch');
   const bSamples = samples.filter(s => s.phase === 'video-b');
   const aKeys = new Set(samples.filter(s => s.phase === 'video-a').flatMap(s => s.lines.map(l => l.key)));
   const bKeys = new Set(bSamples.flatMap(s => s.lines.map(l => l.key)));
   const inheritedKeys = [...bKeys].filter(key => aKeys.has(key));
   const leakedText = bSamples.filter(s => s.lines.some(l => l.active && linesByPhase['video-a'].includes(l.text))).map(s => ({ at: s.at, time: s.currentTime, active: s.lines.filter(l => l.active).map(l => l.text) }));
-  const switchedScope = packets.filter(p => p.type === 'capture-scope' && p.at >= bTime).map(p => ({ sourceId: p.sourceId, generation: p.generation }));
+  const aScope = [...packets].reverse().find(p => p.type === 'capture-scope' && p.at < switchEvent.at);
+  const bScopePackets = packets.filter(p => p.type === 'capture-scope' && p.at >= switchEvent.at);
+  const latestBScopePacket = bScopePackets.at(-1) ?? null;
+  const switchedScope = bScopePackets.map(p => ({ sourceId: p.sourceId, generation: p.generation }));
+  const latestBScope = latestBScopePacket && { sourceId: latestBScopePacket.sourceId, generation: latestBScopePacket.generation };
+  const bWords = packets.filter(p => p.type === 'words' && p.at >= switchEvent.at && p.sourceId === bScopePackets.at(-1)?.sourceId);
+  const geometrySamples = bSamples.filter(s => s.overlayVisible && s.overlayRect && s.videoRect.width > 0 && s.videoRect.height > 0);
+  const anchoredSamples = geometrySamples.filter(s => Math.abs(s.overlayRect.top - s.videoRect.top) <= 3 &&
+    (Math.abs(s.overlayRect.left - s.videoRect.right - 12) <= 4 || Math.abs(s.overlayRect.right - s.videoRect.left + 12) <= 4));
+  const bWordsMatchScope = Boolean(latestBScope && bWords.some(p => p.generation === latestBScope.generation && p.sourceId === latestBScope.sourceId));
+  const sourceChanged = Boolean(aScope && latestBScope && aScope.sourceId !== latestBScope.sourceId && latestBScope.generation > aScope.generation);
   report = { status: bSamples.length ? 'completed-with-observations' : 'inconclusive', health, sampleCount: samples.length, packetCount: packets.length,
     linesByPhase, sharedCaptionKeys: inheritedKeys, activeOldTextOnB: leakedText, sourceScopesAfterSwitch: switchedScope,
+    latestBSourceScope: latestBScope, sourceChanged, bWordsMatchScope,
+    overlayGeometry: { visibleSamples: geometrySamples.length, anchoredSamples: anchoredSamples.length, first: geometrySamples[0] ?? null },
+    assertions: { bScopeObserved: Boolean(latestBScope), sourceChanged, bWordsMatchScope, overlayAnchored: anchoredSamples.length > 0 },
     caveats: ['The two clips have distinct source audio, but tiny ASR can make transcription errors.', '200 ms DOM polling can miss brief flashes.', 'A shared tab audio capture mixes sound only when multiple videos play simultaneously; this test pauses A before starting B.'] };
-  console.log(`E2E_SWITCH_RESULT: samples=${samples.length}, packets=${packets.length}, sharedKeys=${inheritedKeys.length}, oldTextOnB=${leakedText.length}, bScopes=${switchedScope.length}`);
+  if (!sourceChanged || !bWordsMatchScope || anchoredSamples.length === 0) {
+    report.status = 'failed';
+    process.exitCode = 1;
+  }
+  console.log(`E2E_SWITCH_RESULT: samples=${samples.length}, packets=${packets.length}, sharedKeys=${inheritedKeys.length}, oldTextOnB=${leakedText.length}, bScopes=${switchedScope.length}, anchored=${anchoredSamples.length}`);
 } catch (error) {
   report = { status: captureStarted ? 'failed' : 'blocked', error: String(error), sampleCount: samples.length, packetCount: packets.length };
   console.error(`E2E_SWITCH_${report.status.toUpperCase()}: ${error}`); process.exitCode = 1;

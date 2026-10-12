@@ -715,6 +715,15 @@ input[type="color"] {
     const anchor = this.autoScroll ? null : this.captureScrollAnchor();
     const wanted = new Set(groups.map((g) => g.key));
 
+    // Sau seek: xóa dòng cùng key nhưng nội dung đổi (signature khác) để tránh overlap.
+    for (const [key, line] of this.renderedByKey) {
+      const group = groups.find(g => g.key === key);
+      if (group && line.signature !== group.signature) {
+        line.wrapper.remove();
+        this.renderedByKey.delete(key);
+      }
+    }
+
     for (const [key, line] of this.renderedByKey) {
       if (wanted.has(key)) continue;
       line.wrapper.remove();

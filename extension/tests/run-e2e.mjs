@@ -20,7 +20,56 @@ let captureStarted = false;
 let report;
 let sampleTimer;
 let sampling = false;
+const activeRowTransitions = [];
 
+async function startActiveRowObserver() {
+  await page.evaluate(() => {
+    globalThis.__captionE2EPhase = 'first-play';
+    globalThis.__captionE2ETransitions = [];
+    let previousKey;
+    let observedRoot;
+    let shadowObserver;
+    const recordActiveRow = () => {
+      const host = [...document.querySelectorAll('[data-caption-ai-owned]')]
+        .find(element => element.shadowRoot?.querySelector('.lines'));
+      const root = host?.shadowRoot;
+      if (root && root !== observedRoot) {
+        shadowObserver?.disconnect();
+        observedRoot = root;
+        shadowObserver = new MutationObserver(recordActiveRow);
+        shadowObserver.observe(root, { attributes: true, subtree: true, attributeFilter: ['class'] });
+      }
+      const active = root?.querySelector('.line-active') ?? null;
+      const key = active?.getAttribute('data-caption-key') ?? null;
+      if (key === previousKey) return;
+      previousKey = key;
+      const video = document.querySelector('video');
+      globalThis.__captionE2ETransitions.push({ phase: globalThis.__captionE2EPhase,
+        key, videoTime: video?.currentTime ?? null, at: Date.now(),
+        text: active?.querySelector('.line-en')?.textContent?.trim() ?? '' });
+    };
+    const hostObserver = new MutationObserver(recordActiveRow);
+    hostObserver.observe(document.documentElement, { childList: true, subtree: true });
+    globalThis.__captionE2EStopObserver = () => {
+      hostObserver.disconnect();
+      shadowObserver?.disconnect();
+    };
+    recordActiveRow();
+  });
+}
+
+async function drainActiveRowTransitions() {
+  activeRowTransitions.push(...await page.evaluate(() => {
+    const transitions = globalThis.__captionE2ETransitions ?? [];
+    globalThis.__captionE2ETransitions = [];
+    return transitions;
+  }));
+}
+
+async function setActiveRowPhase(phase) {
+  await drainActiveRowTransitions();
+  await page.evaluate(value => { globalThis.__captionE2EPhase = value; }, phase);
+}
 function record(kind, data) { events.push({ at: Date.now(), kind, ...data }); }
 
 async function sample(phase) {
@@ -90,7 +139,15 @@ function summarize() {
     }
     previous = sample;
   }
+  const keyedTransitions = activeRowTransitions.filter(transition => transition.key);
+  for (let i = 2; i < keyedTransitions.length; i++) {
+    const [a, b, c] = keyedTransitions.slice(i - 2, i + 1);
+    if (a.phase === b.phase && b.phase === c.phase && a.key === c.key && a.key !== b.key) {
+      jumps.push({ phase: c.phase, transitions: [a, b, c] });
+    }
+  }
   return { adjacentRepetitionCandidates: repeats, rowBacktrackCandidates: jumps,
+    activeRowTransitions,
     expiredHighlightSamples: lateHighlights.slice(0, 100),
     sampleCount: samples.length, receivedPacketCount: packets.length,
     caveats: ['Adjacent repetitions may be genuine speech; compare against the audio.',
@@ -162,6 +219,7 @@ try {
   page.on('pageerror', error => record('pageerror', { message: String(error) }));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.waitForFunction(() => document.querySelector('video')?.readyState >= 2, { timeout: 20000 });
+  await startActiveRowObserver();
   await page.bringToFront();
   console.log(`E2E_BROWSER_READY: Chromium opened with extension ${extensionId}.`);
   console.log('E2E_CAPTURE_REQUIRED: Click extension toolbar icon -> Turn on Captions on the Caption E2E tab within 120 seconds.');
@@ -178,9 +236,11 @@ try {
   await page.locator('video').evaluate(video => video.play());
   await page.waitForTimeout(25000);
   await sample(phase);
+  await drainActiveRowTransitions();
   await page.screenshot({ path: join(output, 'first-play.png') });
   packets.push(...await worker.evaluate(() => globalThis.__captionE2EPackets.splice(0)));
   phase = 'seek-replay';
+  await setActiveRowPhase(phase);
   record('seek', { target: 2 });
   await page.locator('video').evaluate(async video => {
     video.pause();
@@ -190,6 +250,8 @@ try {
   await page.waitForTimeout(18000);
   await sample(phase);
   await page.screenshot({ path: join(output, 'seek-replay.png') });
+  await drainActiveRowTransitions();
+  await page.evaluate(() => globalThis.__captionE2EStopObserver?.());
   await page.locator('video').evaluate(video => video.pause());
   packets.push(...await worker.evaluate(() => globalThis.__captionE2EPackets.splice(0)));
   const evidence = summarize();
