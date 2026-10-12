@@ -130,7 +130,7 @@ class StreamingTranscript:
                 break
             agreed += 1
         if flush:
-            # Pause/end chạy thêm decode hữu hạn; phần đuôi cuối lấy từ decode mới, không từ tuổi từ.
+            # Pause/end runs a finite decode; final tail comes from the new decode, not from aging.
             agreed = len(hypothesis)
         for index, word in enumerate(hypothesis):
             word["wordId"] = self.previous[index]["wordId"] if index < len(self.previous) else self._word_id()
@@ -138,7 +138,7 @@ class StreamingTranscript:
                 word["captionId"] = self.previous[index]["captionId"]
             word["provisional"] = index >= agreed
             if index < agreed:
-                # Agreement đóng băng cả timestamp; suffix decode không được kéo prefix đã commit.
+                # Agreement freezes timestamps; suffix decode must not drag committed prefix.
                 word = {**self.previous[index], "provisional": False} if not flush else word
                 hypothesis[index] = word
         self.open_words.extend(hypothesis[:agreed])
@@ -195,7 +195,7 @@ class StreamingTranscript:
                    "removedCaptionIds": [key for key in self.captions if key not in new_captions],
                    "language": result.language, "languageProbability": result.language_probability,
                    "voiced": result.voiced}
-        # Lịch sử finalized thuộc backend; sidecar chỉ giữ suffix đang sửa để RAM không tăng theo video.
+        # Finalized history belongs to backend; sidecar keeps only the mutable suffix to bound RAM.
         self.visible = {key: value for key, value in new_words.items() if key not in finalized_words}
         self.captions = {key: value for key, value in new_captions.items() if key not in finalized_ids}
         self.open_words = retained_open

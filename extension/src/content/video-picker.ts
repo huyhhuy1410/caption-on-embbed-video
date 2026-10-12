@@ -1,13 +1,8 @@
-/**
- * Chip chọn video khi trang có nhiều `<video>` — FR-1.3.
- *
- * Đứng RIÊNG ngoài shadow root của overlay: overlay neo theo hộp video đang
- * chọn, mà video audio-only có hộp 0×0 (Issue 5.23) nên overlay bị ẩn — nhét
- * picker vào đó là nó biến mất đúng lúc cần nhất.
- */
+// Video picker chip for pages with multiple <video> (FR-1.3).
+// Lives outside overlay's shadow root: overlay anchors to video box, but audio-only videos have 0x0 boxes (Issue 5.23), so overlay hides — picker must be separate to stay visible.
 type ShadowHost = HTMLElement & { shadowRoot: ShadowRoot | null };
 
-/** Khoảng cách tới mép video / mép viewport (px). */
+/** Gap to video/viewport edge (px). */
 const GAP_PX = 8;
 
 export class VideoPicker {
@@ -18,7 +13,7 @@ export class VideoPicker {
   private list: HTMLDivElement;
   private videosRef: HTMLVideoElement[] = [];
 
-  /** Video user ghim, `null` = đang theo heuristic. */
+  /** User-pinned video; `null` means following the heuristic. */
   private picked: HTMLVideoElement | null = null;
   private expanded = false;
   private userPositioned = false;
@@ -35,7 +30,7 @@ export class VideoPicker {
 
   private readonly onDocumentPointerDown = (event: Event): void => {
     if (!this.expanded) return;
-    // `composedPath` xuyên shadow DOM; `event.target` thì bị retarget về host.
+    // `composedPath` crosses shadow DOM; `event.target` is retargeted to the host.
     if (event.composedPath().includes(this.host)) return;
     this.setExpanded(false);
   };
@@ -58,7 +53,7 @@ export class VideoPicker {
   z-index: 99999999;
   display: none;
   font-family: system-ui, sans-serif;
-  /* Không chắn chuột: chỉ chip và panel tự bật lại. */
+  /* Don't block the mouse: only chip and panel re-enable events. */
   pointer-events: none;
 }
 .chip {
@@ -126,7 +121,7 @@ export class VideoPicker {
 .item:hover {
   background: rgba(255, 255, 255, 0.2);
 }
-/* Nền đậm + viền, không chỉ đổi màu chữ — khác biệt màu đơn thuần dễ bị bỏ sót. */
+/* Filled background + border, not just text color — color alone is easy to miss. */
 .item[aria-current="true"] {
   background: rgba(79, 195, 247, 0.26);
   border-color: #4fc3f7;
@@ -215,7 +210,7 @@ export class VideoPicker {
     this.chip.addEventListener("lostpointercapture", release);
   }
 
-  /** Vẽ lại danh sách. Danh sách không đổi thì chỉ cập nhật mục đang ghim. */
+  /** Re-render the list; if unchanged, only refresh the pinned item. */
   setVideos(videos: HTMLVideoElement[]): void {
     const connected = [...new Set(videos)].filter((video) => video.isConnected);
     if (this.picked && !connected.includes(this.picked)) this.picked = null;
@@ -225,7 +220,7 @@ export class VideoPicker {
       return;
     }
 
-    // Ref identity phân biệt video trong shadow roots; query document trả -1 cho tất cả.
+    // Ref identity distinguishes videos inside shadow roots; a document query returns -1 for all of them.
     if (connected.length !== this.videosRef.length ||
         connected.some((video, index) => video !== this.videosRef[index])) {
       this.render(connected);
@@ -238,8 +233,8 @@ export class VideoPicker {
   }
 
   /**
-   * Neo chip vào mép video đang chọn; video 0×0 thì lùi về góc viewport vì
-   * không có hộp nào để bám (video audio-only vẫn cần picker — Issue 5.23).
+   * Anchors the chip to the selected video's edge; 0x0 videos fall back to the viewport corner
+   * since there is no box to anchor to (audio-only videos still need the picker — Issue 5.23).
    */
   position(rect: DOMRect): void {
     this.lastAnchorRect = rect;
@@ -252,7 +247,7 @@ export class VideoPicker {
     let top: number;
     if (rect.width > 0 && rect.height > 0) {
       if (rect.left - GAP_PX - width >= GAP_PX) {
-        // Bên trái video, ngang mép trên — tránh chỗ panel caption đang chiếm.
+        // Left of the video, aligned to its top — avoids the spot the caption panel occupies.
         left = rect.left - GAP_PX - width;
         top = rect.top + GAP_PX;
       } else {
@@ -290,7 +285,7 @@ export class VideoPicker {
     caret.className = "caret";
     caret.textContent = this.expanded ? "▲" : "▼";
     this.chip.append(text, caret);
-    this.chip.title = "Chọn video để tạo phụ đề";
+    this.chip.title = "Choose a video for captions";
   }
 
   private setExpanded(next: boolean): void {
@@ -332,14 +327,14 @@ export class VideoPicker {
         event.preventDefault();
         event.stopPropagation();
         if (!video.isConnected || !this.videosRef.includes(video)) return;
-        // Bấm lại video đã ghim thì giữ nguyên: `reconcile()` ưu tiên "video
-        // đang phát" nên bỏ ghim xong nó chọn lại chính video đó.
+        // Re-clicking the pinned video keeps it: `reconcile()` prefers the "playing video",
+        // so unpinning would just re-select the same one.
         if (video !== this.picked) {
           this.picked = video;
           this.onPick(video);
         }
-        // `markActive` chỉ chạy lúc dựng danh sách, nên phải gọi lại ở đây —
-        // không thì mục vừa chọn vẫn hiện là chưa chọn.
+        // `markActive` only runs when the list is built, so it must be called here too —
+        // otherwise the newly picked item still renders as unselected.
         this.markActive();
         this.setExpanded(false);
       });
@@ -386,10 +381,10 @@ export class VideoPicker {
   }
 }
 
-/** Nhãn rút gọn từ `src`, đủ để phân biệt hai video. */
+/** Short label from `src`, enough to tell two videos apart. */
 function describeVideo(video: HTMLVideoElement): string {
   const current = video.currentSrc || video.src;
-  if (!current) return "video (không rõ nguồn)";
+  if (!current) return "video (unknown source)";
   try {
     const url = new URL(current, window.location.href);
     const name = url.pathname.split("/").filter(Boolean).pop() ?? url.hostname;
@@ -399,20 +394,19 @@ function describeVideo(video: HTMLVideoElement): string {
   }
 }
 
-/** Nhãn phụ: đang phát / chỉ audio. */
+/** Secondary label: playing / audio-only. */
 function videoTag(video: HTMLVideoElement): string {
-  if (!video.paused && !video.ended) return "đang phát";
-  return isVisible(video) ? "" : "chỉ audio";
+  if (!video.paused && !video.ended) return "playing";
+  return isVisible(video) ? "" : "audio only";
 }
 
 /**
- * Video có vùng hiển thị thật không — câu hỏi THỊ GIÁC, khác `paused`: video
- * 0×0 vẫn phát ra tiếng và vẫn được transcribe (Issue 5.23).
+ * Whether the video has a real visible area — a VISUAL question, distinct from `paused`:
+ * 0x0 videos still produce audio and are still transcribed (Issue 5.23).
  */
 export function isVisible(video: HTMLVideoElement): boolean {
   const rect = video.getBoundingClientRect();
-  // `offsetWidth/Height` bắt `display:none` (rect toàn 0), rect bắt video bị
-  // thu nhỏ bằng transform — cần cả hai.
+  // `offsetWidth/Height` catches `display:none`; the rect catches transform-scaled videos.
   return (
     rect.width > 0 &&
     rect.height > 0 &&

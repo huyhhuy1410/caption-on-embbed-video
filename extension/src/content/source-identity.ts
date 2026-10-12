@@ -2,14 +2,14 @@ type MediaSource = { currentSrc: string; src: string };
 
 export class SourceIdentity {
   private readonly sources = new WeakMap<MediaSource, { url: string; id: string }>();
-  // Cache backend dùng sourceId xuyên phiên; bộ đếm cục bộ sẽ trùng giữa các tab.
-  // getRandomValues vẫn dùng được trên HTTP, nơi randomUUID cần secure context.
+  // Backend caches sourceId across sessions; local counter would collide between tabs.
+  // getRandomValues works over HTTP, where randomUUID requires secure context.
   private readonly documentId = Array.from(crypto.getRandomValues(new Uint32Array(4)),
     value => value.toString(16).padStart(8, "0")).join("");
   private counter = 0;
 
   forVideo(video: MediaSource, pageUrl: string): string {
-    // SPA có thể giữ nguyên blob: URL nhưng đổi video qua page URL.
+    // SPA may keep blob: URL but change video via page URL.
     const url = (video.currentSrc || video.src) + "@" + pageUrl;
     let entry = this.sources.get(video);
     if (!entry || entry.url !== url) {

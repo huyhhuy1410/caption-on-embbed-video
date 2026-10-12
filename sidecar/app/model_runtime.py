@@ -17,7 +17,7 @@ class DecodeResult:
 
 
 def decode_waveform(model: Any, audio: np.ndarray, language: str | None) -> DecodeResult:
-    # Generator cũng chạy inference; phải consume trong cùng worker, không trên event loop.
+    # Generator runs inference; must consume in worker thread, not event loop.
     segments, info = model.transcribe(
         audio, language=language, beam_size=1, word_timestamps=True,
         vad_filter=True, condition_on_previous_text=False,
@@ -46,7 +46,7 @@ class ModelRuntime:
         self.model: Any = None
         self.state = "loading"
         self.message = "Loading selected model; first use may download its weights"
-        # Một worker duy nhất bảo vệ toàn model, kể cả khi coroutine bị cancel lúc inference.
+        # Single worker serializes all model access, survives coroutine cancellation during inference.
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="caption-asr")
         self.load_task: asyncio.Task | None = None
         self.inference_gate = asyncio.Semaphore(1)
@@ -90,7 +90,6 @@ class ModelRuntime:
     async def close(self) -> None:
         if self.load_task is not None:
             await self.load_task
-        # Không chặn event loop trong khi worker đang consume generator cuối.
         await asyncio.to_thread(self.executor.shutdown, wait=True, cancel_futures=True)
         self.model = None
         self.closed = True

@@ -11,7 +11,7 @@ from .session import CaptionSession
 from .settings import SAMPLE_RATE, Settings
 from .streaming import Scope
 
-# Giữ các bất biến windowed: catchup > overlap; window >= 2 * overlap (Issue 5.22/5.30).
+# Window invariants: catchup > overlap; window >= 2 * overlap (Issue 5.22/5.30).
 WINDOW_SIZE = 3 * SAMPLE_RATE
 OVERLAP_SIZE = int(1.5 * SAMPLE_RATE)
 CATCHUP_WINDOW_SIZE = 2 * SAMPLE_RATE
@@ -85,12 +85,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
 
 def log_latency(record: dict[str, Any], whisper_seconds: float, window_started_at: float) -> None:
-    """Một dòng `LAT` mỗi lượt decode, cả hai mode.
-
-    `kind` tách nhịp ổn định với nhịp bắt kịp sau tua; `revision` chỉ có ở
-    streaming — đó là cách đối chiếu độ trễ decode với độ trễ render mà
-    `analyze_latency.py` đọc.
-    """
+    """Log one LAT line per decode; kind separates steady vs catch-up; revision is streaming-only for analyze_latency.py correlation."""
     sent_at = time.perf_counter()
     window_seconds = record["samples"] / SAMPLE_RATE
     revision = record.get("revision")
@@ -115,7 +110,7 @@ def resolve_window_size(is_first_chunk: bool) -> int:
 
 
 def compute_video_time(raw_video_time: float, word_time: float, is_first_chunk: bool) -> float:
-    # Anchor windowed đã được gateway resolve; chỉ trừ phần context giữ lại (Issue 5.30).
+    # Window anchor resolved by gateway; subtract retained overlap context (Issue 5.30).
     overlap_sec = 0.0 if is_first_chunk else OVERLAP_SIZE / SAMPLE_RATE
     return round(raw_video_time - overlap_sec + word_time, 2)
 
@@ -149,7 +144,7 @@ def assign_caption_groups(words: list[dict[str, Any]], max_words: int) -> None:
 
 
 def should_emit_words(words: list[dict[str, Any]], is_first_chunk: bool) -> bool:
-    # Window đầu rỗng vẫn báo detection; các window rỗng sau không rebuild UI (Issue 5.40).
+    # First empty window signals detection; later empty windows skip UI rebuild (Issue 5.40).
     return bool(words) or is_first_chunk
 
 

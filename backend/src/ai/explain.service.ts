@@ -9,7 +9,7 @@ export interface ExplainInput {
   lang: string;
 }
 
-// Limiter ở controller để cache hit không bị đếm quota hai lần.
+// Rate limiter at controller layer so cache hits don't count against quota twice
 @Injectable()
 export class ExplainService {
   constructor(

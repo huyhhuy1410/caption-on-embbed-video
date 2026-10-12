@@ -1,4 +1,4 @@
-/** Media events không nhất thiết composed; bind trực tiếp thay vì delegation qua document. */
+/** Media events aren't necessarily composed; bind directly instead of delegating through document. */
 export function bindVideoEvents(
   video: HTMLVideoElement,
   handlers: Partial<Record<string, EventListener>>,

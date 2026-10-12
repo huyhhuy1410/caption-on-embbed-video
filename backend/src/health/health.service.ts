@@ -31,7 +31,7 @@ export class HealthService {
       }
       const data = payload as Record<string, unknown>;
       const status = data.status === 'ok' ? 'ready' : data.status;
-      // Model loading/error có thể trả HTTP 503 nhưng không phải sidecar bị tắt.
+      // Model loading/error may return HTTP 503 but sidecar isn't down
       if (status !== 'ready' && status !== 'loading' && status !== 'error') {
         return response.ok
           ? this.invalidResponse()

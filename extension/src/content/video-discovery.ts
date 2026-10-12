@@ -4,7 +4,7 @@ const OWNED_SELECTOR = "[data-caption-ai-owned]";
 
 type Scan = { root: Node; walker: TreeWalker; first: boolean };
 
-/** Open roots không phát mutation khi attachShadow; probe host theo từng lát, không patch trang. */
+/** Open roots don't fire mutation on attachShadow; probe hosts in slices, no page patching. */
 export class VideoDiscovery {
   private readonly roots = new Map<Document | ShadowRoot, MutationObserver>();
   private readonly elements = new Set<Element>();
@@ -76,7 +76,7 @@ export class VideoDiscovery {
           continue;
         }
         for (const node of mutation.addedNodes) this.enqueue(node);
-        // Dọn ref trong subtree đã gỡ theo cùng budget như subtree mới.
+        // Clean up refs in removed subtrees using the same budget as new ones.
         for (const node of mutation.removedNodes) this.enqueue(node);
         if (mutation.target instanceof HTMLVideoElement && this.eligible(mutation.target)) {
           this.changed = true;
@@ -155,7 +155,7 @@ export class VideoDiscovery {
       if (root instanceof ShadowRoot && !this.eligible(root.host)) {
         observer.disconnect();
         this.roots.delete(root);
-        // Root rời cây không còn nhận mutation; quét riêng để giải phóng ref bên trong.
+        // Root left the tree; no more mutations, so scan separately to release internal refs.
         this.enqueue(root);
       }
     }

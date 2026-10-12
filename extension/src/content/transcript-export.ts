@@ -30,7 +30,7 @@ function timestamp(seconds: number, separator: ',' | '.'): string {
 }
 
 function cueText(text: string): string {
-  // Không cho text ASR tạo markup hoặc giả mạo dòng timing trong subtitle.
+  // Prevent ASR text from creating markup or faking timing lines in subtitle.
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/--&gt;/g, '—&gt;');
 }
@@ -54,7 +54,7 @@ export function serializeTranscript(
   }
   const cues: Cue[] = [];
   for (const [key, group] of groups) {
-    // Legacy windowed không có provisional; streaming phải xác nhận toàn bộ câu.
+    // Legacy windowed has no provisional; streaming must confirm entire sentence.
     if (group.some((word) => word.provisional === true ||
       ((word.wordId !== undefined || word.captionId !== undefined) && word.provisional !== false) ||
       !validWord(word))) continue;

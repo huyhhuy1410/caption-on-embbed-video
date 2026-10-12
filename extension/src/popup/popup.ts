@@ -6,7 +6,7 @@ const serviceState = document.getElementById("service-state") as HTMLElement;
 type CaptionResponse = { enabled?: boolean; state?: string; error?: string };
 
 function renderResponse(response: CaptionResponse | undefined): void {
-  // Callback vẫn chạy khi port đóng; không đổi label nếu capture chưa thành công.
+  // Callback still runs after the port closes; leave the label unchanged if capture never succeeded.
   const error = chrome.runtime.lastError?.message ?? response?.error;
   if (error || !response) {
     serviceState.textContent = error ?? "No response from the extension.";
@@ -33,7 +33,7 @@ let healthGeneration = 0;
 function pollHealth(generation: number): void {
   chrome.runtime.sendMessage({ action: "caption:health" }, (health: HealthState | undefined) => {
     const error = chrome.runtime.lastError?.message;
-    // Bỏ response của lần mở cũ, không tạo hai vòng polling khi đóng/mở nhanh.
+    // Drop the previous open's response so rapid close/open never leaves two polling loops.
     if (generation !== healthGeneration || info.hidden) return;
     modelDetail.textContent = error ?? (health
       ? `Backend: ${health.backend} · Sidecar: ${health.sidecar} · Model: ${health.model ?? "unknown"} · Mode: ${health.mode ?? "unknown"}${health.message ? ` — ${health.message}` : ""}`

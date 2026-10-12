@@ -16,8 +16,8 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
 
   /**
-   * Control state không được rơi trong lúc mất kết nối: audio cũ là vô dụng nên
-   * drop, nhưng reset và đổi nguồn là one-shot nên chỉ giữ bản mới nhất.
+   * Control state must not be lost during disconnect: old audio is useless (drop),
+   * but reset and source-switch are one-shot — keep only the latest.
    */
   private pendingReset = false;
   private pendingSourceId?: string;
@@ -91,7 +91,7 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
     this.socket = socket;
 
     socket.on('open', () => {
-      // Socket cũ có thể mở muộn sau khi một socket mới đã thay nó.
+      // Old socket may open late after a new one replaced it
       if (socket !== this.socket || this.disposed) {
         socket.close();
         return;
@@ -99,7 +99,7 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
       this.reconnectAttempt = 0;
       console.info('Connected to Whisper sidecar');
 
-      // Callback chạy trước flush để nguồn hiện tại ghi đè pending source cũ.
+      // Callback runs before flush so current source overrides pending old source
       this.onOpen?.();
       if (this.latestScope) this.restoreScope();
       else this.flushPendingControls();
@@ -113,8 +113,7 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
     });
 
     socket.on('error', (error) => {
-      // `ws` luôn phát close sau error. Không schedule ở đây, nếu không một lỗi
-      // tạo hai timer reconnect.
+      // `ws` always emits close after error. Don't schedule here — one error would create two reconnect timers.
       console.error('Sidecar error:', error.message);
     });
 
@@ -156,12 +155,12 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Audio realtime không queue: khi reconnect thì audio cũ đã stale. */
+  /** Realtime audio not queued: old audio is stale on reconnect. */
   sendAudio(audio: Buffer): boolean {
     return this.sendNow(audio);
   }
 
-  /** Metadata theo từng chunk cũng drop cùng audio của chính chunk đó. */
+  /** Per-chunk metadata drops with that chunk's audio. */
   sendMetadata(metadata: unknown): boolean {
     return this.sendNow(JSON.stringify(metadata));
   }
@@ -176,18 +175,16 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
 
   sendSourceSwitch(sourceId: string): void {
     if (this.sendMetadata({ type: 'source-switch', sourceId })) {
-      // Source hiện tại gửi thành công phải xoá pending source cũ; nếu giữ, flush
-      // sẽ gửi source cũ SAU source mới và đảo namespace ngược lại.
+      // Successful send clears pending old source; keeping it would flush old source AFTER new, reversing namespace.
       this.pendingSourceId = undefined;
     } else {
-      // Chỉ nguồn mới nhất còn ý nghĩa.
+      // Only latest source matters
       this.pendingSourceId = sourceId;
     }
   }
 
   private flushPendingControls(): void {
-    // Nguồn trước, reset sau: namespace/buffer thuộc nguồn nào phải được xác lập
-    // trước khi reset trạng thái của lượt tua trong nguồn đó.
+    // Source first, then reset: namespace/buffer must be established before resetting seek state within that source.
     if (this.pendingSourceId !== undefined) {
       const sourceId = this.pendingSourceId;
       if (this.sendMetadata({ type: 'source-switch', sourceId })) {
@@ -203,7 +200,7 @@ export class SidecarService implements OnModuleInit, OnModuleDestroy {
     this.onMessage = handler;
   }
 
-  /** Gọi ở mọi lần open, kể cả kết nối đầu — gateway tự guard source null. */
+  /** Called on every open, including first connection — gateway guards null source. */
   setOpenHandler(handler: () => void): void {
     this.onOpen = handler;
   }

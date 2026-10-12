@@ -2,30 +2,31 @@ import { Injectable } from '@nestjs/common';
 
 @Injectable()
 export class VideoClockService {
-  /** Độ dài audio một chunk, giây (capture.ts: 16,000 mẫu @ 16kHz). */
+  /** Audio chunk duration in seconds (capture.ts: 16,000 samples @ 16kHz). */
   private static readonly CHUNK_SECONDS = 1.0;
 
-  /** `videoTimeAtCapture` của chunk TRƯỚC. `undefined` = chưa có chunk nào. */
+  /** Previous chunk's `videoTimeAtCapture`. `undefined` = no chunk yet. */
   private previous: number | undefined;
 
   /**
-   * @param currentVideoTime `videoTimeAtCapture` offscreen vừa gửi
-   * @returns video time tại thời điểm BẮT ĐẦU audio của chunk này
+   * @param currentVideoTime `videoTimeAtCapture` from offscreen
+   * @returns video time at START of this audio chunk
    */
   resolveAnchor(currentVideoTime: number): number {
-    //  - Đã có chunk trước → dùng mẫu của chunk trước.
-    //  - Chunk đầu tiên → chưa có mẫu, suy ra: video time lùi đúng CHUNK_SECONDS.
+    // No prior sample (first chunk, or just reset): infer the chunk's start from the
+    // current time. A prior sample is already the start of THIS chunk — reusing it is
+    // what keeps the anchor from drifting.
     const anchor =
       this.previous !== undefined
         ? this.previous
         : currentVideoTime - VideoClockService.CHUNK_SECONDS;
 
-    // Cập nhật SAU khi đã tính anchor — thứ tự này quan trọng.
+    // Assign AFTER computing the anchor: the stored value must stay one chunk behind.
     this.previous = currentVideoTime;
     return anchor;
   }
 
-  /** Xoá trạng thái — gọi khi seek */
+  /** Clear state — call on seek. */
   reset(): void {
     this.previous = undefined;
   }

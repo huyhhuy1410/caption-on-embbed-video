@@ -300,7 +300,7 @@ describe('scoped audio gateway', () => {
       const second = client();
       gateway.handleConnection(second.c);
       second.send({ ...b, type: 'source-switch' });
-      // Offscreen gửi seek ngay khi mở WS, trước cả audio mới.
+      // The offscreen sends a seek as soon as the WS opens, ahead of any new audio.
       second.send({ ...b, type: 'seek', seekTimeAtCapture: 0 });
       expect(second.sent.at(-1)).toMatchObject({
         ...b,

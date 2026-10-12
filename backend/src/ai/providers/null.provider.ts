@@ -5,15 +5,9 @@ import { Translation } from '../types/translation';
 import { WordExplanation } from '../types/word-explanation';
 
 /**
- * Provider rỗng, dùng khi KHÔNG có `AI_API_KEY`.
- *
- * Vì sao cần: `GeminiProvider` ném lỗi khi thiếu key, mà `ai.module.ts` dựng nó
- * trong `useFactory` ⇒ Nest không boot được ⇒ hỏng luôn cả caption EN, dù
- * caption EN hoàn toàn không cần AI. Design nói rõ: "Core captions are
- * free/private via local whisper" — chỉ translation/explain mới cần key.
- *
- * Provider này giữ app chạy; tính năng cần AI sẽ trả lỗi rõ ràng để tầng gọi
- * tự quyết định (ví dụ bỏ qua bản dịch, không làm hỏng caption).
+ * Fallback provider when `AI_API_KEY` is missing. Allows app to boot and English
+ * captions to work (they don't need AI); translation/explain calls reject with
+ * clear errors so callers can degrade gracefully.
  */
 export class NullProvider implements TranslationProvider, ExplainProvider {
   private readonly logger = new Logger(NullProvider.name);

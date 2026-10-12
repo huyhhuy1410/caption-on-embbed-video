@@ -68,8 +68,8 @@ function notifySource(): void {
 }
 
 function syncVisibility(): void {
-  // Tại sao kiểm isVisible: overlay chỉ hiện khi video nằm trong viewport,
-  // tránh nhấp nhô không cần thiết khi người dùng cuộn xa.
+  // isVisible check: overlay only shows when video is in viewport, avoiding
+  // unnecessary flicker when user scrolls away.
   if (captionEnabled && !languageHidden && activeVideo && (fullscreen.isActive() || isVisible(activeVideo))) overlay.show();
   else overlay.hide();
 }
@@ -123,18 +123,18 @@ async function restoreSnapshot(): Promise<void> {
   const scope = { ...captureScope };
   const key = `${scope.sessionId}:${scope.generation}:${scope.sourceId}:${url}`;
   if (restoreKey === key) return;
-  // Khoá trước await để chặn hai lần load song song; mở lại nếu load lỗi.
+  // Lock before await to prevent parallel loads; release on error.
   restoreKey = key;
   try {
     const result = await send({ type: "snapshot-load", url });
     if (!captureScope || !sameScope(scope, captureScope) || scope.sourceId !== activeSourceId || activeVideoUrl !== url) return;
     const snapshot = result?.snapshot as TranscriptSnapshot | null;
     if (!result?.ok || !snapshot) return;
-    // UUID giữ identity qua refresh; chỉ remap nguồn và bỏ metric của lịch sử restore.
+    // UUID preserves identity across refresh; only remap source and drop metrics from restore history.
     const words = snapshot.words.map(word => ({ ...word, sourceId: scope.sourceId,
       capturedAtEpochMs: undefined }));
     const translations = snapshot.translations.map(item => ({ ...item, sourceId: scope.sourceId }));
-    // Backend trả replay canonical; merge trước tại UI sẽ giữ hai identity cho cùng lịch sử.
+    // Backend returns canonical replay; merging at UI first would create two identities for the same history.
     await send({ type: "restore-snapshot", ...scope, words, translations });
   } catch (error) {
     if (restoreKey === key) restoreKey = "";
@@ -212,7 +212,7 @@ chrome.runtime.onMessage.addListener(message => {
     return;
   }
   if (!captionEnabled || !captureScope || message.sourceId !== activeSourceId) return;
-  // Bỏ mọi message thiếu scope: đường mới luôn gắn đủ session/generation.
+  // Drop messages missing scope: new path always carries full session/generation.
   if (!sameScope(captureScope, message)) return;
   if ((message.type === "words" || message.type === "replay") && Array.isArray(message.words)) {
     if (message.mode === "streaming") {
@@ -247,7 +247,7 @@ function bind(video: HTMLVideoElement): () => void {
     playing: active(() => playback("playing")),
     pause: active(() => playback("paused")),
     ended: active(() => playback("ended")),
-    // Clock đứng khi buffering nhưng tab audio vẫn có thể chạy từ nguồn khác.
+    // Clock freezes during buffering but tab audio may still play from other sources.
     waiting: active(() => playback("playing")),
     stalled: active(() => playback("playing")),
     seeking: active(() => {
@@ -290,7 +290,7 @@ function reconcile(): void {
     stopOverlayLoop();
     activeVideo = next;
     activeSourceId = nextSource;
-    // Snapshot bám theo URL bền vững, tách khỏi sourceId phiên.
+    // Snapshot tracks durable URL, decoupled from session sourceId.
     activeVideoUrl = next ? (next.currentSrc || next.src) : "";
     captureScope = null;
     restoreKey = "";

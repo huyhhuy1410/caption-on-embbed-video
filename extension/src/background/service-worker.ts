@@ -6,7 +6,7 @@ const SESSION_KEY = "captionSession";
 const LAST_TAB_KEY = "lastCaptionTab";
 const BACKEND_URL = "http://127.0.0.1:8000";
 const snapshots = new SnapshotStore();
-// Snapshot chỉ được đọc qua SW, không mở toàn bộ storage cho content scripts.
+// Snapshots are SW-only; content scripts don't get full storage access.
 const storageReady = chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
 void storageReady.catch(error => console.warn("Caption AI: storage access restriction failed", error));
 type CaptionSession = { tabId: number };
@@ -39,8 +39,8 @@ async function readSession(): Promise<CaptionSession | undefined> {
   return value && Number.isInteger(value.tabId) ? value : undefined;
 }
 
-// `captions-off` xoá session trước khi content script flush snapshot, nên tab
-// vừa capture vẫn phải được phép ghi nốt. Chỉ tin tab do SW tự ghi.
+// `captions-off` clears session before content script flushes snapshot, so the
+// captured tab must still be allowed to write. Only trust tabs the SW itself recorded.
 async function readTrustedTabId(senderTabId: number): Promise<boolean> {
   const value = (await chrome.storage.session.get(LAST_TAB_KEY))[LAST_TAB_KEY];
   return Number.isInteger(value) && value === senderTabId;
@@ -64,7 +64,7 @@ function toOffscreen(message: object): Promise<unknown> {
   return chrome.runtime.sendMessage({ ...message, target: "offscreen" });
 }
 
-// Toolbar là gesture duy nhất cấp activeTab cho tabCapture.
+// Toolbar click is the only gesture that grants activeTab for tabCapture.
 let toggles: Promise<void> = Promise.resolve();
 chrome.action.onClicked.addListener(tab => {
   if (tab.id === undefined) return;
@@ -87,7 +87,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return;
   }
-  // Popup không có sender.tab; xử lý trước guard dành riêng cho content script.
+  // Popup has no sender.tab; handle before the content-script guard.
   const fromPopup = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL("dist/popup/popup.html");
   if (fromPopup && message.action === "caption:toggle") {
     toggles = toggles.then(async () => {
@@ -122,7 +122,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void requestHealth().then(sendResponse);
     return true;
   }
-  // Chỉ nhận control từ top-frame của tab capture; tab khác không đổi source/clock.
+  // Only accept control from the capture tab's top frame; other tabs can't change source/clock.
   if (!sender.tab?.id || (sender.frameId ?? 0) !== 0) return;
   if (message.type === "explain-popup-request") {
     void requestExplanation(String(message.word ?? ""), String(message.context ?? "")).then(sendResponse);
@@ -139,8 +139,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const session = await readSession();
     const senderTabId = sender.tab!.id!;
     if (session?.tabId !== senderTabId) {
-      // Chỉ ngoại lệ là snapshot-save sau khi session đã đóng; các request còn
-      // lại từ tab khác phải bị chặn như bình thường.
+      // Only exception is snapshot-save after session closed; other requests
+      // from other tabs stay blocked as usual.
       if (message.type !== "snapshot-save" || !(await readTrustedTabId(senderTabId))) {
         throw new Error("No active capture for this tab");
       }

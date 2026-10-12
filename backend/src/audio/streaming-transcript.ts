@@ -217,7 +217,7 @@ export class StreamingTranscriptStore {
     }
     if (members.size !== words.size) return null;
 
-    // Chỉ commit sau khi toàn bộ membership hợp lệ; revision lỗi không làm mất suffix.
+    // Commit only after all membership checks pass; invalid revision must not lose suffix.
     const finalized: FinalCaption[] = [];
     const emittedWords = [...u.words];
     const emittedCaptions = [...u.captions];
@@ -245,7 +245,7 @@ export class StreamingTranscriptStore {
       if (cached) {
         this.aliases.set(c.captionId, cached);
         cached.lastAccess = Date.now();
-        // History finalized là timeline chuẩn sau seek, không dịch lại ID vừa sinh.
+        // History finalized is the canonical timeline after seek; don't re-emit just-assigned IDs.
         captionWords.forEach((w) => {
           if (!cached.words.some((old) => old.wordId === w.wordId))
             removedWords.add(w.wordId!);

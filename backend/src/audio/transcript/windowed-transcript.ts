@@ -8,10 +8,9 @@ export type WindowedPatch<T extends WindowedWord = WindowedWord> = {
   words: T[]; replaceRanges: VideoRange[]; removedWindowedGroupIds: string[];
 };
 
-// Từ đầu cửa sổ luôn có videoStart == range.from; sai số làm tròn 0.01 nên lấy dư.
+// Rounding margin for window-edge comparison (0.01 precision → 0.05 headroom).
 const EDGE_EPSILON = 0.05;
-// Batch chỉ "nghe lại" được từ bắt đầu trước mép nếu mốc của nó xê dịch trong khoảng
-// này. Xa hơn là lần nói khác, không phải cùng một từ được decode lại.
+// Max timestamp drift for a word to count as "re-decoded" rather than a new utterance.
 const REDERIVE_TOLERANCE = 1.3;
 
 export function intersects(word: WindowedWord, range: VideoRange): boolean {
@@ -20,14 +19,8 @@ export function intersects(word: WindowedWord, range: VideoRange): boolean {
   return word.videoStart < range.to && word.videoEnd > range.from;
 }
 
-/**
- * Từ cũ có bị batch mới thay không.
- *
- * Cửa sổ trượt 2s chồng nhau 1s. Từ bắt đầu TRƯỚC mép trái nằm trọn trong vùng
- * chồng và batch mới chỉ nghe được phần đuôi của nó — thay bằng giao khoảng ở đây
- * là tự xoá từ mà cửa sổ trước đã nghe đúng (`teeth` → mảnh cụt `If`, Issue 5.52).
- * Chỉ thay khi batch thực sự decode lại được chính từ đó: cùng chữ, cùng mốc.
- */
+// Replace old word only if batch re-decodes it (same text, within 1.3s).
+// Otherwise the overlap region keeps the prior window's correct decode (Issue 5.52).
 export function isReplaced(word: WindowedWord, range: VideoRange,
                            incoming: WindowedWord[] = []): boolean {
   if (range.from === range.to) return word.videoStart === word.videoEnd && word.videoStart === range.from;
@@ -36,14 +29,8 @@ export function isReplaced(word: WindowedWord, range: VideoRange,
     Math.abs(other.videoStart - word.videoStart) < REDERIVE_TOLERANCE);
 }
 
-/**
- * Từ mở đầu batch chỉ là đuôi bị cắt của một từ cũ đang giữ → là mảnh cụt, phải bỏ.
- *
- * Cửa sổ cắt ngang từ đang nói: cửa sổ trước nghe trọn `teeth 14.42-14.68`, cửa sổ
- * sau mở đầu ở 14.46 và nghe ra `If 14.46-14.74` với confidence thấp. Hai bên gần
- * như trùng mốc nên không tách được bằng vị trí hay confidence; dấu hiệu phân biệt
- * là trung điểm mảnh cụt rơi vào bên trong một từ cũ đang giữ.
- */
+// A word at range.from whose midpoint falls inside a kept word is a clipped tail of
+// that kept word, not a new decode — drop it (Issue 5.52).
 export function isClippedHead(word: WindowedWord, range: VideoRange, kept: WindowedWord[]): boolean {
   if (range.from === range.to || word.videoStart > range.from + EDGE_EPSILON) return false;
   const mid = (word.videoStart + word.videoEnd) / 2;
@@ -54,7 +41,7 @@ function sameText(left: WindowedWord, right: WindowedWord): boolean {
   return left.w.trim().toLowerCase() === right.w.trim().toLowerCase();
 }
 
-/** Lọc hai nửa của cùng một luật: giữ từ cũ, bỏ mảnh cụt mở đầu batch. */
+// Filter clipped heads from incoming batch, keeping prior window's complete words.
 export function dropClippedHeads<T extends WindowedWord>(kept: T[], incoming: T[], ranges: VideoRange[]): T[] {
   return incoming.filter(word => !ranges.some(range => isClippedHead(word, range, kept)));
 }
@@ -74,7 +61,7 @@ export function groupWords<T extends WindowedWord>(words: T[]): Map<string, T[]>
   return groups;
 }
 
-// Một identity không được nối lại hai phía của nhóm mới; fragment mất bản dịch cũ.
+// Preserve group identity across runs; reassigning IDs would orphan translations.
 export function normalizeRuns<T extends WindowedWord>(words: T[], original: T[], newId: () => string): T[] {
   const previous = groupWords(original);
   const sorted = [...words].sort((a, b) => a.videoStart - b.videoStart);

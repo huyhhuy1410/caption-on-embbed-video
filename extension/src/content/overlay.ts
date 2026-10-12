@@ -4,15 +4,15 @@ import { captionKey, TranscriptState, validWord } from "../shared/transcript-sta
 import type { CaptureScope, WordsUpdate, CaptionWord, SentenceTranslation } from "../shared/protocol";
 export type { CaptionWord, SentenceTranslation } from "../shared/protocol";
 
-/** Từ user vừa bấm, kèm câu chứa nó — `/explain-word` cần ngữ cảnh để giải
- * nghĩa đúng nghĩa trong video, không phải nghĩa từ điển. */
+// Word the user clicked, with its sentence — `/explain-word` needs context
+// to disambiguate video meaning from dictionary meaning.
 export interface WordPick {
   word: string;
   context: string;
   anchor: { left: number; top: number; right: number; bottom: number };
 }
 
-/** Màu của hai dòng caption (FR-4.9). */
+// Caption line colors (FR-4.9).
 export interface CaptionColors {
   en: string;
   vi: string;
@@ -20,39 +20,32 @@ export interface CaptionColors {
 
 type CaptionColorKey = keyof CaptionColors;
 
-/** EN là dòng chính; VI cố ý chìm hơn để không tranh sự chú ý. */
+// EN is primary; VI is deliberately subdued to avoid competing for attention.
 const DEFAULT_COLORS: CaptionColors = {
   en: "#ffffff",
   vi: "#9e9e9e",
 };
 
-/**
- * Panel đặt BÊN CẠNH video, không nằm trên video: đặt trong thì caption che
- * gần hết khung hình. Bên cạnh giữ video quan sát được và bản dịch vẫn đọc được.
- */
+// Panel beside video, not overlaid — overlay would obscure most of the frame.
 const PANEL_GAP_PX = 12;
 const PANEL_WIDTH_PX = 320;
 
-/** Bề rộng tối đa khung sau khi user tự kéo (px). */
+// Max panel width after user drags (px).
 const DRAGGED_MAX_WIDTH_PX = 560;
 
-/**
- * Giữ tối thiểu phần này của khung (px) nằm trong viewport khi kéo.
- *
- * Không giới hạn hoàn toàn: overlay là `position: fixed` và extension
- * **không có UI nào khác** để gọi lại nó — kéo tới mất hẳn thì chỉ còn cách
- * F5. Giữ một mảnh nhỏ ở mép là ranh giới giữa "kéo tuỳ ý" và "mất vĩnh viễn".
- */
+// Keep at least this much of panel (px) in viewport when dragging.
+// Overlay is `position: fixed` with no other UI to recall it — losing it
+// entirely means F5 is the only recovery.
 const KEEP_VISIBLE_PX = 48;
 
-/** Một nhóm caption đã chuẩn hoá từ `words[]`. */
+// Normalized caption group derived from `words[]`.
 interface CaptionGroup {
   key: string;
   words: CaptionWord[];
   signature: string;
 }
 
-/** Một dòng caption đã dựng trong DOM. */
+// Caption line rendered in DOM.
 interface RenderedLine {
   key: string;
   wrapper: HTMLDivElement;
@@ -63,7 +56,7 @@ interface RenderedLine {
   words: CaptionWord[];
 }
 
-/** Neo thị giác của dòng đầu đang đọc — giữ manual scroll qua DOM update. */
+/** Visual anchor of the first line being read — preserves manual scroll across DOM updates. */
 interface ScrollAnchor {
   key: string;
   offset: number;
@@ -102,10 +95,10 @@ export class CaptionOverlay {
   private activeWordIndex = -1;
   private lastVideoTime = 0;
 
-  /** Đang cuộn tay hay tự cuộn theo câu đang phát. */
+  /** Whether scrolling manually or auto-scrolling with current sentence. */
   private autoScroll = true;
 
-  /** Model nhóm caption chỉ dựng lại khi `setWords()` thay dữ liệu. */
+  /** Caption groups model, only rebuilt when `setWords()` changes data. */
   private groups: CaptionGroup[] = [];
   private groupsDirty = true;
 
@@ -133,17 +126,16 @@ export class CaptionOverlay {
 :host {
   position: fixed;
   z-index: 99999999;
-  /* Không bắt chuột: phần còn lại của trang (kể cả controls/tua của video)
-     phải bấm được. Chỉ các vùng con tự bật pointer-events. */
+  /* Pass-through: page (incl. video controls/seek) must remain clickable.
+     Children opt in with their own pointer-events. */
   pointer-events: none;
   display: flex;
   flex-direction: column;
   font-family: system-ui, sans-serif;
   box-sizing: border-box;
 }
-/* Thuoc tinh hidden cua HTML chi la display:none o muc UA stylesheet, nen bat
-   ky rule display nao cua tac giu ghi de no. .settings-menu co display:grid
-   => bam nut gear hai lan khong an duoc (Issue 5.39). */
+/* HTML hidden is just UA display:none, so author display rules override it.
+   .settings-menu has display:grid, so toggling gear twice didn't hide it (Issue 5.39). */
 [hidden] {
   display: none !important;
 }
@@ -172,8 +164,7 @@ export class CaptionOverlay {
   max-height: 70vh;
   min-height: 120px;
 }
-/* Vùng cuộn. overflow-y bật thanh cuộn khi nội dung dài hơn khung —
-   đó là bề mặt đọc lại. */
+/* Scroll area — overflow-y enables scrollbar when content exceeds frame. */
 .lines {
   flex: 1 1 auto;
   min-height: 0;
@@ -288,8 +279,7 @@ button {
 button:hover {
   background: rgba(255, 255, 255, 0.2);
 }
-/* Nút "Follow current" chỉ hiện khi đang cuộn tay — mặc định auto-scroll thì
-   vô nghĩa, và một nút thừa chỉ gây rối. */
+/* "Follow current" only shows during manual scroll — redundant under auto-scroll. */
 button.follow {
   margin-right: auto;
   background: rgba(79, 195, 247, 0.22);
@@ -305,7 +295,7 @@ button.icon-button {
   padding: 0;
   font-size: 15px;
 }
-/* input[type=color] mặc định có viền dày của UA — bỏ đi cho gọn. */
+/* input[type=color] has thick UA border by default — strip it. */
 input[type="color"] {
   width: 24px;
   height: 20px;
@@ -388,9 +378,9 @@ input[type="color"] {
       }
     });
 
-    // Chỉ thao tác THẬT của người mới chuyển sang manual. Không dùng event
-    // `scroll`: Chrome cũng phát nó khi row mới/VI mới làm đổi chiều cao (scroll
-    // anchoring), khiến auto-scroll tự dừng dù user không chạm gì.
+    // Only real user input triggers manual scroll. `scroll` event is not used:
+    // Chrome fires it when new rows/VI change height (scroll anchoring),
+    // which would stop auto-scroll without user intent.
     this.lineHost.addEventListener("scroll", () => this.measureFirstRender(), { passive: true });
     this.lineHost.tabIndex = 0;
     this.lineHost.addEventListener("wheel", () => this.switchToManualScroll(), {
@@ -411,7 +401,7 @@ input[type="color"] {
       }
     });
     this.lineHost.addEventListener("pointerdown", (event) => {
-      // Kéo scrollbar không phát wheel; nhận diện vùng scrollbar ở mép phải.
+      // Scrollbar drag doesn't fire wheel; detect scrollbar area at right edge.
       const rect = this.lineHost.getBoundingClientRect();
       if (event.clientX >= rect.right - 12) this.switchToManualScroll();
     });
@@ -481,22 +471,22 @@ input[type="color"] {
     this.dragHandle.addEventListener("lostpointercapture", release);
   }
 
-  /** Chuyển sang manual chỉ từ ý định người dùng, không từ layout scroll. */
+  /** Switch to manual only on user intent, not layout scroll. */
   private switchToManualScroll(): void {
     if (!this.autoScroll) return;
     this.autoScroll = false;
     this.followButton.hidden = false;
   }
 
-  /** Cuộn tay chủ động (dùng khi gọi từ test hoặc khi cần ép). */
+  /** Manual scroll (used in tests or when forcing). */
   scrollBy(delta: number): void {
     this.switchToManualScroll();
     this.lineHost.scrollTop += delta;
   }
 
   /**
-   * Chỉ cuộn khung caption nội bộ; `scrollIntoView()` sẽ kéo cả trang và phá
-   * vị trí video.
+   * Scroll only the caption frame; `scrollIntoView()` would drag the whole page
+   * and break video position.
    */
   private scrollToCurrent(): void {
     if (this.activeKey === null) return;
@@ -532,13 +522,13 @@ input[type="color"] {
     this.wordPick = handler;
   }
 
-  /** Gắn action phụ vào toolbar, đặt cạnh nút settings. */
+  /** Mount secondary action in toolbar, next to settings button. */
   mountToolbarButton(button: HTMLButtonElement): void {
     button.classList.add("icon-button");
     this.toolbar.insertBefore(button, this.settingsMenu);
   }
 
-  /** Tra theo khoá ổn định, không theo vị trí DOM có thể đổi khi thêm dòng. */
+  /** Lookup by stable key, not DOM position that shifts as lines are added. */
   private pickAt(
     key: string,
     index: number,
@@ -551,7 +541,7 @@ input[type="color"] {
   }
 
   setWords(words: CaptionWord[]): void {
-    // Tương thích batch cũ: thay từng group, không suy diễn coverage cho replay thưa.
+    // Legacy batch compat: replace per-group, don't infer coverage for sparse replay.
     const groups = groupWords(words);
     const incoming = [...groups.values()].flatMap(members => members.map(w => ({ ...w,
       windowedGroupId: w.windowedGroupId ?? `legacy:${w.captionStart}` })));
@@ -571,7 +561,7 @@ input[type="color"] {
     const fragmentPrefix = `local:${Date.now()}:${Math.random().toString(36).slice(2)}`;
     this.words = applyPatch(this.words.filter(w => !w.wordId), patch, () => `${fragmentPrefix}:${fragment++}`)
       .concat(this.words.filter(w => Boolean(w.wordId))).sort((a, b) => a.videoStart - b.videoStart);
-    // Giới hạn theo group để không persist một identity với membership bị cắt.
+    // Cap by group to avoid persisting one identity with sliced membership.
     while (this.words.length > 10_000) {
       const key = captionKey(this.words[0]);
       this.words = this.words.filter(word => captionKey(word) !== key);
@@ -654,7 +644,7 @@ input[type="color"] {
     }));
   }
 
-  /** Mọi nhóm đã nạp của video hiện tại, sắp theo từ đầu tiên. */
+  /** All loaded groups for current video, sorted by first word. */
   private getGroups(): CaptionGroup[] {
     if (!this.groupsDirty) return this.groups;
     const byKey = new Map<string, CaptionWord[]>();
@@ -677,7 +667,7 @@ input[type="color"] {
     return this.groups;
   }
 
-  /** Binary search: từ cuối cùng có `videoStart <= videoTime`. */
+  /** Binary search for last word with `videoStart <= videoTime`. */
   private activeWordAt(videoTime: number): CaptionWord | null {
     let low = 0;
     let high = this.words.length - 1;
@@ -693,7 +683,7 @@ input[type="color"] {
     }
     if (found === -1) return null;
     const word = this.words[found];
-    // Batch ASR có thể đến sau khi từ đã phát xong; không giữ sáng từ cuối qua khoảng trống.
+    // Batch ASR may arrive after the word finished playing; don't keep the last word lit across a gap.
     return videoTime < word.videoEnd ? word : null;
   }
 
@@ -706,8 +696,8 @@ input[type="color"] {
   }
 
   /**
-   * Cập nhật DOM tăng dần. Không xoá `lineHost`, vì xoá sẽ reset scrollTop và
-   * đá người đọc khỏi câu cũ mỗi khi caption/bản dịch mới tới.
+   * Incremental DOM update. Never clear `lineHost` — that resets scrollTop and
+   * kicks the reader off the old sentence whenever new captions/translations arrive.
    */
   private reconcileLines(): void {
     const groups = this.getGroups();
@@ -715,7 +705,7 @@ input[type="color"] {
     const anchor = this.autoScroll ? null : this.captureScrollAnchor();
     const wanted = new Set(groups.map((g) => g.key));
 
-    // Sau seek: xóa dòng cùng key nhưng nội dung đổi (signature khác) để tránh overlap.
+    // After seek: remove lines with same key but different content (signature) to avoid overlap.
     for (const [key, line] of this.renderedByKey) {
       const group = groups.find(g => g.key === key);
       if (group && line.signature !== group.signature) {
@@ -759,8 +749,8 @@ input[type="color"] {
     if (anchor && this.renderedByKey.has(anchor.key)) {
       this.restoreScrollAnchor(anchor);
     } else if (!this.autoScroll) {
-      // Nhóm neo bị dữ liệu mới thay hẳn: không có row nào để khôi phục theo
-      // key, nhưng vẫn giữ vị trí số học thay vì nhảy về đầu danh sách.
+      // Anchor group replaced by new data: no row to restore by key,
+      // but keep numeric position instead of jumping to list start.
       this.setProgrammaticScrollTop(oldScrollTop);
     }
   }
@@ -818,8 +808,9 @@ input[type="color"] {
         this.activeKey === null ? null : this.renderedByKey.get(this.activeKey);
       if (oldLine) {
         oldLine.wrapper.className = "line line-past";
-        // Highlight cũ phải mất ngay khi chuyển câu; nếu không toàn lịch sử sẽ
-        // tích luỹ các từ xanh và người đọc không biết từ nào đang phát.
+        // Old highlight must vanish immediately on sentence change; otherwise
+        // the entire history accumulates blue words and the reader can't tell
+        // which word is playing.
         oldLine.spans.forEach((span) => {
           span.className = "";
         });
@@ -841,7 +832,7 @@ input[type="color"] {
     this.activeWordIndex = nextIndex;
   }
 
-  /** Dòng đầu đang nhìn + offset bên trong dòng đó. */
+  /** First line being viewed + offset within that line. */
   private captureScrollAnchor(): ScrollAnchor | null {
     const top = this.lineHost.scrollTop;
     for (const line of this.renderedLines) {
@@ -901,8 +892,8 @@ input[type="color"] {
   }
 
   /**
-   * Chọn bên phải, không đủ chỗ thì bên trái, hết cách mới đè lên mép phải video.
-   * Bị bỏ qua khi user đã tự kéo, trừ khi `force`.
+   * Prefer right side; if no room, try left; as last resort overlap video right edge.
+   * Ignored when user dragged manually, unless `force`.
    */
   position(rect: DOMRect, force = false): void {
     if (this.userPositioned && !force && this.drag === null) {
@@ -919,7 +910,7 @@ input[type="color"] {
     } else if (rect.left - gap - width >= KEEP_VISIBLE_PX) {
       left = rect.left - gap - width;
     } else {
-      // Không bên nào đủ chỗ ⇒ đè lên mép phải video, vẫn hơn là tràn màn hình.
+      // Neither side fits — overlap video right edge, better than overflowing screen.
       left = Math.max(KEEP_VISIBLE_PX, Math.min(rect.right - width, viewportWidth - width - KEEP_VISIBLE_PX));
     }
 

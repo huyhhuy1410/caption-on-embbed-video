@@ -17,17 +17,10 @@ import {
   captionKey,
 } from './streaming-transcript';
 
-/** Windowed dùng mốc thời gian; streaming dùng identity ổn định. */
+/** Windowed uses timestamps; streaming uses stable identity. */
 type CaptionGroup = { captionStart: number; text: string; captionId?: string; windowedGroupId?: string };
 
-/**
- * Khoá hàng đợi dịch = (nguồn, captionStart).
- *
- * `captionStart` là mốc thời gian RIÊNG của từng video: video B bắt đầu
- * câu đầu tiên ở 0:00 cũng hệt video A. Khoá bằng `captionStart` đơn thuần thì
- * câu của video A bị xem như đã thử (nên bỏ, không dịch lại) hoặc nhận nhầm bản
- * dịch của video B (Issue 5.20).
- */
+/** Queue key = (source, captionStart). Without the source, two videos at 0:00 collide (Issue 5.20). */
 function queueKey(
   sourceId: string | null,
   captionStart: number,
@@ -38,7 +31,7 @@ function queueKey(
     : `${sourceId ?? ''}|${captionStart}`;
 }
 
-/** Nhóm đã gắn nguồn, dùng khi xếp hàng dịch. Xem `enqueueForTranslation`. */
+/** Group with source attached, used when queuing for translation. See `enqueueForTranslation`. */
 type QueuedGroup = CaptionGroup & {
   sourceId: string | null;
   sessionId?: string;
@@ -47,20 +40,13 @@ type QueuedGroup = CaptionGroup & {
   enqueuedAt?: number;
 };
 
-/** Số lần thử tối đa cho một câu trước khi tạm bỏ nó. */
+/** Max attempts per sentence before dropping it. */
 const MAX_TRANSLATE_ATTEMPTS = 3;
 
 /**
- * Trần thời gian giữ một câu trong hàng đợi khi provider quá tải (503).
- *
- * Vì sao 503 không dùng chung `MAX_TRANSLATE_ATTEMPTS`: 503 là lỗi tạm thời
- * của provider và **không tiêu quota**, nên giữ câu chờ là an toàn — trần quota
- * 15 req/phút do bộ đếm cửa sổ giữ, không phải do việc bỏ sau N lần. Trước đây
- * 503 đi chung nhánh "tính công rồi bỏ", nên một đợt Gemini quá tải vài phút
- * **xoá vĩnh viễn bản dịch VI của cả đoạn** chứ không chỉ chậm hơn — đúng cái
- * "xoá sổ bản dịch cả video" đã xảy ra ở Issue 5.12. Vẫn cần trần để một lỗi
- * 503 kéo dài (model bị thu hồi, key hết hạn mà lỗi trả về 503) không giữ câu
- * vô hạn.
+ * Max time to hold a sentence during 503 overload. Holding is safe — 503 doesn't consume
+ * quota — and keeps a brief provider outage from deleting a whole video's translations,
+ * which the old count-and-drop path did (Issue 5.12). The ceiling bounds the hold.
  */
 const TRANSIENT_HOLD_MAX_MS = 5 * 60_000;
 
@@ -69,19 +55,16 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private extensionClient?: WebSocket;
 
   /**
-   * `sourceId` của video ĐANG CHẠY — khoá cache theo nguồn (Issue 5.20).
-   *
-   * Đây là biến SỐNG SUỐT phiên, không phải biến đi kèm message: backend
-   * nhận audio của mọi video trong tab (tabCapture), nên nó phải nhớ nguồn hiện
-   * tại để gán cho `getRange`/`getTranslations` khi seek. Đổi video mà không
-   * cập nhật biến này thì replay trả lời của video trước.
+   * `sourceId` of the currently playing video. Session-lifetime, not per-message:
+   * tabCapture delivers audio from every video in the tab, so seek/replay must know
+   * which source to read. Stale value returns the previous video's words (Issue 5.20).
    */
   private activeSourceId: string | null = null;
   private activeScope?: CaptureScope;
   private awaitingAudio = false;
   private readonly inFlight = new Set<string>();
 
-  /** value là `QueuedGroup` — phải giữ `sourceId` để drain ghi cache đúng nguồn. */
+  /** Value is `QueuedGroup` — must keep `sourceId` so drain writes to correct source cache. */
   private readonly pending = new Map<string, QueuedGroup>();
 
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
@@ -89,25 +72,17 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private draining = false;
   private translationBatchSequence = 0;
 
-  /** Số lần đã thử của mỗi nhóm, để thôi thử lại sau MAX_TRANSLATE_ATTEMPTS. */
+  /** Attempt count per group, to stop retrying after MAX_TRANSLATE_ATTEMPTS. */
   private readonly attempts = new Map<string, number>();
 
-  /**
-   * Mốc lúc một nhóm bắt đầu bị GIỮ vì 503 — khác `attempts` ở chỗ nó đo
-   * THỜI GIAN chờ, không đếm lần. Xem `TRANSIENT_HOLD_MAX_MS`.
-   */
+  /** When a group started being held for 503 — wait TIME, unlike `attempts` which counts. */
   private readonly heldSince = new Map<string, number>();
 
   /**
-   * Không được thử lại trước mốc này sau một đợt 503.
-   *
-   * Cần riêng vì `msUntilRoom()` chỉ biết QUOTA, không biết provider đang
-   * quá tải: sau 503 thì cửa sổ vẫn còn chỗ ⇒ timer nổ ngay lập tức ⇒ 503 lặp
-   * liên tục, đốt hết lượt của các câu mới trong lúc model đang chết.
-   *
-   * Giữ ở gateway chứ không `pauseUntil` trên limiter dùng chung: 503 là lỗi
-   * của CHÍNH request (gotcha #26), không phải trạng thái của cả project — đường
-   * HTTP không có lý do bị chặn theo.
+   * Don't retry before this timestamp after a 503 burst. Needed separately because
+   * `msUntilRoom()` only knows quota: the window still has room right after a 503, so
+   * the timer would fire at 0ms and 503 forever. Owned here, not by the shared limiter,
+   * because 503 is request-specific — the HTTP path has no reason to stall.
    */
   private drainNotBefore = 0;
 
@@ -119,8 +94,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly rateLimiter: TranslationRateLimiter,
   ) {
     this.sidecarService.setOpenHandler(() => {
-      // Sidecar giữ state theo từng WS connection; reconnect = buffer/source
-      // sạch. Gửi lại nguồn HIỆN TẠI để window đầu sau reload vào đúng namespace.
+      // Sidecar keeps state per WS connection; reconnect = buffer/source cleared.
+      // Resend CURRENT source so first window after reload goes to correct namespace.
       if (this.activeScope)
         this.sendToExtension({
           type: 'sidecar-reconnected',
@@ -202,16 +177,11 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
-   * Xếp các caption group chưa có bản dịch vào hàng đợi, rồi hẹn một lượt
-   * drain.
-   *
-   * Vì sao xếp hàng thay vì gọi ngay: dịch từng câu riêng tốn 1 request/câu.
-   * Nhịp sinh caption là ~15–25 nhóm/phút, mà Gemini free tier cho ~15
-   * request/phút ⇒ vượt trần ngay trong điều kiện bình thường. Gộp nhiều câu
-   * vào một request là cách duy nhất giảm số request mà không giảm số câu.
-   *
-   * `enqueue` là ĐỒNG BỘ, `drain` chạy ở macrotask sau ⇒ mọi nhóm trong cùng
-   * một message `words` tự nhiên gộp thành một request, không cần chờ thêm.
+   * Queue caption groups that lack translations, then schedule a drain. Queuing rather
+   * than calling directly: one request per sentence exceeds the Gemini free tier
+   * (~15-25 groups/min against 15 RPM), so several sentences must share one request.
+   * Enqueue is synchronous and `drain` runs in the next macrotask, so groups arriving in
+   * the same `words` message batch together for free.
    */
   private enqueueForTranslation(groups: CaptionGroup[]): void {
     for (const group of groups) {
@@ -219,17 +189,15 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         this.activeSourceId,
         group.windowedGroupId ?? group.captionId ?? group.captionStart,
       );
-      // So cả TEXT, không chỉ khoá. Một nhóm caption có thể bị cắt ngang
-      // ranh giới window: lần đầu chỉ thấy nửa câu, lần sau mới đủ. Nếu chỉ
-      // kiểm tra khoá thì bản dịch NỬA CÂU đã cache sẽ chặn luôn bản đầy đủ.
+      // Compare TEXT, not just key: a group can grow across a window boundary (half
+      // sentence first, full sentence next), and a key-only hit would keep the half.
       if (cached && cached.text === group.text) {
         this.sendToExtension({ type: 'translation', ...cached, ...this.activeScope });
         continue;
       }
 
-      // Ghi nguồn vào nhóm NGAY LÚC XẾP HÀNG, không đọc `activeSourceId` lúc
-      // drain — drain có thể chạy vài giây sau, mà user đã kịp đổi video ⇒ bản
-      // dịch của video cũ bị ghi vào namespace của video mới.
+      // Capture the source AT QUEUE TIME: drain runs seconds later, and a video switch
+      // in between would file this translation under the new video (Issue 5.20).
       const queued: QueuedGroup = {
         captionStart: group.captionStart,
         captionId: group.captionId,
@@ -249,8 +217,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const tried = this.attempts.get(key) ?? 0;
       if (tried >= MAX_TRANSLATE_ATTEMPTS) continue;
 
-      // Ghi đè: nhóm có thể đã trong hàng đợi với text CŨ (ngắn hơn), giờ dài
-      // ra. Bản mới nhất là bản đúng.
+      // Overwrite: group may already be queued with OLD (shorter) text, now longer. Latest is correct.
       queued.enqueuedAt = this.pending.get(key)?.enqueuedAt ?? Date.now();
       this.pending.set(key, queued);
       while (this.pending.size > 300)
@@ -264,23 +231,18 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
-   * Hẹn lượt drain kế tiếp, chờ tới khi cửa sổ quota còn chỗ.
-   *
-   * Guard `draining` là bắt buộc, không phải cho đẹp: `drainTimer` được xoá
-   * lúc timer NỔ, không phải lúc drain XONG. Một drain có retry sẽ await hàng
-   * giây, suốt thời gian đó `drainTimer` là `undefined` ⇒ không còn gì chặn việc
-   * hẹn drain mới ⇒ nhiều request chạy chồng, cùng key, cùng bucket quota.
+   * Schedule the next drain, waiting until the quota window has room. The `draining`
+   * guard is load-bearing: `drainTimer` is cleared when the timer FIRES, not when the
+   * drain COMPLETES, so a draining request that awaits for seconds leaves `drainTimer`
+   * undefined and would let a second drain start against the same quota bucket.
    */
   private scheduleDrain(): void {
     if (this.pending.size === 0) return;
     if (this.drainTimer !== undefined || this.draining) return;
 
-    // Còn chỗ trong cửa sổ thì bắn ngay. Đây là chủ ý: caption về theo từng đợt
-    // ~2s, nên gộp được nhóm nào thì dòng VI hiện sớm được nhóm đó — chờ thêm
-    // chỉ làm bản dịch đến muộn mà không giúp gì cho quota.
-    // `msUntilRoom()` đã bao gồm cả cooldown toàn cục — xem
-    // TranslationRateLimiter.pauseUntil. Lấy max với `drainNotBefore` để
-    // không thử lại trong lúc provider còn đang quá tải.
+    // Fire as soon as the window has room. Captions arrive in ~2s bursts, so draining
+    // whatever is queued shows VI sooner; waiting longer only delays it.
+    // `drainNotBefore` keeps a waiting drain from retrying while the provider is down.
     const wait = Math.max(
       this.rateLimiter.msUntilRoom(),
       this.drainNotBefore - Date.now(),
@@ -296,29 +258,26 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }, wait);
   }
 
-  /** Nhóm này đã bị giữ chờ 503 quá lâu chưa? Xem `TRANSIENT_HOLD_MAX_MS`. */
+  /** Has this group been held for 503 too long? See `TRANSIENT_HOLD_MAX_MS`. */
   private hasHeldTooLong(key: string, now: number): boolean {
     const since = this.heldSince.get(key);
     return since !== undefined && now - since >= TRANSIENT_HOLD_MAX_MS;
   }
 
-  /**
-   * Dịch mọi nhóm đang chờ trong MỘT request.
-   *
-   * Fire-and-forget: FR-5.2 cho phép VI đến muộn 1–3s, nên không được để HTTP
-   * call chặn luồng `words`. Lỗi (hết quota, mạng, thiếu key) chỉ log — caption
-   * EN phải chạy bất kể.
-   */
+  /** Group is still the active one for its source, so its translation is worth keeping. */
   private currentGroup(group: CaptionGroup & { sourceId: string | null }): boolean {
     return !group.windowedGroupId || this.transcriptService.isCurrentWindowedGroup(group.sourceId, group.windowedGroupId, group.text);
   }
 
+  /**
+   * Translate all waiting groups in ONE request, fire-and-forget: FR-5.2 tolerates VI
+   * arriving 1-3s late, so the HTTP call must not block the `words` stream. Every failure
+   * is handled in the catch — EN captions run regardless.
+   */
   private async drain(): Promise<void> {
-    // Kiểm lại quota NGAY TRƯỚC khi tiêu, dù `scheduleDrain` đã tính rồi.
-    // Đây là chốt chặn duy nhất nằm đúng chỗ request thật sự rời máy, nên bất
-    // biến "≤15 request/60s" được giữ tại đây thay vì phụ thuộc vào việc timer
-    // không bao giờ nổ sớm (đồng hồ hệ thống nhảy, timer bị dồn...). Trả batch về
-    // hàng đợi rồi hẹn lại — không mất câu nào.
+    // Recheck quota immediately before spending. This is the last checkpoint before the
+    // request leaves, so "≤15 requests/60s" holds even if the timer fired early. Groups
+    // go back on the queue, so nothing is lost.
     if (this.rateLimiter.msUntilRoom() > 0) {
       this.scheduleDrain();
       return;
@@ -345,8 +304,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
     batch.forEach((g) =>
       this.inFlight.add(queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId)),
     );
-    // Ghi mốc NGAY TRƯỚC khi bắn — đây là bộ đếm quota, phải khớp số request
-    // thật đã rời máy, kể cả request rồi thất bại.
+    // Count right before sending: this feeds the quota window and must reflect requests
+    // actually issued, including ones that fail.
     this.rateLimiter.recordCall();
     try {
       const results = await this.translateService.translateBatch(
@@ -358,8 +317,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       console.debug('[translation-timing]', { event: 'provider-complete', batchId,
         elapsedMs: Date.now() - startedAt });
       batch.forEach((group, index) => {
-        // Xoá mốc giữ NGAY khi thành công: để sót lại thì lần 503 sau nhóm này
-        // bị coi là "đã giữ quá lâu" và bị bỏ oan.
+        // Clear the hold timestamp on success — leaving it would make the next 503 read
+        // this group as held-too-long and drop it.
         this.heldSince.delete(
           queueKey(group.sourceId, group.captionStart, group.windowedGroupId ?? group.captionId),
         );
@@ -367,8 +326,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         if (!vi) { emptyCount++; return; }
         if (!this.currentGroup(group)) { staleCount++; return; }
 
-        // `sourceId` lấy từ nhóm đã xếp hàng, KHÔNG phải `activeSourceId`:
-        // drain có thể chạy vài giây sau khi user đã đổi sang video khác.
+        // `sourceId` off the queued group, never `activeSourceId` — the user may have
+        // switched videos since this was queued.
         this.transcriptService.setTranslation({
           captionStart: group.captionStart,
           captionId: group.captionId,
@@ -400,13 +359,12 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       console.debug('[translation-timing]', { event: 'error', batchId,
         elapsedMs: Date.now() - startedAt,
         errorType: error instanceof Error ? error.name : 'unknown' });
-      // Ba nhánh, KHÁC NHAU về hậu quả — xem `ProviderUnavailableError`.
       const now = Date.now();
       const quotaError =
         error instanceof ProviderUnavailableError && !error.retryable;
       const overloaded =
         error instanceof ProviderUnavailableError && error.retryable;
-      // 503 đã giữ quá trần ⇒ bỏ (còn câu mới trong hàng đợi vẫn được thử).
+      // A 503 held past the ceiling drops like any other error; newly queued sentences still get their turn.
       const heldTooLong = batch.some((g) =>
         this.hasHeldTooLong(
           queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId),
@@ -415,11 +373,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
       );
 
       if (quotaError) {
-        // Lỗi quota: KHÔNG thuộc về câu nào cả, cả project đang cạn quota.
-        // Trả các nhóm về hàng đợi và KHÔNG tăng `attempts` — đếm nó là công
-        // của câu thì một đợt cạn quota kéo dài sẽ xoá sổ bản dịch của cả
-        // video.
-        // Cooldown nằm ở limiter dùng chung, nên đường HTTP cũng dừng theo.
+        // Project-wide, not any sentence's fault. Re-queue WITHOUT counting an attempt —
+        // charging it to the sentence would delete the whole video's translations once
+        // quota runs dry. The shared limiter's cooldown also stalls the HTTP path.
         this.rateLimiter.pauseUntil(now + error.retryAfterMs);
         for (const group of batch) {
           if (!this.currentGroup(group)) continue;
@@ -433,12 +389,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             `re-queued ${batch.length} sentences`,
         );
       } else if (overloaded && !heldTooLong) {
-        // 503 = model quá tải: TẠM THỜI và không tiêu quota ⇒ giữ câu trong
-        // hàng đợi, KHÔNG tính công, chờ provider hồi.
-        //
-        // Phải khai báo lịch nghỉ cho chính drain này (`drainNotBefore`),
-        // không chỉ re-queue: cửa sổ quota vẫn còn chỗ sau 503 nên nếu không,
-        // `scheduleDrain` hẹn 0ms và 503 lặp lại liên tục.
+        // Model overload: temporary and quota-free, so hold without counting an attempt.
+        // `drainNotBefore` must be set, not just a re-queue — the quota window still has
+        // room after a 503, so `scheduleDrain` would otherwise retry at 0ms and 503 forever.
         this.drainNotBefore = Math.max(
           this.drainNotBefore,
           now + error.retryAfterMs,
@@ -459,8 +412,8 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           `Translation held (provider overloaded), re-queued ${batch.length} sentences`,
         );
       } else {
-        // Còn lại: lỗi của CHÍNH batch (400/401/500) — tính công rồi bỏ sau MAX
-        // lần; hoặc 503 đã giữ quá `TRANSIENT_HOLD_MAX_MS`.
+        // Batch-specific failure (400/401/500), or a 503 held past `TRANSIENT_HOLD_MAX_MS`:
+        // count the attempt and drop the sentence once `MAX_TRANSLATE_ATTEMPTS` is spent.
         for (const group of batch) {
           if (!this.currentGroup(group)) continue;
           const key = queueKey(
@@ -484,7 +437,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
         this.inFlight.delete(queueKey(g.sourceId, g.captionStart, g.windowedGroupId ?? g.captionId)),
       );
       this.draining = false;
-      // Nhóm mới có thể đã về trong lúc đang chờ request này.
+      // New groups may have arrived while waiting for this request.
       this.scheduleDrain();
     }
   }
@@ -595,7 +548,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           if (typeof sourceId === 'string' && sourceId) {
             this.activeSourceId = sourceId;
             this.videoClockService.reset();
-            // Nội dung video trước không được sống sót qua mốc đổi nguồn.
+            // Previous video content must not survive source switch point.
             this.sidecarService.sendSourceSwitch(sourceId);
           }
         } else if (isRecord(parsed) && parsed.type === 'seek') {
@@ -604,23 +557,22 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
           if (seekTime !== undefined) {
             this.videoClockService.reset();
 
-            // Reset clock ở backend là chưa đủ: sidecar còn giữ ~3s audio của
-            // đoạn trước mốc tua, để nguyên thì window kế tiếp trộn tiếng cũ với
-            // tiếng mới nhưng dán mốc mới ⇒ phụ đề đúng lúc tua rồi lệch ngay sau.
+            // Resetting the backend clock isn't enough — the sidecar still holds ~3s of
+            // audio from before the seek, which would mix into the next window with the
+            // new timestamps and leave captions briefly off-target.
             this.sidecarService.sendReset();
 
-            // Mốc thời gian là của RIÊNG video này, nên phải lọc theo nguồn.
+            // Timestamps are per-video, so replay must be filtered by source.
             const sourceId = this.activeSourceId;
 
-            // Lấy hết phần đã xem phía sau, không giới hạn cửa sổ: giới hạn thì
-            // sau mốc đó hệ thống không biết đã xem tới đâu và rơi về nhịp
-            // transcribe thường, dù dữ liệu nằm sẵn trong cache.
+            // Send everything watched after the seek point, unbounded: capping it would
+            // re-introduce the ~2s transcribe latency for data already in cache.
             const replayWords = this.transcriptService.getRangeFrom(
               sourceId,
               seekTime,
             );
 
-            // Bản dịch đi kèm, thiếu chúng thì dòng VI rỗng ở đúng các đoạn tiếp theo.
+            // Translations travel alongside; without them the VI line is empty downstream.
             const replayTranslations =
               this.transcriptService.getTranslationsFrom(sourceId, seekTime);
             console.info('Seek received:', seekTime);
@@ -633,8 +585,7 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
             });
           }
         } else {
-          // Gắn lại anchor: video time tại ĐẦU audio của chunk này, không phải
-          // tại lúc gửi. Xem VideoClockService.
+          // Re-anchor: video time at START of this audio chunk, not at send time. See VideoClockService.
           const withAnchor =
             isRecord(parsed) && typeof parsed.videoTimeAtCapture === 'number'
               ? {
@@ -701,9 +652,9 @@ export class AudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
 }
 
 /**
- * Sidecar chốt nhóm caption bằng `captionStart` (gặp dấu kết câu hoặc đủ 16 từ).
- * Backend gom lại theo chính khoá đó — extension đã tự gom nhóm để dựng dòng EN,
- * nó chỉ thiếu bản dịch.
+ * Regroup words into the captions the sidecar finalized (sentence-ending punctuation or
+ * 16 words). The extension already grouped them to draw the EN line; this only needs the
+ * per-caption text to translate.
  */
 function collectCaptionGroups(words: unknown): CaptionGroup[] {
   if (!Array.isArray(words)) return [];

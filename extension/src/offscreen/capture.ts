@@ -63,8 +63,7 @@ chrome.runtime.onMessage.addListener((message) => {
     clockReceivedAt = performance.now();
     playbackRate = Number.isFinite(message.playbackRate) ? message.playbackRate : 1;
     if (typeof message.playing === "boolean") playing = message.playing;
-    // Đang seek: video clock đứng yên, tab audio vẫn chạy. Dừng tích tụ frame
-    // để không trộn audio của vị trí cũ và mới trong cùng một chuỗi.
+    // Seeking: video clock paused but tab audio still runs. Stop accumulating frames to avoid mixing old/new position audio in same sequence.
     if (message.seeking === true) clearPartial();
   } else if (message.type === "source-switch") {
     const nextSource = typeof message.sourceId === "string" ? message.sourceId : null;
@@ -141,11 +140,9 @@ function connectBackend(token: number): void {
 }
 
 /**
- * Nhả mọi tài nguyên audio và đặt lại state NGAY (đồng bộ).
- *
- * Không được `await` gì trước khi gán lại global: một phiên mới có thể mở giữa
- * chừng, và teardown của phiên cũ sẽ xoá nhầm state của phiên mới. `context.close()`
- * là thao tác async duy nhất nên trả về cho caller await sau.
+ * Sync reset — must not await before reassigning globals, or a session starting
+ * mid-teardown gets its state clobbered. Only `context.close()` is async, and it
+ * is returned for the caller to await.
  */
 function releaseAudio(): AudioContext | undefined {
   if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
@@ -177,7 +174,6 @@ function releaseAudio(): AudioContext | undefined {
 }
 
 async function stopTabAudio(): Promise<void> {
-  // Vô hiệu hoá callback của phiên đang chạy trước khi đụng tài nguyên.
   active = false;
   captureToken++;
   const oldContext = releaseAudio();
@@ -185,8 +181,7 @@ async function stopTabAudio(): Promise<void> {
 }
 
 async function captureTabAudio(streamId: string): Promise<void> {
-  // Token phải cấp trước mọi await, nếu không hai lần start chồng nhau cùng giữ
-  // một token và cả hai đều đi tiếp với một `stream` chung.
+  // Token allocated before any await: overlapping starts would otherwise share a token and both proceed with the same stream.
   const token = ++captureToken;
   const oldContext = releaseAudio();
   await oldContext?.close().catch(() => {});
@@ -210,7 +205,7 @@ async function captureTabAudio(streamId: string): Promise<void> {
   }
   context = audio;
   captured.getAudioTracks()[0]?.addEventListener("ended", () => {
-    // Track cũ của phiên đã bị thay: dừng ở đây sẽ giết nhầm phiên mới.
+    // Old session's track ended after replacement: stopping here would kill the new session.
     if (token !== captureToken) return;
     relay({ type: "status", state: "error", message: "Tab audio capture ended. Toggle captions to restart." });
     void stopTabAudio();
@@ -229,7 +224,7 @@ async function captureTabAudio(streamId: string): Promise<void> {
     }
     const { samples, contextTime } = event.data;
     const now = performance.now();
-    // Audio clock được map sang browser epoch; không dùng thời điểm gửi frame làm capture start.
+    // Audio clock mapped to browser epoch; frame send time is not capture start.
     const blockStartEpochMs = performance.timeOrigin + now - (audio.currentTime - contextTime) * 1000;
     if (!pendingSamples.length) {
       pendingStartEpochMs = blockStartEpochMs;
@@ -255,12 +250,11 @@ async function captureTabAudio(streamId: string): Promise<void> {
   const input = audio.createMediaStreamSource(captured);
   source = input;
   input.connect(recorder);
-  // Web Audio chỉ render node có đường đi tới destination; worklet không nối ra
-  // thì `process()` không bao giờ chạy. Gain 0 giữ đồ thị sống mà không phát tiếng.
+  // Web Audio only renders nodes connected to destination; gain=0 keeps graph alive without audible output.
   const sink = audio.createGain();
   sink.gain.value = 0;
   recorder.connect(sink).connect(audio.destination);
-  // tabCapture chặn route mặc định; giữ tiếng của tab qua audio graph riêng.
+  // tabCapture blocks default route; preserve tab audio via separate graph to destination.
   input.connect(audio.destination);
   connectBackend(token);
   relay({ type: "capture-ready", ...scope });

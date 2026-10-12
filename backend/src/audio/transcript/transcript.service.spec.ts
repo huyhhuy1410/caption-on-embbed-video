@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { TranscriptService, Word } from './transcript.service';
-// Từ giả với `videoStart` cho trước.
+// Fake word with a given videoStart.
 function makeWord(videoStart: number, sourceId: string | null = null): Word {
   return {
     w: 'test',
@@ -70,11 +70,11 @@ describe('TranscriptService', () => {
       service.setTranslation({ captionStart: 10, text: 'a', vi: 'A' });
       service.setTranslation({ captionStart: 20, text: 'b', vi: 'B' });
 
-      // 20 nằm ngoài [21, 31] ⇒ chỉ còn 30
+      // 20 falls outside [21, 31], so only 30 remains.
       expect(service.getTranslations(null, 21, 31)).toEqual([
         { captionStart: 30, text: 'c', vi: 'C' },
       ]);
-      // cả ba, đã sort
+      // all three, sorted
       expect(service.getTranslations(null, 0, 100).map((t) => t.captionStart)).toEqual(
         [10, 20, 30],
       );
@@ -108,51 +108,48 @@ describe('TranscriptService', () => {
     });
   });
 
-  // Issue 5.20: hai video có mốc thời gian RIÊNG, trùng nhau. Không tách
-  // namespace theo nguồn thì replay của video B trả lời của video A.
-  // Issue 5.25: sau mỗi lần tua, whisper gõ lại cùng vùng audio với timestamp
-  // LỆCH (đường tính anchor đổi). Dedup lúc đọc không bắt được nên cache phình
-  // và `getRange` trả lẫn hai bản timeline.
+  // Issue 5.20: videos have independent but overlapping timelines; without a per-source namespace, replaying video B returns video A's lines.
+  // Issue 5.25: after a seek, whisper re-decodes the same audio with shifted timestamps (the anchor path changes), and read-time dedup misses it, so the cache bloats and `getRange` returns both timelines mixed.
   describe('re-transcription over an existing range', () => {
     it('replaces the old copy instead of concatenating it', () => {
-      // Lần 1: vùng cũ. Dùng từ KHÁC NHAU để dedup lúc đọc không ăn mất
-      // (dedup chỉ bỏ khi cùng chữ VÀ lệch < 0.5s).
+      // First pass: the old range. Distinct words so read-time dedup keeps them
+      // (dedup only drops the same text within 0.5s).
       service.addWords([
         { ...makeWord(50, 'v1'), w: 'one' },
         { ...makeWord(50.4, 'v1'), w: 'two' },
       ]);
       expect(service.getRangeFrom('v1', 0)).toHaveLength(2);
 
-      // Lần 2 sau khi tua: cùng câu nhưng anchor lệch vài trăm ms nên vùng mới
-      // CHỒNG LẤN gần hết vùng cũ — đúng hình dạng log thật ghi ra
-      // (`51.72→56.02` rồi `51.76→56.16`). Hai bản phải bị thay, không cộng dồn.
+      // Second pass after a seek: same sentence, anchor shifted a few hundred ms,
+      // so the new range overlaps the old almost fully (real log shape:
+      // `51.72→56.02` then `51.76→56.16`). The old copy must be replaced, not appended.
       service.addWords([
         { ...makeWord(50.3, 'v1'), w: 'one' },
         { ...makeWord(50.8, 'v1'), w: 'two' },
       ]);
 
       const words = service.getRangeFrom('v1', 0);
-      // Còn đúng 2 từ của BẢN MỚI, không phải 4 từ nối từ hai lần ghi.
+      // Only the 2 words of the NEW copy remain, not 4 stitched from both writes.
       expect(words).toHaveLength(2);
       expect(words.map((w) => w.videoStart)).toEqual([50.3, 50.8]);
-      // Không còn từ nào của bản cũ sót lại.
+      // No word from the old copy survives.
       expect(words.some((w) => w.videoStart === 50)).toBe(false);
     });
 
     it('keeps untouched ranges of the same video', () => {
       service.addWords([makeWord(10, 'v1')]);
       service.addWords([makeWord(50, 'v1')]);
-      // Ghi lại vùng 50 CHỒNG LẤN lên bản cũ, mốc lệch đủ xa để dedup bỏ sót.
+      // Rewrite range 50 over the old copy, shifted far enough that dedup misses it.
       service.addWords([makeWord(50.3, 'v1')]);
 
       const words = service.getRangeFrom('v1', 0);
-      // Vùng 10 không bị đụng tới nên vẫn phải còn.
+      // Range 10 is untouched, so it must survive.
       expect(words.map((w) => w.videoStart)).toEqual([10, 50.3]);
     });
 
     it('leaves other videos alone', () => {
       service.addWords([makeWord(50, 'v1')]);
-      // Video khác ghi đúng vùng đó vẫn phải giữ nguyên bản của nó.
+      // Another video writing the same range keeps its own copy.
       service.addWords([makeWord(50.3, 'v2')]);
 
       expect(service.getRangeFrom('v1', 0).map((w) => w.videoStart)).toEqual([50]);
@@ -162,7 +159,7 @@ describe('TranscriptService', () => {
     });
   });
 
-  // Issue 5.25: replay chỉ lấy 3 giây nên đoạn sau phải chờ nhịp thường.
+  // Issue 5.25: replay only covers 3 seconds, so the rest must wait for the normal cadence.
   describe('getRangeFrom (replay to the end of what was watched)', () => {
     it('returns everything watched past the seek point', () => {
       service.addWords([makeWord(10, 'v1')]);
@@ -170,11 +167,11 @@ describe('TranscriptService', () => {
       service.addWords([makeWord(30, 'v1')]);
       service.addWords([makeWord(40, 'v1')]);
 
-      // Tua về 20: cần cả 20, 30, 40 — không chỉ 3 giây sau 20.
+      // Seek to 20: need 20, 30 and 40 too, not only the 3 seconds after 20.
       expect(service.getRangeFrom('v1', 20).map((w) => w.videoStart)).toEqual([
         20, 30, 40,
       ]);
-      // Tua về 0: tất cả.
+      // Seek to 0: everything.
       expect(service.getRangeFrom('v1', 0)).toHaveLength(4);
     });
 
@@ -188,12 +185,11 @@ describe('TranscriptService', () => {
     });
 
     it('keeps the part of a bucket that STRADDLES the seek point', () => {
-      // Một bucket khoá theo giây của từ ĐẦU và trải ~một window sidecar, nên
-      // nó có thể bắt đầu trước mốc tua rồi vươn qua sau. Lọc theo
-      // `anchorTime` là mất sạch phần sau mốc (Issue 5.35).
-      //
-      // Ca cũ (`excludes ranges before the seek point`) không bắt được lỗi này:
-      // seek 25 rơi đúng biên bucket, không bucket nào trải qua mốc.
+      // A bucket is keyed by the FIRST word's second and spans ~one sidecar window,
+      // so it can start before the seek point and reach past it. Filtering by
+      // `anchorTime` drops everything after the point (Issue 5.35).
+      // The older case misses this: seek 25 lands on a bucket boundary, so no bucket
+      // straddles the point.
       service.addWords(
         [49, 49.6, 50.2, 50.8, 51.4, 52].map((t) => {
           const word = makeWord(t, 'v1');
@@ -228,21 +224,21 @@ describe('TranscriptService', () => {
       expect(service.getRange('video-b', 29, 31).map((x) => x.w)).toEqual([
         'other',
       ]);
-      // Nguồn lạ không nhận được gì, kể cả bucket trùng giây.
+      // An unknown source gets nothing, not even a bucket on the same second.
       expect(service.getRange('video-c', 29, 31)).toEqual([]);
     });
 
     it('keeps both videos after switching back', () => {
       service.addWords([makeWord(30, 'video-a')]);
-      // Rời video A sang B, rồi quay lại A — replay vẫn phải ra lời của A.
+      // Leave video A for B, then return to A — replay must still return A's lines.
       service.addWords([{ ...makeWord(5, 'video-b'), w: 'b-word' }]);
-      // Quay lại A và xem LẠI đúng vùng cũ: bản cũ bị thay, không phải giữ.
+      // Back on A, rewatch the exact same range: the old copy is replaced, not kept.
       service.addWords([{ ...makeWord(30, 'video-a'), w: 'a-again' }]);
 
       expect(service.getRange('video-a', 29, 31).map((x) => x.w)).toEqual([
         'a-again',
       ]);
-      // Và video B không bị đụng tới.
+      // Video B stays untouched.
       expect(service.getRange('video-b', 4, 6).map((x) => x.w)).toEqual([
         'b-word',
       ]);
@@ -270,7 +266,7 @@ describe('TranscriptService', () => {
 
     it('an unknown source is a namespace, not the empty one', () => {
       service.addWords([makeWord(30, null)]);
-      // Word KHÔNG có sourceId (sidecar cũ) vẫn phải tách được khỏi video thật.
+      // A word with no sourceId (old sidecar) must stay separate from a real video.
       expect(service.getRange(null, 29, 31)).toHaveLength(1);
       expect(service.getRange('video-a', 29, 31)).toEqual([]);
     });
@@ -295,7 +291,7 @@ describe('TranscriptService', () => {
 
       for (let i = 0; i < 301; i++) {
         fakeNow = i;
-        // Mốc cách 1.5s để luật mới không coi là decode lại cùng từ.
+        // 1.5s spacing so the new rule doesn't treat these as re-decoded same words.
         service.addWords([makeWord(i * 1.5)]);
       }
       expect(service.getRange(null, 0, 0.5)).toEqual([]);
@@ -310,21 +306,21 @@ describe('TranscriptService', () => {
       service.addWords([makeWord(0)]); // key 0, lastAccess = 0
       fakeNow = 1;
       for (let i = 1; i <= 299; i++) {
-        // thêm 299 bucket (key 1..299), mốc cách 1.5s để không bị luật mới coi là decode lại.
+        // add 299 buckets (keys 1..299), 1.5s apart so the new rule doesn't see re-decodes.
         fakeNow = i;
         service.addWords([makeWord(i * 1.5)]);
       }
-      // giờ có 300 bucket, chưa vượt trần (300 = MAX), chưa evict.
+      // now 300 buckets, at the cap (300 = MAX), nothing evicted yet.
 
-      fakeNow = 1_000_000; // nhảy thật xa
-      service.getRange(null, 0, 0.5); // touch key 0 -> lastAccess = 1_000_000 (MỚI NHẤT)
+      fakeNow = 1_000_000; // jump far ahead
+      service.getRange(null, 0, 0.5); // touch key 0 -> lastAccess = 1_000_000 (MOST RECENT)
       fakeNow = 1_000_001;
-      service.addWords([makeWord(299 * 1.5 + 1.5)]); // thêm bucket thứ 301 -> vượt trần -> evict
-      // lúc này lastAccess: key 0 = 1_000_000, các key 1..299 = 1..299, key 300 = ?
-      // key 300 sẽ lấy Date.now() hiện tại = 1_000_000 (fakeNow chưa đổi)
-      // -> hai bucket cùng lastAccess 1_000_000, còn lại nhỏ hơn -> đuổi key 1 (nhỏ nhất)
+      service.addWords([makeWord(299 * 1.5 + 1.5)]); // add bucket 301 -> over the cap -> evict
+      // lastAccess now: key 0 = 1_000_000, keys 1..299 = 1..299, key 300 = ?
+      // key 300 takes the current Date.now(), so two buckets tie at 1_000_000
+      // while the rest are older -> evict key 1 (smallest)
 
-      expect(service.getRange(null, 0, 0.5)).toHaveLength(1); // key 0 vẫn sống
+      expect(service.getRange(null, 0, 0.5)).toHaveLength(1); // key 0 still alive
       nowSpy.mockRestore();
     });
   });

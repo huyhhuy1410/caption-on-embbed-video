@@ -14,17 +14,17 @@ type Response =
   | { ok: false; kind: "unavailable" }
   | { ok: false; kind: "error"; message: string };
 
-/** Popup giải nghĩa gắn cạnh từ vừa bấm; click ngoài hoặc × để đóng. */
+/** Word explanation popup anchored to clicked word; closes on outside click or ×. */
 export class WordPopup {
   private host: HTMLDivElement;
   private shadow: ShadowRoot;
   private card: HTMLDivElement;
-  /** Thanh kéo. Giữ tham chiếu vì `renderBase()` xoá lại con của card. */
+  /** Drag handle; kept as ref because `renderBase()` wipes card children. */
   private grab: HTMLDivElement;
   private current: WordPick | null = null;
   private requestId = 0;
 
-  /** Popup đã bị user kéo ⇒ `position()` không neo lại cạnh từ nữa. */
+  /** Once dragged, `position()` won't re-anchor to the word. */
   private dragged = false;
 
   private readonly onOutside = (event: Event): void => {
@@ -34,9 +34,8 @@ export class WordPopup {
   };
 
   private readonly onDragStart = (event: PointerEvent): void => {
-    // Kéo chỉ bằng thanh trên cùng: phần còn lại của card là nội dung và nút,
-    // bấm chúng phải là bấm chứ không phải bắt đầu kéo — cùng lý do tách
-    // `.drag-handle` riêng ở overlay (gotcha #45).
+    // Drag only via top handle: rest of card is content/buttons that need click,
+    // not drag start — same reason overlay has a separate `.drag-handle` (gotcha #45).
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
@@ -56,8 +55,8 @@ export class WordPopup {
       handle.removeEventListener("pointermove", onMove);
       handle.removeEventListener("pointerup", onUp);
       handle.removeEventListener("pointercancel", onUp);
-      // Chỉ đánh dấu "đã kéo" khi thật sự dịch — bấm nhầm vào thanh không được
-      // làm popup rời khỏi từ, nếu không thì chỉ cần bấm là mất neo.
+      // Mark "dragged" only on real movement: a stray click on the handle must
+      // not detach the popup from its word.
       if (
         Math.abs(up.clientX - startX) > 3 ||
         Math.abs(up.clientY - startY) > 3
@@ -161,8 +160,8 @@ export class WordPopup {
   border-radius: 5px;
   cursor: pointer;
 }
-/* Popup neo sát từ vừa bấm nên hay đè lên dòng caption. Thanh này là đường
-   thoát: kéo ra chỗ trống, hoặc chấp nhận che. */
+/* Popup anchors to the word so it often covers the caption line; this handle is
+   the escape hatch — drag it clear, or accept the overlap. */
 .grab {
   position: absolute;
   top: 0;
@@ -185,8 +184,8 @@ export class WordPopup {
     const sameWord = this.current?.word === pick.word;
     this.current = pick;
     const id = ++this.requestId;
-    // Popup mới luôn neo lại cạnh từ vừa bấm. Giữ vị trí đã kéo chỉ khi bấm LẠI
-    // đúng từ đó — bấm từ khác thì kéo xong không còn ý nghĩa gì.
+    // A new word always re-anchors. Keep the dragged position only when the SAME
+    // word is clicked again — for a different word the drag no longer means anything.
     if (!sameWord) this.dragged = false;
     this.renderBase(pick);
     this.card.appendChild(node("div", "loading", "Loading explanation…"));
@@ -224,9 +223,8 @@ export class WordPopup {
   }
 
   private renderBase(pick: WordPick): void {
-    // `renderBase` chạy lại mỗi lần vẽ (loading → xong → retry) nên nó dựng
-    // lại toàn bộ con. Giữ `grab` sống sót qua `textContent = ""`, hoặc popup
-    // sẽ mất đường kéo ngay sau lần vẽ đầu tiên.
+    // `renderBase` reruns on every paint (loading → done → retry) and rebuilds all
+    // children; re-append the saved `grab` or the popup loses its handle after first paint.
     const grab = this.grab;
     this.card.textContent = "";
     this.card.appendChild(grab);
@@ -290,9 +288,9 @@ export class WordPopup {
   }
 
   private position(pick: WordPick): void {
-    // Đã kéo thì giữ chỗ user đặt. `position()` còn được gọi lại sau khi lời
-    // giải nghĩa về (chiều cao card đổi), nếu không chặn ở đây thì popup bị
-    // nhảy về cạnh từ đúng lúc user đang đọc.
+    // Once dragged, keep the user's spot. `position()` is called again when the
+    // explanation arrives (card height changes); without this guard the popup jumps
+    // back to the word while the user is reading.
     if (this.dragged) return;
 
     const width = this.card.offsetWidth || 300;
@@ -314,7 +312,7 @@ export class WordPopup {
 function node(tag: "div", className: string, text: string): HTMLDivElement {
   const element = document.createElement(tag);
   element.className = className;
-  // Nội dung đến từ trang và model; `textContent` giữ nó là text, không phải HTML.
+  // Content comes from the page and the model; `textContent` keeps it text, not HTML.
   element.textContent = text;
   return element;
 }

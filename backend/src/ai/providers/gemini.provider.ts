@@ -10,50 +10,26 @@ export interface GeminiConfig {
   model?: string;
 }
 
-/**
- * 503 (model quá tải) là trạng thái TẠM THỜI. Lần thử lại được đặt ở TẦNG GATEWAY,
- * không phải ở đây — xem `callGemini`.
- *
- * 429 KHÔNG retry ở đâu cả — xem `QUOTA_STATUS`. Hết quota là trạng thái của
- * CẢ PROJECT trong cửa sổ một phút, nên thử lại trong cùng phút chỉ tổ đốt thêm
- * quota mà chắc chắn vẫn 429. Chỉ có bộ đếm cửa sổ 60s ở gateway mới biết lúc nào
- * quota mở lại.
- */
+/** 503 = overload, retried by the gateway. 429 = quota gone for the minute, never retried. */
 const RETRYABLE_STATUS = new Set([503]);
 const QUOTA_STATUS = 429;
 const MAX_RETRY_DELAY_MS = 8_000;
 
-/**
- * Backoff gợi ý cho 503. 503 không kèm `retryDelay`, nên dùng backoff mũ và cap
- * lại để một request hỏng không treo luồng quá lâu.
- *
- * Chỉ là GỢI Ý đặt vào `ProviderUnavailableError.retryAfterMs` cho tầng
- * gateway. Việc thử lại thật do gateway làm, vì chỉ nó đếm được số request trong
- * cửa sổ quota.
- */
+/** Suggested 503 backoff when the server sends no `retryDelay` — a hint for the gateway's retry. */
 export function retryDelayMs(attempt: number): number {
   return Math.min(1000 * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
 }
 
 /**
- * Chờ tối thiểu khi Gemini báo 429 mà KHÔNG kèm gợi ý thời gian.
- *
- * Không có hằng số này thì 429 rơi về `retryAfterMs = 0` ⇒
- * `pauseUntil(now + 0)` là no-op ⇒ hàng đợi thử lại ngay lập tức ⇒ đốt trọn
- * một cửa sổ quota bằng các request chắc chắn 429. Quota tính theo CỬA SỔ MỘT
- * PHÚT, nên chờ hết cửa sổ là lựa chọn thận trọng đúng bản chất quota.
- *
- * Cố ý khai báo riêng thay vì import từ `commandcode.provider`: mỗi provider
- * một file độc lập, đổi transport của một bên không được kéo theo bên kia.
+ * Minimum wait when a 429 carries no retry hint. Without it `retryAfterMs = 0` makes
+ * `pauseUntil()` a no-op and the retry burns the same exhausted window. Duplicated in
+ * commandcode.provider so neither provider depends on the other.
  */
 const QUOTA_FALLBACK_DELAY_MS = 60_000;
 
 /**
- * Thời gian server dặn chờ, đọc từ `retryDelay` trong body lỗi 429.
- *
- * KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
- * cắt nó xuống dưới một phút — bản trước cap ở 8s — là tự bảo đảm lần thử kế
- * tiếp rơi đúng vào cửa sổ vừa cạn, rồi 429 lại, và cứ thế.
+ * Server-specified 429 wait from the body's `retryDelay`. Never capped (unlike the 503
+ * backoff): quota is per MINUTE, so a wait under 60s just hits the same exhausted window.
  */
 export function serverRetryDelayMs(body: string): number {
   const match = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(body);
@@ -65,7 +41,7 @@ interface GeminiTranslateResult {
   translation: string;
 }
 
-/** Envelope cho batch: mỗi phần tử tự mang số thứ tự câu của nó. */
+/** Batch envelope — each item carries its own sentence index. */
 interface GeminiTranslateBatchResult {
   translations: Array<{ index: number; translation: string }>;
 }
@@ -94,20 +70,10 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
   }
 
   /**
-   * POST MỘT generateContent call và trả JSON đã parse.
-   *
-   * Hàm này KHÔNG tự thử lại, và đó là chủ ý — đừng thêm retry vào đây.
-   *
-   * Lý do: throttle của gateway đếm số request để giữ trần 15 request/phút của
-   * Gemini free tier. Retry nội bộ ở đây khiến MỘT lượt drain bắn nhiều HTTP call
-   * mà bộ đếm không thấy gì cả. Probe đo được đúng hệ quả đó: 26 request/phút so
-   * với trần 15 (Issue 5.12, vòng 2).
-   *
-   * Nên cả 429 lẫn 503 đều ném `ProviderUnavailableError` lên gateway, kèm cờ
-   * `retryable` để gateway biết phải tính công (503 — lỗi của chính batch) hay
-   * re-queue không tính công (429 — quota của cả project):
-   * - 429 (`retryable = false`): giữ nguyên `retryDelay` server dặn, không cap.
-   * - 503 (`retryable = true`): không có `retryDelay`, dùng backoff mũ có cap.
+   * Single generateContent call, returns parsed JSON. Intentionally NO retry here
+   * — gateway tracks quota (15 RPM free tier). Internal retry caused 26 RPM vs
+   * 15 limit (Issue 5.12). Both 429 and 503 throw `ProviderUnavailableError` with
+   * `retryable` flag for gateway to handle.
    */
   private async callGemini<T>(prompt: string, schema: object): Promise<T> {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
@@ -128,10 +94,7 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
       const text = await res.text();
       const status = res.status;
 
-      // 429: quota của cả project trong một phút — KHÔNG thử lại ở bất kỳ đâu.
-      // Ném lên để gateway tạm dừng MỌI request, và giữ nguyên thời gian server
-      // dặn (cap nó xuống dưới một phút là tự bảo đảm lần thử sau rơi đúng vào
-      // cửa sổ vừa cạn).
+      // 429: project-wide quota, pause all requests. Keep server's retry delay uncapped.
       if (status === QUOTA_STATUS) {
         const retryAfterMs = serverRetryDelayMs(text);
         this.logger.warn(
@@ -144,8 +107,7 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
         );
       }
 
-      // 503: model quá tải — tạm thời và thuộc về chính batch này. Gateway sẽ
-      // thử lại, nhưng TÍNH CÔNG để một đợt quá tải dài không giữ câu vô hạn.
+      // 503: temporary overload, gateway will retry but count attempts to avoid infinite holds.
       if (RETRYABLE_STATUS.has(status)) {
         this.logger.warn(`HTTP ${status} (overloaded), deferring retry`);
         throw new ProviderUnavailableError(
@@ -170,16 +132,15 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
     return JSON.parse(text) as T;
   }
 
-  // ---- TODO (Parker): implement below, using the helpers above ----
-
   async translate(
     sentence: string,
     to: string,
     from: string,
   ): Promise<Translation> {
-        const prompt = `Translate the following ${from} sentence to ${to} and return only the translation, nothing else.
-    Sentence: ${sentence}`;
-        const result = await this.callGemini<GeminiTranslateResult>(prompt, {
+    const prompt = `Translate the following ${from} sentence to ${to} and return only the translation, nothing else.
+Sentence: ${sentence}`;
+
+    const result = await this.callGemini<GeminiTranslateResult>(prompt, {
       type: 'object',
       properties: {
         translation: { type: 'string' },
@@ -187,16 +148,12 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
       required: ['translation'],
     });
 
-        return { text: result.translation, from, to };
+    return { text: result.translation, from, to };
   }
 
   /**
-   * Dịch nhiều câu trong 1 request (design §4.3 "batched on finalize").
-   *
-   * Mảng trả về SONG SONG với mảng vào: `result[i].text` là bản dịch của
-   * `sentences[i]`. Nếu Gemini trả thiếu/ thừa phần tử thì ném lỗi — im lặng
-   * ghép lệch index sẽ gán bản dịch của câu này cho câu khác, tệ hơn là không
-   * dịch gì.
+   * Batch translate in one request (design §4.3). Returns array parallel to input.
+   * Throws if response count mismatches — silent index mismatch is worse than no translation.
    */
   async translateBatch(
     sentences: string[],
@@ -209,7 +166,7 @@ export class GeminiProvider implements TranslationProvider, ExplainProvider {
       return [one];
     }
 
-    // Đánh số từng câu để model không trộn thứ tự và để kiểm tra khớp index.
+    // Number sentences to preserve order and verify index alignment.
     const numbered = sentences
       .map((sentence, index) => `${index + 1}. ${sentence}`)
       .join('\n');

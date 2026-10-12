@@ -26,7 +26,7 @@ export class ExplainController {
   @Post()
   async explainWord(@Body() body: ExplainWordDto): Promise<WordExplanation> {
     const key = { ...body, provider: this.explainService.providerName };
-    // Cache hit và request trùng đang chạy không tiêu quota chung với caption.
+    // Cache hit and in-flight dedup don't consume shared quota
     const cached = this.explainCache.lookup(key);
     if (cached) return cached;
     const inflight = this.explainCache.inflight(key);
@@ -64,7 +64,7 @@ export class ExplainController {
   private mapProviderError(error: unknown): unknown {
     if (error instanceof ProviderUnavailableError) {
       if (!error.retryable) {
-        // Quota provider ảnh hưởng cả translate; lỗi retryable chỉ ảnh hưởng request này.
+        // Quota error affects translate too; retryable error is request-specific only
         this.rateLimiter.pauseUntil(Date.now() + error.retryAfterMs);
         return new HttpException(
           {

@@ -20,14 +20,8 @@ export type Word = {
   captionStart: number;
   c: number;
   /**
-   * Danh tính video tạo ra từ này (Issue 5.20).
-   *
-   * `videoStart` là mốc thời gian RIÊNG của từng video — video B tua tới 0:30
-   * trùng khớp với video A đã xem tới 0:30. Không có field này thì cache của hai
-   * video lẫn vào nhau và replay trả về lời của video khác.
-   *
-   * `null` = không rõ nguồn (sidecar cũ, hoặc metadata thiếu field). Giữ
-   * namespace riêng thay vì coi như không nguồn — xem `sourceKey`.
+   * Video that produced this word. `videoStart` is per-video, so two videos at 0:30
+   * would collide without it (Issue 5.20). `null` = unknown source, its own namespace.
    */
   sourceId?: string | null;
   windowedGroupId?: string;
@@ -40,7 +34,7 @@ export type Word = {
 type Bucket = {
   words: Word[];
   lastAccess: number;
-  /** Giây video đầu tiên của bucket — khoá đã ghép chuỗi nên phải giữ riêng. */
+  /** First video second of bucket — kept separately because key is stringified. */
   anchorTime: number;
   ranges: VideoRange[];
 };
@@ -48,18 +42,12 @@ type Bucket = {
 export type WindowedResult = WindowedPatch<Word> & { mode: 'windowed' };
 
 function normalizeSource(sourceId: string | null | undefined): string | null {
-  // `undefined` và `null` là CÙNG một namespace (không rõ nguồn). Không gộp thì
-  // Word có `sourceId: undefined` (test cũ, sidecar cũ) không bao giờ khớp với
-  // truy vấn `null` — mà gateway luôn truyền `null` khi chưa biết nguồn.
+  // `undefined` and `null` are the SAME namespace (unknown source). Without this,
+  // words with `undefined` (old sidecar/tests) never match queries with `null`.
   return sourceId ?? null;
 }
 
-/**
- * Khoá cache = (nguồn, giây). `videoStart` là mốc RIÊNG của từng video nên không
- * dùng làm khoá đơn thuần: hai video cùng tua tới 0:30 sẽ đè lên nhau và replay
- * trả lời của video trước. Nguồn rỗng gói thành chuỗi riêng, không gộp — xem
- * `Word.sourceId`.
- */
+/** Cache key = (source, second) — a bare second collides across videos at 0:30 (Issue 5.20). */
 function bucketKey(
   sourceId: string | null | undefined,
   videoStart: number,
@@ -68,10 +56,8 @@ function bucketKey(
 }
 
 /**
- * Bản dịch của một caption group.
- *
- * Nhóm canonical dùng windowedGroupId/captionId; captionStart chỉ là khoá
- * dự phòng cho dữ liệu legacy. Bản dịch chỉ hợp lệ với toàn bộ text của nhóm.
+ * Translation for one caption group. Lookup prefers windowedGroupId/captionId, with
+ * captionStart as the legacy fallback; the translation only fits the full group text.
  */
 export type SentenceTranslation = {
   windowedGroupId?: string;
@@ -79,11 +65,7 @@ export type SentenceTranslation = {
   captionStart: number;
   text: string;
   vi: string;
-  /**
-   * Danh tính video — cùng lý do như `Word.sourceId`: `captionStart` là mốc
-   * riêng của từng video, dùng làm khoá đơn thuần thì bản dịch của video A
-   * bị trả cho video B (Issue 5.20).
-   */
+  /** Video identity — without it, a bare `captionStart` returns video A's translation for video B (Issue 5.20). */
   sourceId?: string | null;
 };
 
@@ -241,9 +223,9 @@ export class TranscriptService {
     return true;
   }
 
-  // Tách map riêng khỏi `cache`: words đến liên tục, bản dịch đến muộn (sau call AI).
+  // Separate map from `cache`: words arrive continuously, translations arrive later (after AI call).
   private readonly translations = new Map<string, TranslationBucket>();
-  // Lịch sử hypothesis không phải state đang hiển thị; replay chỉ đọc `translations`.
+  // Hypothesis history is not display state; replay reads only `translations`.
   private readonly windowedTranslationHistory = new Map<string, WindowedTranslationHistory>();
   private windowedBuckets(sourceId: string | null | undefined): Bucket[] {
     for (const [key, bucket] of this.cache) {
@@ -270,8 +252,8 @@ export class TranscriptService {
       return ordered.map(w => ({ ...w, windowedGroupId: id }));
     });
     const incomingIds = new Set(incoming.map(w => w.windowedGroupId));
-    // Từ cũ chỉ bị thay khi nó bắt đầu bên trong dải batch (`isReplaced`); từ bắt đầu
-    // trước mép trái là phần chồng của cửa sổ trước, batch mới chỉ nghe được đuôi.
+    // Old words replaced only if they start inside batch range (`isReplaced`);
+    // words starting before left edge are overlap from prior window.
     const kept = old.filter(w => !incomingIds.has(w.windowedGroupId!) && !isReplaced(w, range, incoming));
     const admitted = dropClippedHeads(kept, incoming, [range]);
     const reference = old.filter(w => !incomingIds.has(w.windowedGroupId!)).concat(admitted);
@@ -316,8 +298,8 @@ export class TranscriptService {
         historyByNew.set(id, matches);
       }
     }
-    // Kể cả occurrence chưa dịch cũng chặn ambiguity. Chỉ nối lineage một-một;
-    // giữ range gốc để jitter không kéo bản dịch dần sang occurrence bên cạnh.
+    // Even untranslated occurrences block ambiguity. Only 1:1 lineage;
+    // keep original range so jitter doesn't drift translation to adjacent occurrence.
     for (const { entry, newIds } of candidates) {
       if (entry.currentId && groups.has(entry.currentId)) continue;
       if (newIds.length !== 1) continue;
@@ -372,12 +354,7 @@ export class TranscriptService {
     return members.length > 0 && members.map(w => w.w).join(' ') === text;
   }
 
-  /**
-   * Từ trong `[fromSec, toSec]` của ĐÚNG nguồn này.
-   *
-   * `sourceId` bắt buộc: không lọc theo nguồn thì hai video cùng nằm trong một
-   * khoảng giây sẽ trả lẫn lời của nhau.
-   */
+  /** Words in `[fromSec, toSec]` for this source only — unfiltered, two videos in the same range would mix. */
   getRange(
     sourceId: string | null | undefined,
     fromSec: number,
@@ -414,17 +391,11 @@ export class TranscriptService {
   }
 
   /**
-   * Từ đã xem từ `fromSec` trở đi — dùng cho replay sau khi tua.
-   *
-   * Cố ý không chặn trên: trần TTL/LRU đã giới hạn tổng số bucket, còn giới hạn
-   * cửa sổ thì sau mốc đó hệ thống không biết đã xem tới đâu và rơi về nhịp
-   * transcribe thường (~2s), tức replay được một đoạn rồi đoạn sau phải chờ.
-   *
-   * Điều kiện lọc phải là CHỒNG LẤN (`bucketEnd >= fromSec`), không phải
-   * "bắt đầu sau mốc". Bucket khoá theo giây của từ ĐẦU và trải ~một window
-   * sidecar, nên nó có thể bắt đầu trước mốc tua rồi vươn qua sau: lọc theo
-   * `anchorTime` là mất sạch các từ trong khoảng `fromSec → bucketEnd`. Phép
-   * lọc cuối ở từng từ đã xử lý đúng phần đó (Issue 5.35).
+   * Everything watched from `fromSec` onward, for replay after a seek. No upper bound —
+   * TTL/LRU already caps memory, and a window cap would re-expose the ~2s transcribe
+   * latency for data sitting in cache. Must select by OVERLAP (`bucketEnd >= fromSec`),
+   * not "starts after": buckets are keyed by their first word and can straddle the seek
+   * point (Issue 5.35).
    */
   getRangeFrom(sourceId: string | null | undefined, fromSec: number): Word[] {
     const now = Date.now();
@@ -439,7 +410,7 @@ export class TranscriptService {
     const result: Word[] = [];
     for (const bucket of this.cache.values()) {
       if (normalizeSource(bucket.words[0]?.sourceId) !== source) continue;
-      // Bucket kết thúc trước mốc tua thì không liên quan.
+      // Bucket ending before seek point is irrelevant
       const lastWord = bucket.words[bucket.words.length - 1];
       const bucketEnd = lastWord?.videoEnd ?? bucket.anchorTime;
       if (bucketEnd < fromSec) continue;
@@ -474,7 +445,7 @@ export class TranscriptService {
     }
   }
 
-  /** Bản dịch đã cache cho nhóm này của đúng nguồn, nếu có. */
+  /** Cached translation for this group from the correct source, if any. */
   getTranslation(
     sourceId: string | null | undefined,
     captionStart: number | string,
@@ -506,7 +477,7 @@ export class TranscriptService {
     this.evictTranslations();
   }
 
-  /** Bản dịch của các nhóm trong `[fromSec, toSec]`, sort theo mốc video. */
+  /** Translations for groups in `[fromSec, toSec]`, sorted by video timestamp. */
   getTranslations(
     sourceId: string | null | undefined,
     fromSec: number,
@@ -532,7 +503,7 @@ export class TranscriptService {
     return result.sort((a, b) => a.captionStart - b.captionStart);
   }
 
-  /** Bản dịch của mọi nhóm đã xem từ `fromSec` trở đi — đi kèm `getRangeFrom`. */
+  /** Translations for all groups watched from `fromSec` onward — companion to `getRangeFrom`. */
   getTranslationsFrom(
     sourceId: string | null | undefined,
     fromSec: number,

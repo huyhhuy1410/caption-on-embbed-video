@@ -64,7 +64,7 @@ export class TranscriptState {
     if (new Set(update.words.map(word => word.wordId)).size !== update.words.length ||
         new Set(update.captions.map(caption => caption.captionId)).size !== update.captions.length) return false;
 
-    // Validate cả candidate trước commit; một membership lỗi không được xoá nửa suffix.
+    // Validate the whole candidate before commit; one bad membership must not wipe half the suffix.
     const words = new Map(this.words);
     const captions = new Map(this.captions);
     for (const id of update.removedWordIds) words.delete(id);

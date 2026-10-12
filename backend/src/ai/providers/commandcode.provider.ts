@@ -11,85 +11,53 @@ export interface CommandCodeConfig {
   baseUrl?: string;
 }
 
-/** Base URL gốc — tài liệu: https://commandcode.ai/docs/provider */
+/** Base URL — docs: https://commandcode.ai/docs/provider */
 const DEFAULT_BASE_URL = 'https://api.commandcode.ai/provider/v1';
 
 /**
- * Model MẶC ĐỊNH — cố ý chọn dòng rẻ, KHÔNG phải dòng đắt.
- *
- * Đổi dòng model là đổi chi phí, nên default phải là dòng "flash" (nhanh +
- * rẻ) chứ không phải dòng "pro"/"max". Parker yêu cầu rõ: dùng model tối ưu
- * chi phí, không dùng model đắt. Việc dịch caption EN→VI là việc ngắn, lặp lại
- * liên tục, ~15–25 nhóm caption/phút — đây đúng là loại việc dòng flash làm
- * được, không cần dòng đắt.
- *
- * Ghi đè bằng env `AI_MODEL` (xem `ai.module.ts`) nếu muốn đổi.
+ * Cheap flash tier, not pro/max: caption translation is high-frequency (~15-25
+ * groups/min) short-text work. Override via `AI_MODEL`.
  */
 const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash';
 
 /**
- * 503 = model quá tải, TẠM THỜI. Thử lại đặt ở TẦNG GATEWAY, không ở đây.
- * Xem `callChat` — provider này KHÔNG tự retry, vì gateway đang đếm quota.
+ * 503 = temporary overload. Retry at GATEWAY layer, not here — gateway tracks quota.
  */
 const RETRYABLE_STATUS = new Set([503]);
 
-/**
- * 429 = hết quota. Tài liệu nói upstream trả 429 với `rate_limit_error`.
- *
- * KHÔNG retry ở bất kỳ đâu — xem `ProviderUnavailableError`. Hết quota là
- * trạng thái của CẢ PROJECT trong cửa sổ một phút, thử lại trong cùng phút chỉ
- * chỉ đốt thêm quota mà chắc chắn vẫn 429.
- */
+/** 429 = quota exhausted. Never retry — project-wide state for one minute window. */
 const QUOTA_STATUS = 429;
 
 const MAX_RETRY_DELAY_MS = 8_000;
 
 /**
- * Chờ tối thiểu khi provider báo 429 mà KHÔNG kèm gợi ý thời gian.
- *
- * Không có con số này thì 429 rơi về `retryAfterMs = 0` ⇒
- * `pauseUntil(now + 0)` là no-op ⇒ hàng đợi thử lại ngay lập tức ⇒ đốt quota
- * liên tục. Quota của hệ
- * thống này tính theo CỬA SỔ MỘT PHÚT (`TRANSLATE_WINDOW_MS`), nên phải chờ
- * hết cửa sổ là lựa chọn thận trọng đúng bản chất quota.
+ * Minimum wait when 429 has no retry hint. Without this, `retryAfterMs = 0` makes
+ * `pauseUntil()` a no-op → immediate retry burns the exhausted window.
  */
 const QUOTA_FALLBACK_DELAY_MS = 60_000;
 
 /**
- * Backoff gợi ý cho 503 — lỗi của chính batch này, không phải quota.
- *
- * CHỈ LÀ GỢI Ý đặt vào `ProviderUnavailableError.retryAfterMs` cho tầng
- * gateway. Việc thử lại thật do gateway làm, vì chỉ nó đếm được số request
- * trong cửa sổ quota.
- *
- * Cố ý KHÔNG import từ `gemini.provider` dù logic giống hệt: mỗi provider
- * một file độc lập, đổi transport của Gemini không được kéo theo file này.
+ * Suggested backoff for 503 (batch-specific, not quota) — a hint for
+ * `ProviderUnavailableError.retryAfterMs` only; actual retry happens at gateway.
+ * Duplicated in gemini.provider so the two providers stay independent.
  */
 export function retryDelayMs(attempt: number): number {
   return Math.min(1000 * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
 }
 
 /**
- * Thời gian server dặn chờ sau 429, đọc từ body rồi tới header.
- *
- * KHÔNG cap giá trị này (khác hẳn backoff của 503). Quota là per MINUTE, nên
- * cắt nó xuống dưới một phút là tự bảo đảm lần thử kế tiếp rơi đúng vào cửa sổ
- * vừa cạn, rồi 429 lại, và cứ thế.
- *
- * Thứ tự nguồn: body (`retryDelay`/`retry_after`) → header `Retry-After` →
- * `QUOTA_FALLBACK_DELAY_MS`. Tài liệu của CommandCode không nêu tên field
- * `retryDelay` (đó là tên Gemini trả về), nên phải đọc cả hai và có đường lùi
- * an toàn — xem `QUOTA_FALLBACK_DELAY_MS`.
+ * Server-specified wait after 429, from body then header. Never cap this (unlike
+ * 503 backoff) — quota is per MINUTE, so capping below 60s guarantees next retry
+ * hits the same exhausted window.
  */
 export function serverRetryDelayMs(body: string, headers?: Headers): number {
-  // Body: {"retryDelay":"31s"} (kiểu Gemini) hoặc {"retry_after": 31}
+  // Body: {"retryDelay":"31s"} (Gemini-style) or {"retry_after": 31}
   const delayField =
     /"(?:retryDelay|retry_after|retryDelayMs)"\s*:\s*"?(\d+(?:\.\d+)?)"?/.exec(
       body,
     );
   if (delayField) return Number(delayField[1]) * 1000;
 
-  // Header chuẩn HTTP: số giây, hoặc ngày HTTP tuyệt đối.
   const header = headers?.get('retry-after');
   if (header) {
     const seconds = Number(header);
@@ -99,21 +67,20 @@ export function serverRetryDelayMs(body: string, headers?: Headers): number {
     if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
   }
 
-  // Không có gợi ý nào ⇒ chờ hết cửa sổ quota một phút.
   return QUOTA_FALLBACK_DELAY_MS;
 }
 
-/** Envelope phẳng cho 1 câu. */
+/** Single sentence translation envelope. */
 interface TranslateResult {
   translation: string;
 }
 
-/** Envelope cho batch: mỗi phần tử tự mang số thứ tự câu của nó. */
+/** Batch envelope — each item carries its own sentence index. */
 interface TranslateBatchResult {
   translations: Array<{ index: number; translation: string }>;
 }
 
-/** Envelope cho explain. */
+/** Word explanation envelope. */
 interface ExplainResult {
   meaning: string;
   translation: string;
@@ -122,25 +89,15 @@ interface ExplainResult {
 }
 
 /**
- * Bóc JSON ra khỏi câu trả lời của model.
- *
- * Chat Completions KHÔNG có `responseSchema` như Gemini, nên không thể ép
- * model trả JSON đúng kiểu cấu trúc. Chỉ còn cách dặn trong prompt rồi tự bóc.
- * Model hay bọc JSON trong ```json ... ``` hoặc kèm một câu giải thích trước/
- * sau, nên phải cắt phần rác trước khi `JSON.parse`.
- *
- * KHÔNG gửi `response_format: {type:'json_object'}`: tài liệu CommandCode
- * không liệt kê field đó cho `/chat/completions`, gửi field lạ dễ nhận 400 —
- * hậu quả là mất bản dịch, tệ hơn nhiều so với phải tự bóc JSON.
+ * Extract JSON from a model response. Chat Completions has no `responseSchema`,
+ * so we prompt for JSON and strip fences / surrounding prose before `JSON.parse`.
  */
 export function extractJson(raw: string): string {
   let text = raw.trim();
 
-  // Bỏ fence ```json ... ``` nếu có.
   const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text);
   if (fence) text = fence[1].trim();
 
-  // Cắt tới `{` đầu và `}` cuối cùng để loa phần rác model thêm vào.
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start === -1 || end === -1 || end < start) {
@@ -150,15 +107,9 @@ export function extractJson(raw: string): string {
 }
 
 /**
- * Provider đi qua CommandCode — OpenAI Chat Completions.
- *
- * Tài liệu: https://commandcode.ai/docs/provider
- * - Base URL: `https://api.commandcode.ai/provider/v1`
- * - Endpoint: `POST /chat/completions`
- * - Auth: `Authorization: Bearer <CMD_API_KEY>`
- *
- * Key nằm ở backend `.env`, TUYỆT ĐỐI không đóng gói vào extension (xem
- * CLAUDE.md). Provider này chỉ được dựng phía server.
+ * CommandCode provider — OpenAI Chat Completions API.
+ * Docs: https://commandcode.ai/docs/provider
+ * Key stays in backend `.env`, never bundled into extension (see CLAUDE.md).
  */
 @Injectable()
 export class CommandCodeProvider
@@ -180,17 +131,8 @@ export class CommandCodeProvider
   }
 
   /**
-   * POST MỘT chat completion và trả JSON đã parse.
-   *
-   * Hàm này KHÔNG tự thử lại, và đó là chủ ý — đừng thêm retry vào đây.
-   *
-   * Lý do: throttle của gateway đếm số request để giữ trần. Retry nội bộ ở đây
-   * khiến MỘT lượt drain bắn nhiều HTTP call mà bộ đếm không thấy gì cả — đã
-   * đo được 26 request/phút so với trần 15 (Issue 5.12).
-   *
-   * Nên cả 429 lẫu 503 đều ném `ProviderUnavailableError` lên gateway, kèm cờ
-   * `retryable` để gateway biết phải tính công (503 — lỗi của chính batch) hay
-   * re-queue không tính công (429 — quota của cả project).
+   * One chat completion call, parsed JSON out. No retry here — the gateway owns
+   * quota; internal retry caused 26 RPM against a 15 limit (Issue 5.12).
    */
   private async callChat<T>(prompt: string): Promise<T> {
     const url = `${this.baseUrl}/chat/completions`;
@@ -199,15 +141,13 @@ export class CommandCodeProvider
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // Key nằm trong HEADER, không nằm trong URL như Gemini ⇒ log lỗi không
-        // bao giờ rò rỉ key ra (Gemini phải `throw` thay vì log body).
+        // Key in header (unlike Gemini's URL param) so error logs can't leak it.
         Authorization: `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({
         model: this.model,
         messages: [{ role: 'user', content: prompt }],
         stream: false,
-        // Nhiệt độ 0: dịch thuật cần TÍNH LẶP LẠI, không cần sáng tạo.
         temperature: 0,
       }),
     });
@@ -216,8 +156,7 @@ export class CommandCodeProvider
       const text = await res.text();
       const status = res.status;
 
-      // 429: quota của cả project trong một phút — KHÔNG thử lại ở bất kỳ đâu.
-      // Ném lên để gateway tạm dừng MỌI request, giữ nguyên thời gian server dặn.
+      // Quota: project-wide, keep the server's delay uncapped.
       if (status === QUOTA_STATUS) {
         const retryAfterMs = serverRetryDelayMs(text, res.headers);
         this.logger.warn(
@@ -230,8 +169,7 @@ export class CommandCodeProvider
         );
       }
 
-      // 503: model quá tải — tạm thời và thuộc về chính batch này. Gateway sẽ thử
-      // lại, nhưng TÍNH CÔNG để một đợt quá tải dài không giữ câu vô hạn.
+      // Overload: gateway retries, but counts attempts to bound the hold.
       if (RETRYABLE_STATUS.has(status)) {
         this.logger.warn(`HTTP ${status} (overloaded), deferring retry`);
         throw new ProviderUnavailableError(
@@ -241,9 +179,7 @@ export class CommandCodeProvider
         );
       }
 
-      // Còn lại (401 sai key, 403 upgrade_required, 400, 500) — lỗi của CHÍNH
-      // batch. Gateway tính công rồi bỏ sau MAX lần. Key nằm trong header nên
-      // log body ở đây không lộ bí mật.
+      // 401/403/400/500: batch-specific. Key is in the header, so the body is safe to log.
       this.logger.error(`HTTP ${status}: ${text}`);
       throw new Error(`Request failed (HTTP ${status})`);
     }
@@ -272,11 +208,8 @@ Return JSON only, in exactly this shape: {"translation": "..."}`;
   }
 
   /**
-   * Dịch nhiều câu trong 1 request (design §4.3 "batched on finalize").
-   *
-   * Mảng trả về SONG SANG với mảng vào: `result[i].text` là bản dịch của
-   * `sentences[i]`. Nếu model trả thiếu/thừa phần tử thì ném lỗi — im lặng ghép
-   * lệch index sẽ gán bản dịch của câu này cho câu khác, tệ hơn là không dịch gì.
+   * Batch translate in one request (design §4.3). Returns array parallel to input.
+   * Throws if response count mismatches — silent index mismatch is worse than no translation.
    */
   async translateBatch(
     sentences: string[],
@@ -289,7 +222,7 @@ Return JSON only, in exactly this shape: {"translation": "..."}`;
       return [one];
     }
 
-    // Đánh số từng câu để model không trộn thứ tự và để kiểm tra khớp index.
+    // Number sentences to preserve order and verify index alignment.
     const numbered = sentences
       .map((sentence, index) => `${index + 1}. ${sentence}`)
       .join('\n');
@@ -338,8 +271,7 @@ Return JSON only, in exactly this shape:
 
     const result = await this.callChat<ExplainResult>(prompt);
 
-    // Model hay trả chuỗi "null" hoặc rỗng thay vì JSON null — gộp về null để
-    // side panel không hiện từ khoá rỗng.
+    // Normalize "null" string or empty to actual null
     const pronunciation =
       result.pronunciation?.trim() &&
       result.pronunciation.toLowerCase() !== 'null'

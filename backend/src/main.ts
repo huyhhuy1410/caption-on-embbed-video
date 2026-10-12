@@ -5,8 +5,7 @@ import { WsAdapter } from '@nestjs/platform-ws';
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule);
-  // Không có hook này thì Ctrl+C bỏ qua `onModuleDestroy` và SidecarService
-  // để lại timer reconnect mồ côi.
+  // Without this, Ctrl+C skips `onModuleDestroy` and SidecarService leaks reconnect timers.
   app.enableShutdownHooks();
 
   app.enableCors();

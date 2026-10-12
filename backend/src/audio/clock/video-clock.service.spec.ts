@@ -15,31 +15,30 @@ describe('VideoClockService', () => {
     expect(service).toBeDefined();
   });
 
-  it('chunk đầu tiên: lùi đúng CHUNK_SECONDS vì chưa có mẫu trước', () => {
+  it('first chunk: steps back CHUNK_SECONDS because there is no prior sample', () => {
     expect(service.resolveAnchor(10.0)).toBeCloseTo(9.0, 5);
   });
 
-  it('chuỗi liên tục: anchor của chunk N = mẫu của chunk N-1', () => {
+  it('continuous stream: chunk N anchors to chunk N-1 sample', () => {
     expect(service.resolveAnchor(10.0)).toBeCloseTo(9.0, 5);
     expect(service.resolveAnchor(11.0)).toBeCloseTo(10.0, 5);
     expect(service.resolveAnchor(12.0)).toBeCloseTo(11.0, 5);
   });
 
-  it('video pause: video clock đứng yên thì anchor cũng đứng yên', () => {
-    // Ca này phân biệt pair-shift với phép trừ 1.0. Nếu lỡ viết
-    // `currentVideoTime - CHUNK_SECONDS` thì test này fail.
+  it('paused video: video clock holds still, so the anchor holds still', () => {
+    // Distinguishes pair-shift from a naive `currentVideoTime - CHUNK_SECONDS`,
+    // which fails this case.
     expect(service.resolveAnchor(10.0)).toBeCloseTo(9.0, 5);
     expect(service.resolveAnchor(10.0)).toBeCloseTo(10.0, 5);
     expect(service.resolveAnchor(10.0)).toBeCloseTo(10.0, 5);
   });
 
-  it('reset(): quay lại hành vi chunk đầu tiên', () => {
+  it('reset(): falls back to first-chunk behavior', () => {
     service.resolveAnchor(10.0);
     service.resolveAnchor(11.0);
     service.reset();
-    // Sau reset, không còn mẫu trước ⇒ phải suy ra từ current.
+    // After reset there is no previous sample, so the anchor derives from current.
     expect(service.resolveAnchor(20.0)).toBeCloseTo(19.0, 5);
-    // Và mẫu mới đã được ghi lại.
     expect(service.resolveAnchor(21.0)).toBeCloseTo(20.0, 5);
   });
 });

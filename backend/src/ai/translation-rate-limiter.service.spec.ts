@@ -17,15 +17,15 @@ describe('TranslationRateLimiter', () => {
   it('blocks once the window is full and reopens when the oldest expires', () => {
     for (let i = 0; i < 15; i++) limiter.recordCall(i);
 
-    // Đầy đúng 15 ⇒ phải chờ tới khi request cũ nhất (t=0) rơi ra ngoài.
+    // Exactly full at 15 ⇒ wait until the oldest request (t=0) falls out.
     expect(limiter.msUntilRoom(1_000)).toBe(59_000);
     expect(limiter.msUntilRoom(59_999)).toBe(1);
     expect(limiter.msUntilRoom(60_001)).toBe(0);
   });
 
   it('keeps the invariant under a burst then a long gap', () => {
-    // Bắn 15 request trong 1 giây, rồi im 2 phút — cửa sổ trượt phải tự mở lại,
-    // đây là điều mà throttle-theo-khoảng-cách không làm được.
+    // 15 requests in 1 second, then 2 minutes of silence — the sliding window must
+    // reopen on its own, which interval-based throttling cannot do.
     for (let i = 0; i < 15; i++) limiter.recordCall(i);
 
     expect(limiter.msUntilRoom(500)).toBeGreaterThan(0);
@@ -34,9 +34,9 @@ describe('TranslationRateLimiter', () => {
   });
 
   it('blocks on cooldown even when the sliding window has room', () => {
-    // Hồi quy cho Issue 5.16: cửa sổ còn trống (0 request) KHÔNG được phép
-    // bỏ qua cooldown — nếu không thì `pauseUntil` là dòng code chết và đường
-    // khác tiếp tục bắn provider trong khi nó đã báo hết quota.
+    // Regression for Issue 5.16: an empty window (0 requests) must NOT bypass the
+    // cooldown — otherwise `pauseUntil` is dead code and other paths keep hitting
+    // the provider after it reported quota exhaustion.
     limiter.pauseUntil(10_000);
 
     expect(limiter.msUntilRoom(0)).toBe(10_000);
@@ -55,7 +55,7 @@ describe('TranslationRateLimiter', () => {
     for (let i = 0; i < 15; i++) limiter.recordCall(i);
     limiter.pauseUntil(80_000);
 
-    // Cửa sổ mở lại ở 60s nhưng provider còn bảo chờ tới 80s ⇒ phải chờ 80s.
+    // The window reopens at 60s but the provider asked to wait until 80s ⇒ wait 80s.
     expect(limiter.msUntilRoom(1_000)).toBe(79_000);
   });
 });

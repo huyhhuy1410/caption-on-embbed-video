@@ -10,7 +10,7 @@ export class LanguageEvidence {
     probability: number,
     voiced: boolean,
   ): string | null {
-    // Silence không xác nhận hay phủ định ngôn ngữ; chỉ voiced windows mới là bằng chứng.
+    // Silence neither confirms nor denies language; only voiced windows are evidence.
     if (!voiced) return null;
     if (
       !/^[a-z]{2,3}$/.test(language) ||

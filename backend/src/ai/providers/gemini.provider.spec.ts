@@ -2,7 +2,6 @@ import { GeminiProvider, retryDelayMs, serverRetryDelayMs } from './gemini.provi
 import { ProviderUnavailableError } from '../errors';
 
 describe('GeminiProvider', () => {
-  // Provider config
   let provider: GeminiProvider;
   beforeEach(() => {
     provider = new GeminiProvider({
@@ -11,8 +10,8 @@ describe('GeminiProvider', () => {
     });
   });
   afterEach(() => {
-    jest.restoreAllMocks();
     // Prevent mock fetch from leaking across tests
+    jest.restoreAllMocks();
   });
   it('constructor throws when apiKey missing', () => {
     expect(() => new GeminiProvider({ apiKey: '' })).toThrow(
@@ -21,7 +20,6 @@ describe('GeminiProvider', () => {
   });
 
   it('translate calls generateContent and returns mapped Translation', async () => {
-    // mock global fetch resolved value
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -34,9 +32,9 @@ describe('GeminiProvider', () => {
         ],
       }),
     });
-    // call provider.translate()
+
     const result = await provider.translate('Hello', 'vi', 'en');
-    // assert
+
     expect(result).toEqual({
       text: 'Xin chào',
       from: 'en',
@@ -44,7 +42,6 @@ describe('GeminiProvider', () => {
     });
   });
   it('explainWord maps fields and defaults pronunciation to null', async () => {
-    // mock fetch result
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -61,13 +58,13 @@ describe('GeminiProvider', () => {
         ],
       }),
     });
-    // call provider.explainWord
+
     const result = await provider.explainWord(
       'Hello',
       'Hello, how are you?',
       'vi',
     );
-    // assert
+
     expect(result).toEqual({
       word: 'Hello',
       meaning: 'Hello',
@@ -95,20 +92,19 @@ describe('GeminiProvider', () => {
       status: 500,
       text: async () => 'boom',
     });
-    // call translate
+
     await expect(provider.translate('Hello', 'vi', 'en')).rejects.toThrow(
       'Request failed (HTTP 500)',
     );
-    // call explainWord
     await expect(
       provider.explainWord('Hello', 'Hello, how are you?', 'vi'),
     ).rejects.toThrow('Request failed (HTTP 500)');
   });
 
   it('does NOT retry a 503 internally — defers the retry to the gateway', async () => {
-    // Đây là điều kiện để throttle của gateway đo ĐÚNG số request. Retry nội
-    // bộ ở đây sẽ khiến một lượt drain bắn nhiều HTTP call mà throttle không
-    // thấy (probe từng đo 26 request/phút so với trần 15).
+    // This is what lets the gateway throttle count requests correctly: an
+    // in-provider retry makes one drain fire HTTP calls the throttle never sees
+    // (a probe once measured 26 requests/min against a ceiling of 15).
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 503,
@@ -118,7 +114,7 @@ describe('GeminiProvider', () => {
     await expect(provider.translate('Hello', 'vi', 'en')).rejects.toBeInstanceOf(
       ProviderUnavailableError,
     );
-    // Đúng MỘT lần gọi: không thử lại bên trong.
+    // Exactly ONE call: no internal retry.
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -217,8 +213,8 @@ describe('GeminiProvider', () => {
     });
 
     it('falls back to a full quota window when the server gave no delay', () => {
-      // 0 ở đây là `pauseUntil(now + 0)` = no-op ⇒ hàng đợi bắn lại ngay và
-      // đốt trọn một cửa sổ quota bằng các request chắc chắn 429 (Issue 5.36).
+      // 0 here means `pauseUntil(now + 0)` = no-op ⇒ the queue retries at once and
+      // burns a whole quota window on requests guaranteed to 429 (Issue 5.36).
       expect(serverRetryDelayMs('{}')).toBe(60_000);
     });
   });

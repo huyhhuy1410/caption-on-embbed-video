@@ -21,13 +21,13 @@ type FullscreenSession = {
 function moveNode(parent: Node, node: Node, before: Node | null): void {
   const sibling = before !== node && before?.parentNode === parent ? before : null;
   const movable = parent as MovableNode;
-  // moveBefore giữ state media; insertBefore là fallback cho Chrome cũ/node rời cây.
+  // moveBefore preserves media state; insertBefore is fallback for older Chrome or detached nodes.
   if (parent.isConnected && node.isConnected && movable.moveBefore) {
     try {
       movable.moveBefore(node, sibling);
       return;
     } catch {
-      // Các root khác nhau hoặc browser không hỗ trợ phép move này.
+      // Different roots or browser doesn't support this move operation.
     }
   }
   parent.insertBefore(node, sibling);
@@ -56,7 +56,7 @@ export class CaptionFullscreen {
   }
 
   setTarget(video: HTMLVideoElement, overlay: CaptionOverlay): void {
-    // Target mới không được lấy quyền sở hữu video của phiên fullscreen đang chạy.
+    // New target must not steal video from a running fullscreen session.
     if (this.session && (video !== this.session.video || overlay !== this.session.overlay)) {
       this.exit();
     }
@@ -102,7 +102,7 @@ export class CaptionFullscreen {
       video.style.cssText = "display:block;width:100%;height:100%;object-fit:contain;";
       moveNode(wrapper, video, null);
       session.videoMoved = true;
-      // Top layer không vẽ overlay nằm ngoài element fullscreen.
+      // Top layer doesn't render overlay outside fullscreen element.
       moveNode(wrapper, overlay.element, null);
       wrapper.addEventListener("fullscreenchange", this.onFullscreenChange);
       document.addEventListener("fullscreenchange", this.onFullscreenChange);
@@ -118,13 +118,13 @@ export class CaptionFullscreen {
       await wrapper.requestFullscreen();
     } catch (error) {
       console.warn("Caption AI: fullscreen request failed", error);
-      // Promise cũ có thể reject sau dispose + enter; không được dọn phiên mới.
+      // Old promise may reject after dispose + enter; don't clean up new session.
       if (this.session === session) this.restore(session);
     }
   }
 
   private ownsFullscreen(session: FullscreenSession): boolean {
-    // Document retarget fullscreenElement thành host khi wrapper nằm trong shadow root.
+    // Document retargets fullscreenElement to host when wrapper is in shadow root.
     return session.root.fullscreenElement === session.wrapper;
   }
 
@@ -164,7 +164,7 @@ export class CaptionFullscreen {
     if (this.ownsFullscreen(session)) {
       void document.exitFullscreen().catch(() => {});
     }
-    // Dọn ngay cả khi browser không phát fullscreenchange cho subtree đã rời cây.
+    // Clean up even if browser doesn't fire fullscreenchange for detached subtree.
     this.restore(session);
   }
 
@@ -196,7 +196,7 @@ export class CaptionFullscreen {
     if (ownsVideo && wrapper.isConnected && parent.isConnected && wrapper.parentNode === parent) {
       moveNode(parent, video, session.before);
     }
-    // Wrapper/parent bị SPA gỡ thì bỏ cùng video, không hồi sinh vào trang mới.
+    // If SPA removed wrapper/parent, drop video with them — don't resurrect into new page.
     if (overlay.element.parentNode === wrapper) {
       overlay.element.style.cssText = session.overlayStyle;
       const destination = session.overlayParent?.isConnected ? session.overlayParent : document.body;

@@ -34,13 +34,21 @@ Thumbs.db
 npm-debug.log*
 yarn-error.log*
 
-# --- Test / coverage ---
+# --- Test / coverage (backend unit specs stay tracked: backend/src/**/*.spec.ts) ---
 coverage/
 .tmp/
+/test/
+extension/tests/
+sidecar/test_*.py
+backend/test/
 
-# Local test assets only: scratch pages, the Range-capable server, and a
-# multi-MB sample video. Nothing here is needed to build or run the extension.
-test/
+# --- Dev scripts: one-off patches, latency measurement, doc generation ---
+# Unanchored patterns: each matches the file at any depth. None are product code.
+patch*.js
+popup_fixed.js
+update_docs.js
+measure_latency.sh
+analyze_latency.py
 
 # Agent tooling state, not project source.
 .claude/

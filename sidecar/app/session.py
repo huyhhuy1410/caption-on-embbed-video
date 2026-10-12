@@ -22,11 +22,7 @@ class Job:
 
 
 def snapshot_video_time(snapshot: Snapshot) -> float:
-    """Mốc video của đầu buffer — thay cho `videoTimeAtCapture` của frame đầu tiên.
-
-    Buffer rolling không lưu metadata frame đầu, và offset ảo hưởng cửa sổ đã
-    decode (đã có trong `whisperSec`/`windowSec`) chứ không phải độ trễ hiển thị.
-    """
+    """Video time at buffer head, replacing per-frame videoTimeAtCapture."""
     if not snapshot.anchors:
         return 0.0
     return snapshot.anchors[-1].video
@@ -53,9 +49,7 @@ class CaptionSession:
         self.first = True
         self.window_audio = np.empty(0, dtype=np.float32)
         self.window_anchor: dict[str, Any] | None = None
-        # False khi `window_audio` chỉ còn là overlap của window vừa gửi. Flush
-        # lúc đó sẽ decode lại phần đã phát mà anchor đã bị xoá → mốc video âm,
-        # batch bị backend loại (Issue 5.41).
+        # False when window_audio is only overlap; flushing then produces negative video times rejected by backend (Issue 5.41).
         self.window_dirty = False
         self.last_seq: int | None = None
 
@@ -91,7 +85,7 @@ class CaptionSession:
             return
         kind = metadata.get("type")
         if kind in {"reset", "seek", "source-switch"}:
-            # Scope mới đã reset ở accept_scope; control retransmit không được hạ revision.
+            # Scope already reset in accept_scope; retransmit control must not lower revision.
             if self.scope.sessionId == "legacy":
                 self.reset(self.scope)
         elif kind == "source-language":
@@ -152,7 +146,7 @@ class CaptionSession:
             self.first = True
 
     def submit(self, job: Job) -> None:
-        # Socket luôn drain; snapshot chờ mới nhất thay snapshot cũ, không xếp hàng theo frame.
+        # Socket always drains; latest pending snapshot replaces previous, no per-frame queue.
         self.pending = job
         if self.worker is None or self.worker.done():
             self.worker = asyncio.create_task(self._consume())
@@ -161,7 +155,7 @@ class CaptionSession:
         while self.pending is not None and not self.closed:
             job = self.pending
             try:
-                # Chỉ lấy snapshot sau khi tới lượt model; connection chờ vẫn coalesce frame mới.
+                # Snapshot taken only when model's turn; waiting connections still coalesce new frames.
                 async with self.runtime.inference_gate:
                     if self.closed or self.pending is None:
                         continue
@@ -177,7 +171,7 @@ class CaptionSession:
                 if self.runtime.settings.mode == "streaming":
                     message = self.transcript.update(result, job.snapshot, job.flush)
                     await self.send(message)
-                    # Giữ 1s context trước prefix đã commit; trim không đổi sample clock.
+                    # Keep 1s context before committed prefix; trim doesn't change sample clock.
                     before = self.transcript.committed_end - SAMPLE_RATE
                     self.rolling.trim(before)
                     if job.flush and self.pending is None:
@@ -189,8 +183,7 @@ class CaptionSession:
                         "samples": len(job.snapshot.audio),
                         "videoTime": snapshot_video_time(job.snapshot),
                         "source": job.scope.sourceId,
-                        # Streaming không có cửa sổ "đầu" riêng: rolling buffer chỉ
-                        # dần đầy, nên mọi lượt đều là nhịp ổn định.
+                        # Streaming has no separate "first" window; rolling buffer fills gradually, so every turn is steady.
                         "kind": "steady",
                         "revision": self.transcript.revision,
                         "flush": job.flush,

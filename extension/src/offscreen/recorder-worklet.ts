@@ -15,7 +15,7 @@ class RecorderProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < left.length; i++) {
       mono[i] = right ? (left[i] + right[i]) / 2 : left[i];
     }
-    // Timestamp của render block giữ capture clock độc lập với độ trễ MessagePort.
+    // Render-block timestamp keeps capture clock independent of MessagePort latency.
     this.port.postMessage({ samples: mono, contextTime: currentTime }, [mono.buffer]);
     return true;
   }

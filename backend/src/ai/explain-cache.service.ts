@@ -20,7 +20,7 @@ interface CacheEntry {
 }
 
 function keyId(key: ExplainCacheKey): string {
-  // Context có thể chứa dấu phân cách; tuple JSON tránh va chạm khoá.
+  // JSON tuple avoids key collisions (context may contain separators)
   return JSON.stringify([key.provider, key.lang, key.word, key.context]);
 }
 
@@ -67,7 +67,7 @@ export class ExplainCacheService {
     const existing = this.pending.get(id);
     if (existing) return existing;
 
-    // Đăng ký promise trước khi chạy provider, kể cả khi adapter throw đồng bộ.
+    // Register promise before running provider (handles sync throws)
     const settled = Promise.resolve().then(run).then(
       value => {
         this.pending.delete(id);
@@ -99,7 +99,7 @@ export class ExplainCacheService {
 
   private store(id: string, value: WordExplanation, now: number): void {
     const bytes = Buffer.byteLength(id) + Buffer.byteLength(JSON.stringify(value));
-    // Một response lớn vẫn trả cho caller, nhưng không chiếm toàn bộ cache.
+    // Large response still returned to caller, but not cached
     if (bytes > MAX_ENTRY_BYTES) return;
     this.remove(id);
     this.entries.set(id, { value, storedAt: now, bytes });

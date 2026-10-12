@@ -4,7 +4,7 @@ import { applyPatch, groupWords } from './windowed-transcript';
 function word(w: string, start: number, captionStart = 1): Word {
   return { w, s: start, e: start + 0.2, videoStart: start, videoEnd: start + 0.2, captionStart, c: 0.9, sourceId: 'v1' };
 }
-/** Giữ đúng mốc đo được từ E2E, không làm tròn về lưới 0.2s của `word`. */
+/** Keeps the exact timings measured in E2E, not snapped to `word`'s 0.2s grid. */
 function timed(w: string, videoStart: number, videoEnd: number, c: number, captionStart: number): Word {
   return { w, s: videoStart - captionStart, e: videoEnd - captionStart, videoStart, videoEnd, captionStart, c, sourceId: 'v1' };
 }
@@ -202,9 +202,9 @@ describe('canonical windowed transcript', () => {
     expect(service.getWindowedReplay('v1', 0).words.map(w => w.w)).toEqual(['one']);
   });
 
-  // Hai window liền nhau của E2E: cửa sổ trước nghe trọn `teeth`, cửa sổ sau mở
-  // đầu ở 14.46 giữa từ và nghe ra mảnh cụt `If`. Giao khoảng xoá `teeth` rồi
-  // `If` không được sửa lại ở cửa sổ nào → mất chữ vĩnh viễn (Issue 5.52).
+  // Issue 5.52: two adjacent E2E windows — the first hears `teeth` fully, the second
+  // opens at 14.46 mid-word and hears the clipped `If`. Their ranges intersect, erasing
+  // `teeth`, and no later window re-decodes it, so the word is lost for good.
   it('keeps a word the next window cut through instead of its clipped head', () => {
     const service = new TranscriptService();
     const first = service.addWords([
@@ -228,8 +228,9 @@ describe('canonical windowed transcript', () => {
     const words = service.getWindowedReplay('v1', 0).words;
     expect(words.map(w => w.w)).toEqual(['While', 'brushing', 'your', 'teeth', 'you', 'think', 'I']);
     expect(words.some(w => w.w === 'If')).toBe(false);
-    // `teeth` sống trong nhóm cũ đã cụt nên nhóm đó bị retire: mảnh cụt không được
-    // thừa hưởng bản dịch cả câu. Điều phải giữ là nó vẫn là nhóm hợp lệ, dịch được.
+    // `teeth` lives in an old truncated group, so that group is retired: the clipped
+    // fragment must not inherit the whole-sentence translation, but must stay a valid,
+    // translatable group.
     const fragmentId = words.find(w => w.w === 'teeth')!.windowedGroupId!;
     expect(service.isCurrentWindowedGroup('v1', fragmentId, 'While brushing your teeth')).toBe(true);
     expect(service.getTranslation('v1', teethId)).toBeUndefined();
@@ -240,8 +241,8 @@ describe('canonical windowed transcript', () => {
       .map(w => w.w)).toEqual(words.map(w => w.w));
   });
 
-  // Cửa sổ trước vẫn còn `reach` nằm trọn trong vùng chồng: cửa sổ sau chỉ nghe
-  // được đuôi từ nên mở đầu bằng `for` — chữ thật, không phải mảnh cụt.
+  // The previous window still holds `reach` fully inside the overlap: the next window
+  // only hears the word's tail and opens with `for` — real speech, not a clipped fragment.
   it('keeps a cut-through word whose re-decoded head is genuine speech', () => {
     const service = new TranscriptService();
     service.addWords([
@@ -256,8 +257,8 @@ describe('canonical windowed transcript', () => {
     expect(words.filter(w => w.w === 'your')).toHaveLength(1);
   });
 
-  // Từ bắt đầu trước mép trái batch cũng bị batch đó thay khi nó thực sự nằm trong
-  // dải batch (chữa lại) — luật cũ không được phép đóng băng mọi từ cũ.
+  // A word starting before the batch's left edge is still replaced by that batch when it
+  // truly falls inside the batch range (a correction) — the old rule must not freeze every old word.
   it('still replaces a word that genuinely starts inside the batch range', () => {
     const service = new TranscriptService();
     const initial = service.addWords([word('Rushing', 18.46, 18.46), word('out', 19.1, 18.46)]);

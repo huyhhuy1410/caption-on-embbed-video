@@ -3,7 +3,7 @@ import { LanguageEvidence } from "./language-evidence";
 
 export type LanguageAction = "hide" | "continue" | "choose";
 
-// Whisper multilingual hỗ trợ các mã này; không đưa tên hiển thị vào source-language control.
+// Whisper multilingual supports these codes; display names excluded from source-language control.
 export const SOURCE_LANGUAGES = [
   ["en", "English"],
   ["vi", "Vietnamese"],
@@ -150,13 +150,13 @@ export class CaptionNotice {
         const language = this.select.value;
         if (language && !SOURCE_LANGUAGES.some(([code]) => code === language))
           return;
-        // API frozen dùng undefined cho Auto; integrator chuyển thành null trên wire.
+        // Frozen API uses undefined for Auto; integrator converts to null on wire.
         this.act("choose", language || undefined);
       },
       options,
     );
     this.healthTitle.textContent = "Checking caption services…";
-    // Thẻ trạng thái chiếm góc phải trên và chặn nút fixed của trang; giữ cảnh báo ngôn ngữ riêng.
+    // Status card occupies top-right corner and blocks page's fixed buttons; keep language warning separate.
     this.health.hidden = true;
   }
 

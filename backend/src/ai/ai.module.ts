@@ -12,22 +12,15 @@ import { ExplainController } from './explain.controller';
 import type { TranslationProvider } from './contracts/translation-provider';
 import type { ExplainProvider } from './contracts/explain-provider';
 
-/** Tên provider hợp lệ — xem `createAiProvider`. */
+/** Valid provider names — see `createAiProvider`. */
 const PROVIDER_NAMES = ['commandcode', 'gemini'] as const;
 type ProviderName = (typeof PROVIDER_NAMES)[number];
 
 /**
- * Chọn provider AI theo môi trường.
- *
- * Provider mặc định là `commandcode`; `gemini` vẫn
- * còn nguyên để quay lui: đổi `AI_PROVIDER=gemini` là chạy lại đúng đường cũ.
- *
- * Phải fallback chứ không để provider ném lỗi ở đây: constructor của chúng
- * `throw` khi thiếu key, và factory này chạy lúc Nest khởi động ⇒ thiếu key là
- * app không boot, kéo theo cả caption EN (vốn không cần AI) chết theo.
- *
- * Tên provider lạ KHÔNG được `throw` ở đây — cùng lý do: app sẽ không boot.
- * Ghi log cảnh báo rồi rơi về mặc định để caption vẫn chạy.
+ * Select AI provider by environment. Default: `commandcode`; `gemini` for fallback.
+ * Must fallback (not throw) on missing key or unknown provider — constructors throw,
+ * and this factory runs at Nest startup. Throwing would prevent app boot, breaking
+ * English captions (which don't need AI).
  */
 function createAiProvider(): TranslationProvider & ExplainProvider {
   const apiKey = process.env.AI_API_KEY ?? '';
@@ -56,7 +49,7 @@ function createAiProvider(): TranslationProvider & ExplainProvider {
 
   return new CommandCodeProvider({
     apiKey,
-    // `AI_MODEL` ghi đè được dòng flash mặc định — xem `DEFAULT_MODEL`.
+    // `AI_MODEL` overrides default flash tier — see `DEFAULT_MODEL`
     model: process.env.AI_MODEL ?? undefined,
     baseUrl: process.env.AI_BASE_URL ?? undefined,
   });
@@ -67,10 +60,10 @@ function createAiProvider(): TranslationProvider & ExplainProvider {
     TranslateService,
     ExplainService,
     ExplainCacheService,
-    // Bộ đếm quota dùng chung cho cả WS và HTTP.
+    // Shared quota counter for both WS and HTTP paths
     TranslationRateLimiter,
     {
-      // Một instance duy nhất chia cho cả hai token bên dưới.
+      // Single instance shared by both tokens below
       provide: 'AI_PROVIDER',
       useFactory: createAiProvider,
     },

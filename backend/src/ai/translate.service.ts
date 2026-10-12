@@ -7,7 +7,7 @@ export interface TranslateInput {
   from: string;
   to: string;
 }
-// Service xử lý dịch thuật: ủy quyền cho TranslationProvider (Gemini) qua Dependency Injection
+// Delegates to TranslationProvider via DI.
 @Injectable()
 export class TranslateService {
   constructor(
@@ -22,7 +22,7 @@ export class TranslateService {
     );
   }
 
-  /** Dịch nhiều câu trong 1 request — xem `TranslationProvider.translateBatch`. */
+  /** Batch translate — see `TranslationProvider.translateBatch`. */
   async translateBatch(
     sentences: string[],
     to: string,

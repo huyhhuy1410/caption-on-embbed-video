@@ -6,7 +6,7 @@ import {
 } from './commandcode.provider';
 import { ProviderUnavailableError } from '../errors';
 
-/** Dựng response giả của OpenAI Chat Completions. */
+/** Builds a fake OpenAI Chat Completions response. */
 function chatResponse(content: string) {
   return {
     ok: true,
@@ -15,7 +15,7 @@ function chatResponse(content: string) {
   };
 }
 
-/** Dựng response lỗi (không cần `json`, chỉ cần `ok`/`status`/`text`/`headers`). */
+/** Fake error response: no `json`, only `ok`/`status`/`text`/`headers`. */
 function errorResponse(status: number, body: string, headers: Record<string, string> = {}) {
   return {
     ok: false,
@@ -54,8 +54,8 @@ describe('CommandCodeProvider', () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('https://api.commandcode.ai/provider/v1/chat/completions');
     expect(url).not.toContain('test-key');
-    // Key phải nằm ở header: Gemini nhét key vào URL nên phải `throw` thay vì
-    // log body lỗi. Ở đây body lỗi được log ⇒ key không được lọt vào URL.
+    // The key must live in the header: Gemini puts it in the URL, so a logged
+    // error body would leak it. Here the body is logged, so the key must not be in the URL.
     expect(init.headers.Authorization).toBe('Bearer test-key');
   });
 
@@ -64,7 +64,7 @@ describe('CommandCodeProvider', () => {
 
     const cheap = new CommandCodeProvider({ apiKey: 'k' });
     await cheap.translate('Hello', 'vi', 'en');
-    // Yêu cầu của Parker: KHÔNG dùng dòng đắt, default phải là dòng rẻ.
+    // Default must stay on the cheap tier — an expensive model here is a cost hazard.
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe(
       'deepseek/deepseek-v4-flash',
     );
@@ -137,8 +137,8 @@ describe('CommandCodeProvider', () => {
 
       await provider.translateBatch(['One'], 'vi', 'en');
 
-      // 1 câu vẫn đi qua 1 request — batching là để giảm SỐ REQUEST, không phải
-      // để chia nhỏ.
+      // One sentence still goes through one request — batching cuts the REQUEST
+      // COUNT, not the sentence size.
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -147,8 +147,8 @@ describe('CommandCodeProvider', () => {
         chatResponse('{"translations":[{"index":1,"translation":"A"}]}'),
       );
 
-      // Model trả thiếu câu 2. Im lặng ghép lệch sẽ gán "A" cho cả hai câu —
-      // tệ hơn hẳn là không dịch gì.
+      // The model omitted sentence 2; silently shifting indexes would assign "A"
+      // to both — far worse than translating nothing.
       await expect(
         provider.translateBatch(['One', 'Two'], 'vi', 'en'),
       ).rejects.toThrow('Batch translation missing sentence 2 of 2');
@@ -232,8 +232,8 @@ describe('CommandCodeProvider', () => {
 
       await provider.translate('Hello', 'vi', 'en').catch(() => undefined);
 
-      // Retry nội bộ ở đây khiến MỘT lượt drain bắn nhiều HTTP call mà bộ đếm
-      // quota của gateway không thấy (Issue 5.12). Thử lại thuộc về tầng gateway.
+      // In-provider retry makes one drain fire several HTTP calls the gateway's
+      // quota counter never sees (Issue 5.12); retrying belongs to the gateway.
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
@@ -254,14 +254,14 @@ describe('serverRetryDelayMs', () => {
   });
 
   it('falls back to a full quota WINDOW when the body says nothing', () => {
-    // Không có nhánh này thì retryAfterMs = 0 ⇒ `pauseUntil(now + 0)` là
-    // no-op ⇒ hàng đợi bắn lại ngay ⇒ đốt quota liên tục (Issue 5.12).
+    // Without this branch retryAfterMs = 0 ⇒ `pauseUntil(now + 0)` is a no-op
+    // ⇒ the queue retries at once ⇒ quota burns continuously (Issue 5.12).
     expect(serverRetryDelayMs('{"error":"rate_limit_error"}')).toBe(60_000);
   });
 
   it('does NOT cap a short server hint below the quota window', () => {
-    // Quota là per MINUTE: cắt còn 2s là tự bảo đảm lần thử sau rơi đúng vào
-    // cửa sổ vừa cạn, rồi 429 lại, và cứ thế.
+    // Quota is per MINUTE: clamping to 2s guarantees the next attempt lands in
+    // the just-drained window, 429s again, and so on.
     expect(serverRetryDelayMs('{"retryDelay":"2s"}')).toBe(2_000);
   });
 });

@@ -17,7 +17,7 @@ describe('TranslateController', () => {
       controllers: [TranslateController],
       providers: [
         { provide: TranslateService, useValue: { translate } },
-        // Service THẬT — đây chính là thứ đang được kiểm chứng.
+        // The REAL service — this is what the test verifies.
         TranslationRateLimiter,
       ],
     }).compile();
@@ -34,8 +34,8 @@ describe('TranslateController', () => {
     });
 
     expect(result).toEqual({ text: 'Xin chào' });
-    // Điểm mấu chốt của Issue 5.14: request HTTP PHẢI được ghi vào cùng bộ
-    // đếm mà gateway dùng, nếu không trần thật là tổng của hai bộ đếm rời nhau.
+    // Issue 5.14: the HTTP request MUST be recorded in the same counter the
+    // gateway uses, or the real ceiling is the sum of two separate counters.
     expect(limiter.callsInWindow()).toBe(1);
   });
 
@@ -46,7 +46,7 @@ describe('TranslateController', () => {
       controller.translate({ sentence: 'Hello', from: 'en', to: 'vi' }),
     ).rejects.toBeInstanceOf(HttpException);
 
-    // Không được tiêu quota của provider khi đã biết chắc sẽ bị từ chối.
+    // Must not spend provider quota on a request certain to be rejected.
     expect(translate).not.toHaveBeenCalled();
     expect(limiter.callsInWindow()).toBe(15);
   });
@@ -65,9 +65,8 @@ describe('TranslateController', () => {
   });
 
   it('pauses the shared limiter when the provider reports quota exhaustion', async () => {
-    // Đây là lỗ hổng mà review tìm ra: provider báo hết quota trên đường HTTP
-    // trước đây không hề ngăn đường WebSocket tiếp tục đốt quota, và caller nhận
-    // 500 thay vì 429.
+    // The hole review found: a provider quota-exhaustion on the HTTP path used to
+    // leave the WebSocket path burning quota, and the caller got 500 instead of 429.
     translate.mockRejectedValue(
       new ProviderUnavailableError('HTTP 429', 22_000, false),
     );
@@ -77,15 +76,15 @@ describe('TranslateController', () => {
       .catch((e: unknown) => e)) as unknown as HttpException;
 
     expect(error.getStatus()).toBe(HttpStatus.TOO_MANY_REQUESTS);
-    // Cửa sổ còn chỗ (mới 1 request) nhưng cooldown toàn cục phải chặn.
-    // `tryAcquire` dùng đúng `msUntilRoom()` nên kiểm tra ở đây là kiểm tra
-    // đúng thứ mà request kế tiếp (caption hay /explain-word) sẽ thấy.
+    // The window has room (1 request) but the global cooldown must still block;
+    // `tryAcquire` uses `msUntilRoom()`, so this mirrors what the next request
+    // (caption or /explain-word) will see.
     expect(limiter.tryAcquire()).toBeGreaterThan(0);
   });
 
   it('does not pause the limiter for a retryable provider error', async () => {
-    // 503 là lỗi của chính request đó, không phải quota của project ⇒ không
-    // được khoá đường WebSocket.
+    // A 503 is that request's own failure, not the project's quota ⇒ it must not
+    // lock the WebSocket path.
     translate.mockRejectedValue(
       new ProviderUnavailableError('HTTP 503', 1_000, true),
     );

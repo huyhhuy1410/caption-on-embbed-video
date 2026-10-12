@@ -1,4 +1,4 @@
-// Khớp HealthState trong extension/src/shared/protocol.ts; không kéo source extension vào build backend.
+// Must match HealthState in extension/src/shared/protocol.ts; don't import extension source into backend build.
 export type HealthState = {
   backend: 'ready' | 'unavailable';
   sidecar: 'ready' | 'loading' | 'error' | 'unavailable';

@@ -19,7 +19,7 @@ const MAX_WORDS = 50_000;
 const MAX_TRANSLATIONS = 10_000;
 const MAX_TIME = 365 * 24 * 60 * 60;
 const encoder = new TextEncoder();
-// Cả load (LRU touch) và save đều read-modify-write; tuần tự cả các instance trong SW.
+// Load (LRU touch) and save are both read-modify-write; serialize across all instances in the SW.
 let writes: Promise<unknown> = Promise.resolve();
 
 export function durableVideoKey(url: string): string | null {
@@ -28,7 +28,7 @@ export function durableVideoKey(url: string): string | null {
     const parsed = new URL(url);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
     for (const key of parsed.searchParams.keys()) {
-      // URL ký/expiring chỉ có identity phiên; không giữ credential trong storage.
+      // Signed/expiring URLs carry session-only identity; never persist credentials in storage.
       if (/^(?:token|access[_-]?token|auth(?:orization)?|jwt|key|api[_-]?key|secret|password|signature|sig|expires?|expiry|exp|policy|credential|session(?:id)?|nonce|timestamp|ts|live)$/i.test(key) ||
         /^(?:x-amz-|x-goog-|hdnts|hdnea)/i.test(key)) return null;
     }
@@ -74,7 +74,7 @@ function normalizeSnapshot(raw: unknown, now: number): TranscriptSnapshot | null
       !finite(value.captionStart) || !finite(value.c, 1) || !identity(value) ||
       (value.provisional !== undefined && typeof value.provisional !== 'boolean') ||
       (value.capturedAtEpochMs !== undefined && !finite(value.capturedAtEpochMs, Number.MAX_SAFE_INTEGER))) return null;
-    // Chỉ copy whitelist, không persist audio, API key hay field ngoài contract.
+    // Copy whitelist only; never persist audio, API keys, or fields outside the contract.
     const word: CaptionWord = {
       w: value.w, s: value.s, e: value.e, videoStart: value.videoStart,
       videoEnd: value.videoEnd, captionStart: value.captionStart, c: value.c,
@@ -125,7 +125,7 @@ export class SnapshotStore {
   private readonly now: () => number;
 
   constructor(storage?: SnapshotStorage, options: SnapshotStoreOptions = {}) {
-    // Chỉ khởi tạo bản mặc định trong service worker; content script gửi messaging.
+    // Snapshot is only created by default in the service worker; content scripts go through messaging.
     this.storage = storage ?? chrome.storage.local;
     this.ttlMs = positive(options.ttlMs, 7 * 24 * 60 * 60 * 1000);
     this.maxEntries = positive(options.maxEntries, 20);
@@ -144,7 +144,7 @@ export class SnapshotStore {
     const result = await this.storage.get(STORAGE_KEY);
     const raw = result[STORAGE_KEY];
     if (!object(raw) || raw.version !== 1 || !Array.isArray(raw.entries)) return [];
-    // Chống array khổng lồ từ storage bị sửa, không duyệt dữ liệu vô hạn.
+    // Guard against a tampered storage holding a huge array; never iterate unbounded data.
     if (raw.entries.length > 1000) return [];
     const byKey = new Map<string, Entry>();
     for (const value of raw.entries) {
@@ -185,7 +185,7 @@ export class SnapshotStore {
   async save(url: string, snapshot: TranscriptSnapshot): Promise<void> {
     const key = durableVideoKey(url);
     if (!key) return;
-    // Copy ngay khi gọi: caller có thể sửa history khi operation đang đợi queue.
+    // Copy on call: callers may mutate history while the operation waits in the queue.
     const normalized = normalizeSnapshot(snapshot, this.now());
     if (!normalized) throw new TypeError('Invalid transcript snapshot');
     if (bytes(normalized) > this.maxSnapshotBytes) throw new RangeError('Transcript snapshot exceeds byte cap');

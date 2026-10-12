@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 
-/** Socket điều khiển được để test reconnect mà không mở cổng thật. */
+/** Controllable socket so reconnect tests need no real port. */
 type Handler = (...args: any[]) => void;
 type FakeSocket = {
   readyState: number;
@@ -12,7 +12,7 @@ type FakeSocket = {
   emit(event: string, ...args: any[]): void;
 };
 
-// `var` vì jest.mock được hoist lên trước phần còn lại của module.
+// `var` because jest.mock is hoisted above the rest of the module.
 var mockSockets: FakeSocket[] = [];
 
 jest.mock('ws', () => {
