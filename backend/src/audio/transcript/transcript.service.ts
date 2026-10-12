@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { groupWords, intersects, membership, normalizeRuns } from './windowed-transcript';
+import { dropClippedHeads, groupWords, intersects, isReplaced, membership, normalizeRuns } from './windowed-transcript';
 import type { VideoRange, WindowedPatch } from './windowed-transcript';
 import {
   CaptureScope,
@@ -270,8 +270,12 @@ export class TranscriptService {
       return ordered.map(w => ({ ...w, windowedGroupId: id }));
     });
     const incomingIds = new Set(incoming.map(w => w.windowedGroupId));
-    const reference = old.filter(w => !incomingIds.has(w.windowedGroupId!)).concat(incoming);
-    const next = normalizeRuns(old.filter(w => !incomingIds.has(w.windowedGroupId!) && !intersects(w, range)).concat(incoming), reference, randomUUID);
+    // Từ cũ chỉ bị thay khi nó bắt đầu bên trong dải batch (`isReplaced`); từ bắt đầu
+    // trước mép trái là phần chồng của cửa sổ trước, batch mới chỉ nghe được đuôi.
+    const kept = old.filter(w => !incomingIds.has(w.windowedGroupId!) && !isReplaced(w, range, incoming));
+    const admitted = dropClippedHeads(kept, incoming, [range]);
+    const reference = old.filter(w => !incomingIds.has(w.windowedGroupId!)).concat(admitted);
+    const next = normalizeRuns(kept.concat(admitted), reference, randomUUID);
     const groups = groupWords(next);
     const removed = [...previous.keys()].filter(id => !groups.has(id));
     const currentGroups = [...groups];

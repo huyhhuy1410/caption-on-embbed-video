@@ -295,10 +295,11 @@ describe('TranscriptService', () => {
 
       for (let i = 0; i < 301; i++) {
         fakeNow = i;
-        service.addWords([makeWord(i)]);
+        // Mốc cách 1.5s để luật mới không coi là decode lại cùng từ.
+        service.addWords([makeWord(i * 1.5)]);
       }
       expect(service.getRange(null, 0, 0.5)).toEqual([]);
-      expect(service.getRange(null, 1, 1.5)).toHaveLength(1);
+      expect(service.getRange(null, 1.5, 2.0)).toHaveLength(1);
       nowSpy.mockRestore();
     });
 
@@ -309,16 +310,16 @@ describe('TranscriptService', () => {
       service.addWords([makeWord(0)]); // key 0, lastAccess = 0
       fakeNow = 1;
       for (let i = 1; i <= 299; i++) {
-        // thêm 299 bucket (key 1..299)
+        // thêm 299 bucket (key 1..299), mốc cách 1.5s để không bị luật mới coi là decode lại.
         fakeNow = i;
-        service.addWords([makeWord(i)]);
+        service.addWords([makeWord(i * 1.5)]);
       }
       // giờ có 300 bucket, chưa vượt trần (300 = MAX), chưa evict.
 
       fakeNow = 1_000_000; // nhảy thật xa
       service.getRange(null, 0, 0.5); // touch key 0 -> lastAccess = 1_000_000 (MỚI NHẤT)
       fakeNow = 1_000_001;
-      service.addWords([makeWord(300)]); // thêm bucket thứ 301 -> vượt trần -> evict
+      service.addWords([makeWord(299 * 1.5 + 1.5)]); // thêm bucket thứ 301 -> vượt trần -> evict
       // lúc này lastAccess: key 0 = 1_000_000, các key 1..299 = 1..299, key 300 = ?
       // key 300 sẽ lấy Date.now() hiện tại = 1_000_000 (fakeNow chưa đổi)
       // -> hai bucket cùng lastAccess 1_000_000, còn lại nhỏ hơn -> đuổi key 1 (nhỏ nhất)
